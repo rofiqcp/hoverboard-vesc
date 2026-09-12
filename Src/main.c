@@ -10,6 +10,7 @@
 #include "motor/mc_interface.h"
 #include "vesc/vesc_protocol.h"
 #include "vesc/f103_boot_layout.h"
+#include "vesc/flash_update_f103.h"
 #include "vesc/app_vesc.h"
 #include "comms.h"
 #include "platform_watchdog.h"
@@ -67,6 +68,16 @@ static uint8_t controllerFaultActive(void) {
   return (m_motor_1.m_fault != FAULT_CODE_NONE) || (m_motor_2.m_fault != FAULT_CODE_NONE);
 }
 
+static inline void f103_debug_keepalive(void) {
+#if defined(__arm__) || defined(__thumb__)
+  __HAL_RCC_AFIO_CLK_ENABLE();
+  __HAL_AFIO_REMAP_SWJ_ENABLE();
+  __HAL_DBGMCU_FREEZE_IWDG();
+  __DSB();
+  __ISB();
+#endif
+}
+
 int main(void) {
   /* Capture the reset source before HAL/application code can obscure it, then
    * clear sticky RCC reset flags so the next reboot has an unambiguous cause. */
@@ -79,6 +90,8 @@ int main(void) {
 #endif
   HAL_Init();
   __HAL_RCC_AFIO_CLK_ENABLE();
+  /* Keep the F103 debug port recoverable in every runtime build. */
+  f103_debug_keepalive();
   HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
   HAL_NVIC_SetPriority(MemoryManagement_IRQn, 0, 0);
   HAL_NVIC_SetPriority(BusFault_IRQn, 0, 0);
@@ -97,6 +110,10 @@ int main(void) {
   MX_ADC1_Init();
   MX_ADC2_Init();
   BLDC_Init();
+
+  /* Defensive post-init restore. Any future AFIO remap added by peripheral
+   * setup must not be allowed to strand the target from SWD. */
+  f103_debug_keepalive();
 
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
   Input_Lim_Init();
@@ -133,6 +150,26 @@ int main(void) {
   /* Start IWDG only after potentially long boot/home/button waits. From here on
    * every intentional blocking commissioning helper services the same health gate. */
   platform_watchdog_init();
+
+  /* A freshly streamed image gets one guarded test boot. Both bridges remain
+   * torque-off while real ADC/FOC liveness services the hardware watchdog.
+   * If this image resets before confirmation, TEST metadata persists and the
+   * resident bootloader stays in recovery for host-LKG restore. */
+  if (f103_fw_test_pending()) {
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
+    LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
+    RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
+    const uint32_t fw_test_start = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - fw_test_start) < 3000u) {
+      platform_watchdog_service();
+      HAL_Delay(1u);
+    }
+    if (!f103_fw_confirm_running_image()) {
+      *(volatile uint32_t *)F103_RESET_REASON_ADDR = F103_RESET_REASON_FW_UPDATE;
+      NVIC_SystemReset();
+    }
+  }
 
   while (1) {
     uint32_t prof0=DWT->CYCCNT;

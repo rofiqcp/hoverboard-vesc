@@ -249,12 +249,24 @@ uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
 void mcpwm_foc_reset_isr_profile(void) {}
 void platform_watchdog_get_status(platform_watchdog_status_t *out) { if(out) memset(out,0,sizeof(*out)); }
 bool platform_watchdog_boot_was_iwdg(void) { return false; }
+void mcpwm_foc_get_irq_epoch(uint32_t *entry,uint32_t *exit){if(entry)*entry=0u;if(exit)*exit=0u;}
+uint32_t usart3_rx_error_count(void){return 3u;}
+uint32_t usart3_rx_restart_count(void){return 4u;}
+uint32_t usart3_forced_recovery_count(void){return 5u;}
 void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
     if(!out)return;
     memset(out,0,sizeof(*out));
     out->total_max_cycles=2345u;
+    out->detail_sample_count=31u;
+    for(uint8_t i=0u;i<6u;++i)out->detail_slot_count[i]=(uint32_t)(i+1u);
+    out->steady_isr_count=186u;
+    out->slot_sequence_error_count=0u;
+    out->fast_hold_svpwm_max_cycles=77u;
+    out->profile_revision=0x00020002u;
+    out->dma_tc_pending_exit_count=9u;
 }
 void mcpwm_foc_trace_clear(void) {}
+void mcpwm_foc_trace_freeze(void) {}
 void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out){if(out){memset(out,0,sizeof(*out));out->capacity=MCPWM_FOC_TRACE_CAPACITY;out->sample_size=sizeof(mcpwm_foc_trace_sample_t);}}
 bool mcpwm_foc_trace_read(uint8_t index,mcpwm_foc_trace_sample_t *out){if(!out||index!=0u)return false;memset(out,0,sizeof(*out));out->pwm_tick=123u;return true;}
 float mcpwm_foc_get_erpm_motor(bool second) { return (float)diag_motors[second?1:0].m_rpm; }
@@ -406,6 +418,25 @@ int main(void){
     uint8_t fw[]={COMM_FW_VERSION}; if(!transact(fw,sizeof(fw),r,&rn)||rn<4u||r[0]!=COMM_FW_VERSION||r[1]!=6u||r[2]!=0u)return fail("local fw");
     if(strcmp((const char *)&r[3],"motor_left")!=0)return fail("local hardware name");
     uint8_t ping[]={COMM_PING_CAN}; if(!transact(ping,sizeof(ping),r,&rn)||rn!=2u||r[0]!=COMM_PING_CAN||r[1]!=2u)return fail("ping id2");
+    {
+        const uint8_t magic0=0x48u, magic1=0x42u, ver=1u, op=17u;
+        uint8_t gp[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,op,0u};
+        if(!transact(gp,sizeof(gp),r,&rn)||rn!=286u||tx_capture[0]!=3u||r[0]!=COMM_CUSTOM_APP_DATA||r[4]!=op||r[5]!=0u)
+            return fail("stage1 ISR profile long-frame");
+        int32_t pi=6; uint32_t vals[70];
+        for(uint8_t z=0u;z<70u;++z)vals[z]=buffer_get_uint32(r,&pi);
+        if(vals[0]!=2345u||vals[45]!=31u||vals[46]!=1u||vals[51]!=6u||vals[52]!=186u||
+           vals[53]!=0u||vals[54]!=77u||vals[55]!=0x00020002u||vals[69]!=9u)
+            return fail("stage1 ISR profile ABI values");
+    }
+    {
+        const uint8_t magic0=0x48u, magic1=0x42u, ver=1u, op=24u;
+        uint8_t gh[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,op};
+        if(!transact(gh,sizeof(gh),r,&rn)||rn!=86u||r[0]!=COMM_CUSTOM_APP_DATA||r[4]!=op||r[5]!=0u)
+            return fail("stage2 comms health packet");
+        int32_t hi=6; uint32_t hv[20]; for(uint8_t z=0u;z<20u;++z)hv[z]=buffer_get_uint32(r,&hi);
+        if(hv[14]!=0u||hv[15]!=0u||hv[16]!=0u) return fail("stage2 host comms health hardware placeholders");
+    }
     uint8_t fwr[]={COMM_FORWARD_CAN,2u,COMM_FW_VERSION}; if(!transact(fwr,sizeof(fwr),r,&rn)||rn<4u||r[0]!=COMM_FW_VERSION)return fail("right fw");
     if(strcmp((const char *)&r[3],"motor_right")!=0)return fail("right hardware name");
 

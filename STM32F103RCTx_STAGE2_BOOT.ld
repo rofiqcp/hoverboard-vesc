@@ -42,7 +42,7 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 MEMORY
 {
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 0xBFF0
-FLASH (rx)      : ORIGIN = 0x8002800, LENGTH = 240K /* resident 10-KiB bootloader; metadata starts at 0x0803E800 */
+FLASH (rx)      : ORIGIN = 0x8002800, LENGTH = 8K /* resident stage-2 UART bootloader */
 }
 
 /* Define output sections */
@@ -120,6 +120,7 @@ SECTIONS
     _sdata = .;        /* create a global symbol at data start */
     *(.data)           /* .data sections */
     *(.data*)          /* .data* sections */
+    *(.ramfunc*)        /* flash primitives copied to RAM before main */
 
     . = ALIGN(4);
     _edata = .;        /* define a global symbol at data end */

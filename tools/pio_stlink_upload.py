@@ -4,10 +4,86 @@ import os
 import subprocess
 import sys
 import time
+import struct
+import tempfile
 from pathlib import Path
 
 from stlink_target_guard import resolve_stlink_transport, verify_f103_target
 
+
+META_MAGIC = 0x56455343
+META_STATE_CONFIRMED = 0x434E464D
+META_VERSION = 2
+FLASH_BASE = 0x08000000
+FLASH_END = 0x08040000
+BOOT_BASE = 0x08000000
+BOOT_SIZE = 0x00002800
+APP_BASE = 0x08002800
+APP_REGION_SIZE = 0x0003C000
+META_BASE = 0x0803E800
+EEPROM_BASE = 0x0803F000
+SRAM_BASE = 0x20000000
+SRAM_BOOT_REQUEST = 0x2000BFF0
+
+def crc16(data: bytes) -> int:
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    return crc
+
+def confirmed_meta(image: bytes) -> bytes:
+    size = len(image)
+    c = crc16(image)
+    return struct.pack(
+        '<IIIIHHHHHHII',
+        META_MAGIC, META_STATE_CONFIRMED, size, (~size) & 0xFFFFFFFF,
+        c, (~c) & 0xFFFF, META_VERSION, (~META_VERSION) & 0xFFFF,
+        0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+
+def validate_project_image(image: bytes, address: int, max_size: int, meta_address):
+    if len(image) < 8:
+        raise RuntimeError('image vector table missing')
+    if address == BOOT_BASE:
+        if max_size != BOOT_SIZE or meta_address is not None:
+            raise RuntimeError('bootloader upload partition arguments do not match final layout')
+    elif address == APP_BASE:
+        if max_size != APP_REGION_SIZE or meta_address != META_BASE:
+            raise RuntimeError('application upload requires 240-KiB APP partition plus CONFIRMED metadata at 0x0803E800')
+    else:
+        raise RuntimeError(f'unsupported project flash base 0x{address:08X}')
+    if address < FLASH_BASE or address + len(image) > FLASH_END or len(image) > max_size:
+        raise RuntimeError('image crosses its authorized flash partition')
+    sp, rv = struct.unpack_from('<II', image, 0)
+    pc = rv & ~1
+    if not (SRAM_BASE <= sp <= SRAM_BOOT_REQUEST and (sp & 3) == 0):
+        raise RuntimeError(f'invalid initial MSP 0x{sp:08X}')
+    if (rv & 1) == 0 or not (address <= pc < address + len(image)):
+        raise RuntimeError(f'invalid Thumb Reset_Handler 0x{rv:08X} for image at 0x{address:08X}')
+    if meta_address is not None:
+        if meta_address != META_BASE or meta_address + 36 > EEPROM_BASE:
+            raise RuntimeError('metadata location would overlap EEPROM or is not canonical')
+
+def openocd_program_cmd(openocd, scripts, transport, image, address, speed, under_reset, meta_path=None, meta_address=None):
+    cmd = [str(openocd), '-s', str(scripts), '-f', 'interface/stlink.cfg',
+           '-c', f'transport select {transport}']
+    if under_reset:
+        cmd += ['-c', 'reset_config srst_only srst_nogate connect_assert_srst']
+    cmd += ['-f', 'target/stm32f1x.cfg', '-c', f'adapter speed {speed}']
+    actions = [
+        'init', 'reset halt',
+        f'flash write_image erase {{{image}}} 0x{address:08X} bin',
+        f'verify_image {{{image}}} 0x{address:08X} bin',
+    ]
+    if meta_path is not None:
+        actions += [
+            f'flash write_image erase {{{meta_path}}} 0x{meta_address:08X} bin',
+            f'verify_image {{{meta_path}}} 0x{meta_address:08X} bin',
+        ]
+    actions += ['reset run', 'shutdown']
+    cmd += ['-c', '; '.join(actions)]
+    return cmd
 
 def parse_int(value: str) -> int:
     return int(value, 0)
@@ -15,7 +91,7 @@ def parse_int(value: str) -> int:
 
 def unique_speeds(preferred: int):
     # Fast first when requested, then progressively more conservative SWD clocks.
-    values = [preferred, 400, 100]
+    values = [preferred, 400, 100, 50]
     out = []
     for value in values:
         value = max(50, min(int(value), 4000))
@@ -30,14 +106,23 @@ def main() -> None:
     ap.add_argument("--address", required=True, type=parse_int)
     ap.add_argument("--max-size", required=True, type=parse_int)
     ap.add_argument("--adapter-khz", type=int, default=1000)
+    ap.add_argument("--confirmed-meta-address", type=parse_int, default=None,
+                    help="also write v2 CONFIRMED metadata for this application image")
+    ap.add_argument("--rescue-under-reset", action="store_true",
+                    help="one-time recovery mode for an already-broken image; normal uploads must not use this")
     args = ap.parse_args()
 
     image = Path(args.image).resolve()
     if not image.is_file():
         raise SystemExit(f"STLINK_UPLOAD_FAIL: image missing: {image}")
-    size = image.stat().st_size
+    image_bytes = image.read_bytes()
+    size = len(image_bytes)
     if size <= 0 or size > args.max_size:
         raise SystemExit(f"STLINK_UPLOAD_FAIL: size {size} exceeds {args.max_size}")
+    try:
+        validate_project_image(image_bytes, args.address, args.max_size, args.confirmed_meta_address)
+    except RuntimeError as exc:
+        raise SystemExit(f"STLINK_UPLOAD_FAIL: {exc}; NO FLASH WRITE PERFORMED")
 
     pio_home = Path(os.environ.get("PLATFORMIO_CORE_DIR", Path.home() / ".platformio"))
     openocd_root = pio_home / "packages" / "tool-openocd"
@@ -55,42 +140,70 @@ def main() -> None:
 
     transport = resolve_stlink_transport(scripts)
 
+    # Steady-state uploads are deliberately NORMAL-SWD only. Under-reset is an
+    # explicit one-time rescue mode, never an automatic fallback; otherwise a
+    # regression that disables SWD after boot could be hidden by the uploader.
+    under_reset = bool(args.rescue_under_reset)
     try:
-        verify_f103_target(openocd, scripts, 100)
+        verify_f103_target(openocd, scripts, 100, under_reset=under_reset)
     except RuntimeError as exc:
-        raise SystemExit(str(exc))
+        mode = 'under-reset rescue' if under_reset else 'normal SWD'
+        raise SystemExit(f'STLINK_{mode.upper().replace(" ", "_")}_ATTACH_FAIL: {exc}')
+    print('[STLINK] rescue attach under reset PASS' if under_reset else '[STLINK] normal SWD attach PASS',
+          flush=True)
 
-    last_rc = 1
-    speeds = unique_speeds(args.adapter_khz)
-    for attempt, speed in enumerate(speeds, start=1):
-        # target/stm32f1x.cfg sets 1000 kHz internally, so the explicit speed
-        # must come AFTER the target file or it is silently overwritten.
-        cmd = [
-            str(openocd), "-s", str(scripts),
-            "-f", "interface/stlink.cfg",
-            "-c", f"transport select {transport}",
-            "-f", "target/stm32f1x.cfg",
-            "-c", f"adapter speed {speed}",
-            # Use OpenOCD's program helper for binary images. It performs the
-            # erase/program/verify sequence with the flash driver's supported
-            # reset flow, which is more reliable with HLA ST-Link on Windows.
-            "-c", (
-                f"program {{{image}}} 0x{args.address:08X} verify reset exit"
-            ),
-        ]
-        print(
-            f"[STLINK] attempt={attempt}/{len(speeds)} image={image.name} "
-            f"size={size} address=0x{args.address:08X} swd={speed}kHz",
-            flush=True,
-        )
-        last_rc = subprocess.run(cmd, check=False).returncode
-        if last_rc == 0:
-            print(f"STLINK_BIN_UPLOAD_PASS swd={speed}kHz", flush=True)
-            return
-        if attempt < len(speeds):
-            print(f"[STLINK] retrying at safer SWD clock after rc={last_rc}", file=sys.stderr, flush=True)
-            time.sleep(0.30)
-    raise SystemExit(last_rc)
+    meta_tmp = None
+    meta_path = None
+    try:
+        if args.confirmed_meta_address is not None:
+            meta_tmp = tempfile.NamedTemporaryFile(prefix='f103_confirmed_', suffix='.bin', delete=False)
+            meta_tmp.write(confirmed_meta(image_bytes)); meta_tmp.flush(); meta_tmp.close()
+            meta_path = Path(meta_tmp.name)
+            print(f'[STLINK] CONFIRMED metadata prepared size={size} crc16=0x{crc16(image_bytes):04X} '
+                  f'address=0x{args.confirmed_meta_address:08X}', flush=True)
+
+        last_rc = 1
+        speeds = unique_speeds(args.adapter_khz)
+        for attempt, speed in enumerate(speeds, start=1):
+            cmd = openocd_program_cmd(openocd, scripts, transport, image, args.address, speed,
+                                      under_reset, meta_path, args.confirmed_meta_address)
+            mode = 'under-reset' if under_reset else 'normal'
+            print(f'[STLINK] attempt={attempt}/{len(speeds)} image={image.name} size={size} '
+                  f'address=0x{args.address:08X} swd={speed}kHz mode={mode}', flush=True)
+            last_rc = subprocess.run(cmd, check=False).returncode
+            if last_rc == 0:
+                # A 250-ms probe can catch the resident bootloader before it has
+                # CRC-checked and jumped to APP, producing a false PASS. Require
+                # several fresh NORMAL-SWD reconnects after the target has had
+                # enough time to enter the final runtime image. APP uploads also
+                # prove VTOR and PC are inside the 0x08002800 application region.
+                app_runtime = args.confirmed_meta_address is not None
+                checks = ((0.75, 1), (1.25, 2), (3.00, 3))
+                for delay_s, check_no in checks:
+                    time.sleep(delay_s)
+                    try:
+                        verify_f103_target(
+                            openocd, scripts, 100, under_reset=False,
+                            resume_before_shutdown=True,
+                            expected_vtor=APP_BASE if app_runtime else None,
+                            pc_min=APP_BASE if app_runtime else None,
+                            pc_max=META_BASE if app_runtime else None)
+                    except RuntimeError as exc:
+                        raise SystemExit(
+                            f'STLINK_POSTRUN_NORMAL_ATTACH_FAIL check={check_no}/3 '
+                            f'app_runtime={int(app_runtime)}: {exc}')
+                    print(f'[STLINK] post-run normal SWD check {check_no}/3 PASS', flush=True)
+                print(f'STLINK_BIN_UPLOAD_PASS swd={speed}kHz normal_attach_stable=3/3 '
+                      f'app_runtime_verified={int(app_runtime)}', flush=True)
+                return
+            if attempt < len(speeds):
+                print(f'[STLINK] retrying at safer SWD clock after rc={last_rc}', file=sys.stderr, flush=True)
+                time.sleep(0.30)
+        raise SystemExit(last_rc)
+    finally:
+        if meta_path is not None:
+            try: meta_path.unlink()
+            except OSError: pass
 
 
 if __name__ == "__main__":

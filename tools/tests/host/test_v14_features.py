@@ -53,7 +53,7 @@ assert '0x0803F000u' in eeh and '0x0803F800u' in eeh and '0x0803FC00u' not in ee
 assert 'FLASH_PAGE_SIZE != 0x800U' in eeh
 assert re.search(r'#define\s+NB_OF_VAR\s+270u',eeh)
 util=(R/'Src/util.c').read_text(); addrs=[int(x) for x in re.search(r'VirtAddVarTab\[NB_OF_VAR\]\s*=\s*\{([^}]*)\}',util,re.S).group(1).split(',')]; assert addrs==list(range(1000,1270))
-assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8002800,\s*LENGTH\s*=\s*120K',ld)
+assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8002800,\s*LENGTH\s*=\s*240K',ld)
 assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*10K',bld)
 # Stock SET MCCONF ACK and default/read separation.
 assert 'uint8_t ack = COMM_SET_MCCONF' in vp

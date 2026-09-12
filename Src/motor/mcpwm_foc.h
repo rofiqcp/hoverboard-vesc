@@ -312,6 +312,7 @@ typedef struct {
     int32_t m_position_d_filter_q15;
     int32_t m_position_d_proc_filter_q15;
     uint16_t m_position_prev_proc_phase;
+    int32_t m_position_prev_proc_count; /* measured position for VESC process-D in count mode */
     uint16_t m_position_proc_dt_ticks;
     uint16_t m_position_breakaway_ticks;
     uint16_t m_position_no_motion_ticks;
@@ -332,8 +333,6 @@ typedef struct {
     int32_t m_speed_set_ramp_q16;
     uint16_t m_speed_ramp_rpm_s;
     uint32_t m_speed_release_erpm_q16; /* exact VESC s_pid_min_erpm runtime threshold */
-    uint16_t m_speed_breakaway_ticks;
-    uint8_t m_speed_breakaway_done;
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;
@@ -516,13 +515,14 @@ typedef struct {
 } mcpwm_foc_trace_meta_t;
 
 void mcpwm_foc_trace_clear(void);
+void mcpwm_foc_trace_freeze(void);
 void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out);
 bool mcpwm_foc_trace_read(uint8_t chronological_index, mcpwm_foc_trace_sample_t *out);
 
 typedef struct {
     uint32_t total_max_cycles, deadline_miss_count;
     uint32_t pre_max_cycles, control_max_cycles, post_max_cycles;
-    uint32_t pre_fault_max_cycles, pre_offset_max_cycles, pre_protect_max_cycles;
+    uint32_t pre_gate_max_cycles, pre_offset_max_cycles, pre_protect_max_cycles;
     uint32_t motor_step_max_cycles[2], motor_control_max_cycles[2], motor_hold_max_cycles[2];
     uint32_t sensor_max_cycles, pll_max_cycles, current_max_cycles, regulator_max_cycles;
     uint32_t position_pid_max_cycles, speed_pid_max_cycles, current_circle_max_cycles;
@@ -530,15 +530,24 @@ typedef struct {
     uint32_t svpwm_max_cycles, duty_mag_max_cycles, overrun_total;
     /* Profiler acceptance minimal: worst-case dan miss per scheduler slot 0..5.
      * Tidak menambah DWT read baru; memakai elapsed ISR yang sudah tersedia. */
-    uint32_t slot_max_cycles[6], slot_miss_count[6];
+    uint32_t slot_max_cycles[6], slot_miss_count[6], slot_count[6];
+    uint32_t detail_sample_count, detail_slot_count[6];
+    uint32_t steady_isr_count, slot_sequence_error_count;
+    uint32_t fast_hold_svpwm_max_cycles, profile_revision;
     /* Main-context 1-kHz SPEED/POS scheduler. Kept in the same diagnostic
      * transaction so timing can be verified without attaching SWD to F103. */
     uint32_t outer_max_cycles, outer_miss_count, outer_jitter_max_cycles;
     uint32_t outer_period_min_cycles, outer_period_max_cycles;
     uint32_t adc_heartbeat;
     uint32_t motor_heartbeat[2];
+    /* Monotonic validity counters. These are intentionally not cleared by
+     * mcpwm_foc_reset_isr_profile(); host tests compare snapshot deltas. */
+    uint32_t snapshot_dwt, irq_entry_count, irq_exit_count;
+    uint32_t motor_step_count[2];
+    uint32_t dma_tc_pending_exit_count;
 } mcpwm_foc_isr_profile_t;
 void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out);
+void mcpwm_foc_get_irq_epoch(uint32_t *entry, uint32_t *exit);
 void mcpwm_foc_reset_isr_profile(void);
 
 /* Hardware calibration / ISR diagnostics. */

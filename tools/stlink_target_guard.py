@@ -21,17 +21,23 @@ def resolve_stlink_transport(scripts: Path) -> str:
     return "swd"
 
 
-def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100) -> str:
+def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100, under_reset: bool = False,
+                       resume_before_shutdown: bool = False, expected_vtor: int | None = None,
+                       pc_min: int | None = None, pc_max: int | None = None) -> str:
     transport = resolve_stlink_transport(scripts)
     cmd = [str(openocd), "-s", str(scripts), "-f", "interface/stlink.cfg",
-           "-c", f"transport select {transport}",
-           "-c", "reset_config srst_only srst_nogate connect_assert_srst",
-           "-f", "target/stm32f1x.cfg",
+           "-c", f"transport select {transport}"]
+    if under_reset:
+        cmd += ["-c", "reset_config srst_only srst_nogate connect_assert_srst"]
+    actions = ["init", "halt", "flash info 0"]
+    if expected_vtor is not None or pc_min is not None or pc_max is not None:
+        actions += ["mdw 0xE000ED08 1", "reg pc"]
+    if resume_before_shutdown:
+        actions += ["resume"]
+    actions += ["shutdown"]
+    cmd += ["-f", "target/stm32f1x.cfg",
            "-c", f"adapter speed {int(speed)}",
-           # Keep the target halted for the whole identification session.
-           # Releasing it here creates an avoidable race where application code
-           # can run before the upload process reconnects.
-           "-c", "init; halt; flash info 0; shutdown"]
+           "-c", "; ".join(actions)]
     cp = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT, check=False)
     out = cp.stdout or ""
@@ -45,7 +51,26 @@ def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100) -> str:
         raise RuntimeError(
             f"STLINK_TARGET_REJECTED: expected STM32F103RCT6 {EXPECTED_CORE} "
             f"DEV_ID=0x{EXPECTED_DEV_ID:03X}, got core={core} DEV_ID={did}; NO FLASH WRITE PERFORMED")
-    print(f"STLINK_TARGET_F103_PASS core={EXPECTED_CORE} DEV_ID=0x{dev_id:03X}", flush=True)
+    vtor = None
+    pc = None
+    if expected_vtor is not None:
+        m = re.search(r"0xe000ed08:\s*([0-9a-fA-F]{8})", out, re.I)
+        vtor = int(m.group(1), 16) if m else None
+        if vtor != expected_vtor:
+            got = f"0x{vtor:08X}" if vtor is not None else "unknown"
+            raise RuntimeError(f"STLINK_RUNTIME_REJECTED: expected VTOR=0x{expected_vtor:08X}, got {got}")
+    if pc_min is not None or pc_max is not None:
+        m = re.search(r"pc\s+\(/32\):\s*0x([0-9a-fA-F]+)", out, re.I)
+        if not m:
+            m = re.search(r"\bpc:\s*0x([0-9a-fA-F]+)", out, re.I)
+        pc = int(m.group(1), 16) if m else None
+        if pc is None or (pc_min is not None and pc < pc_min) or (pc_max is not None and pc >= pc_max):
+            got = f"0x{pc:08X}" if pc is not None else "unknown"
+            raise RuntimeError(f"STLINK_RUNTIME_REJECTED: PC {got} outside expected runtime image")
+    extra = ''
+    if vtor is not None: extra += f" VTOR=0x{vtor:08X}"
+    if pc is not None: extra += f" PC=0x{pc:08X}"
+    print(f"STLINK_TARGET_F103_PASS core={EXPECTED_CORE} DEV_ID=0x{dev_id:03X}{extra}", flush=True)
     return out
 
 
@@ -54,9 +79,11 @@ def main() -> None:
     ap.add_argument("--openocd", required=True)
     ap.add_argument("--scripts", required=True)
     ap.add_argument("--speed", type=int, default=100)
+    ap.add_argument("--under-reset", action="store_true")
+    ap.add_argument("--resume", action="store_true", help="resume core before shutdown after a read-only probe")
     args = ap.parse_args()
     try:
-        verify_f103_target(Path(args.openocd), Path(args.scripts), args.speed)
+        verify_f103_target(Path(args.openocd), Path(args.scripts), args.speed, args.under_reset, args.resume)
     except RuntimeError as exc:
         raise SystemExit(str(exc))
 

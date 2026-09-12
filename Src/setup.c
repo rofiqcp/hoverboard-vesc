@@ -411,7 +411,19 @@ void MX_ADC1_Init(void) {
   /**Enable or disable the remapping of ADC1_ETRGREG:
     * ADC1 External Event regular conversion is connected to TIM8 TRG0
     */
-  __HAL_AFIO_REMAP_ADC1_ETRGREG_ENABLE();
+  /* STM32F1 HAL AFIO_REMAP_ENABLE() ORs AFIO_MAPR_SWJ_CFG (0x07000000)
+   * into MAPR. On F103 this can disable SW-DP after boot, which makes ST-Link
+   * attach possible only under reset. Program ADC1_ETRGREG remap atomically
+   * while forcing SWJ_CFG back to reset/full-SWJ. Never use the generic HAL
+   * remap macro for MAPR on this target. */
+  {
+    uint32_t mapr = AFIO->MAPR;
+    mapr &= ~(AFIO_MAPR_SWJ_CFG_Msk | AFIO_MAPR_ADC1_ETRGREG_REMAP);
+    mapr |= AFIO_MAPR_ADC1_ETRGREG_REMAP | AFIO_MAPR_SWJ_CFG_RESET;
+    AFIO->MAPR = mapr;
+    __DSB();
+    __ISB();
+  }
 
   /**Configure the ADC multi-mode
     */

@@ -421,7 +421,7 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
              * before arming hard-stop detection. Until then the adaptive current
              * ramp remains active. */
             int32_t progress=(now-origin)*(int32_t)user_dir;
-            if(progress>=(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS){
+            if(progress>=(int32_t)MCCONF_STEERING_MOTION_PROGRESS_COUNTS){
                 direction_has_moved=true;
                 last=now;
                 last_move_age=age;
@@ -493,7 +493,7 @@ static bool steering_center_after_span_calibration(void){
     const int32_t span=mcpwm_foc_steering_span_counts();
     const int32_t span_abs=span<0?-span:span;
     if(span_abs<MCCONF_STEERING_MIN_SPAN_COUNTS)return false;
-    const int32_t hard_margin=span_abs/2+(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS*2;
+    const int32_t hard_margin=span_abs/2+(int32_t)MCCONF_STEERING_MOTION_PROGRESS_COUNTS*2;
 
     /* Coarse return uses the normal calibrated position loop, now with the
      * corrected process-D sign. It limits acceleration far better than a long
@@ -559,8 +559,8 @@ static bool steering_center_after_span_calibration(void){
         const int32_t after=m->m_position_counts;
         const int32_t aa=after<0?-after:after;
         const int32_t directed=(after-before)*(int32_t)user_dir;
-        if(directed<-(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS)goto center_fail;
-        if(aa+(int32_t)MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS<ab){
+        if(directed<-(int32_t)MCCONF_STEERING_MOTION_PROGRESS_COUNTS)goto center_fail;
+        if(aa+(int32_t)MCCONF_STEERING_MOTION_PROGRESS_COUNTS<ab){
             no_progress_pulses=0u;
         }else if(no_progress_pulses<255u){
             no_progress_pulses++;

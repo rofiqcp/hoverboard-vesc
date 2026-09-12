@@ -160,7 +160,8 @@ def print_diag(prefix: str, d: Diag) -> None:
                   f"lastDC={d.last_trip_dc_a:.2f}A lastDuty={100*d.last_trip_duty:.1f}%")
         if d.driven_offset0 is not None:
             print(f"  CONTROL_OFFSETS raw=[{d.driven_offset0},{d.driven_offset1},{d.driven_offset_dc}] "
-                  f"valid={int(d.driven_offset_valid)} calibrating={int(d.driven_offset_calibrating)} samples={d.driven_offset_samples}")
+                  f"boot_valid={int(bool(d.current_offset_valid))} driven_valid={int(d.driven_offset_valid)} "
+                  f"calibrating={int(d.driven_offset_calibrating)} samples={d.driven_offset_samples}")
 
 
 def hall_table_valid(table: list[int]) -> tuple[bool, str]:

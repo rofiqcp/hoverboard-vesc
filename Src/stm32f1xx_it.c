@@ -38,6 +38,7 @@
 #include "defines.h"
 #include "config.h"
 #include "util.h"
+#include "vesc/f103_boot_layout.h"
 
 extern DMA_HandleTypeDef hdma_usart3_rx;
 extern DMA_HandleTypeDef hdma_usart3_tx;
@@ -78,64 +79,49 @@ static inline void f103_emergency_pwm_off(void)
   TIM8->CCR1 = 0; TIM8->CCR2 = 0; TIM8->CCR3 = 0;
 }
 
+static __attribute__((noreturn)) void f103_fault_to_recovery(uint32_t reason)
+{
+  /* Keep the power stage inert, preserve SWD, and make a synchronous reset
+   * into the resident bootloader. This prevents a persistent application fault
+   * from becoming fault -> IWDG -> reboot -> fault forever. */
+  f103_emergency_pwm_off();
+  DBGMCU->CR |= DBGMCU_CR_DBG_IWDG_STOP;
+  volatile uint32_t *const boot_request = (volatile uint32_t *)F103_BOOT_REQUEST_ADDR;
+  boot_request[0] = F103_BOOT_REQUEST_MAGIC;
+  boot_request[1] = F103_BOOT_REQUEST_MAGIC_INV;
+  *(volatile uint32_t *)F103_RESET_REASON_ADDR = reason;
+  __DSB();
+  __ISB();
+  NVIC_SystemReset();
+  for (;;) { __NOP(); }
+}
+
 /**
 * @brief This function handles Hard fault interrupt.
 */
 void f103_HardFault_Handler_impl(void) {
-  f103_emergency_pwm_off();
-  /* USER CODE BEGIN HardFault_IRQn 0 */
-
-  /* USER CODE END HardFault_IRQn 0 */
-  while(1) {
-  }
-  /* USER CODE BEGIN HardFault_IRQn 1 */
-
-  /* USER CODE END HardFault_IRQn 1 */
+  f103_fault_to_recovery(0x48415244u); /* HARD */
 }
 
 /**
 * @brief This function handles Memory management fault.
 */
 void f103_MemManage_Handler_impl(void) {
-  f103_emergency_pwm_off();
-  /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
-  /* USER CODE END MemoryManagement_IRQn 0 */
-  while(1) {
-  }
-  /* USER CODE BEGIN MemoryManagement_IRQn 1 */
-
-  /* USER CODE END MemoryManagement_IRQn 1 */
+  f103_fault_to_recovery(0x4D454D46u); /* MEMF */
 }
 
 /**
 * @brief This function handles Prefetch fault, memory access fault.
 */
 void f103_BusFault_Handler_impl(void) {
-  f103_emergency_pwm_off();
-  /* USER CODE BEGIN BusFault_IRQn 0 */
-
-  /* USER CODE END BusFault_IRQn 0 */
-  while(1) {
-  }
-  /* USER CODE BEGIN BusFault_IRQn 1 */
-
-  /* USER CODE END BusFault_IRQn 1 */
+  f103_fault_to_recovery(0x42555346u); /* BUSF */
 }
 
 /**
 * @brief This function handles Undefined instruction or illegal state.
 */
 void f103_UsageFault_Handler_impl(void) {
-  f103_emergency_pwm_off();
-  /* USER CODE BEGIN UsageFault_IRQn 0 */
-
-  /* USER CODE END UsageFault_IRQn 0 */
-  while(1) {
-  }
-  /* USER CODE BEGIN UsageFault_IRQn 1 */
-
-  /* USER CODE END UsageFault_IRQn 1 */
+  f103_fault_to_recovery(0x55534746u); /* USGF */
 }
 
 /**

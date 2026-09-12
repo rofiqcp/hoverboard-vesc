@@ -12,9 +12,28 @@ OUT = ROOT / "dist/f103_factory_boot_app.bin"
 FLASH_BASE = 0x08000000
 BOOT_SIZE = 0x2800
 APP_BASE = FLASH_BASE + BOOT_SIZE
-APP_REGION_SIZE = 0x1E000
+APP_REGION_SIZE = 0x3C000
+META_BASE = 0x0803E800
+META_OFFSET = META_BASE - FLASH_BASE
+META_MAGIC = 0x56455343
+META_STATE_CONFIRMED = 0x434E464D
+META_VERSION = 2
 RAM_LO = 0x20000000
 RAM_HI = 0x2000C000
+def crc16(data: bytes) -> int:
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    return crc
+
+def confirmed_meta(app: bytes) -> bytes:
+    size = len(app); c = crc16(app)
+    return struct.pack('<IIIIHHHHHHII', META_MAGIC, META_STATE_CONFIRMED, size, (~size) & 0xFFFFFFFF,
+                       c, (~c) & 0xFFFF, META_VERSION, (~META_VERSION) & 0xFFFF,
+                       0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+
 def fail(msg: str) -> None:
     raise SystemExit(f"FACTORY_IMAGE_FAIL: {msg}")
 
@@ -38,17 +57,19 @@ def main() -> None:
     if (rv & 1) == 0 or not (APP_BASE <= pc < APP_BASE + APP_REGION_SIZE):
         fail(f"invalid application Reset_Handler 0x{rv:08X}")
 
-    image = bytearray(b"\xFF" * (BOOT_SIZE + len(app)))
+    meta = confirmed_meta(app)
+    image = bytearray(b"\xFF" * (META_OFFSET + len(meta)))
     image[: len(boot)] = boot
     image[BOOT_SIZE : BOOT_SIZE + len(app)] = app
+    image[META_OFFSET : META_OFFSET + len(meta)] = meta
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_bytes(image)
 
     digest = hashlib.sha256(image).hexdigest()
     print(
         "FACTORY_IMAGE_PASS "
-        f"boot={len(boot)} app={len(app)} total={len(image)} "
-        f"app_base=0x{APP_BASE:08X} sha256={digest}"
+        f"boot={len(boot)} app={len(app)} meta={len(meta)} total={len(image)} "
+        f"app_base=0x{APP_BASE:08X} meta_base=0x{META_BASE:08X} crc16=0x{crc16(app):04X} sha256={digest}"
     )
     print(f"FACTORY_IMAGE={OUT}")
 

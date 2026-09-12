@@ -17,6 +17,7 @@
 #include "vesc/buffer.h"
 #include "vesc/crc.h"
 #include "vesc/flash_update_f103.h"
+#include "vesc/f103_boot_layout.h"
 #include "vesc/mcconf_serial.h"
 #include "vesc/vesc_protocol.h"
 #include "vesc/app_vesc.h"
@@ -59,6 +60,9 @@
 #define HB_CUSTOM_GET_TRACE_SAMPLE             19u /* chronological trace sample */
 #define HB_CUSTOM_CLEAR_TRACE                  20u /* re-arm recorder after diagnosis */
 #define HB_CUSTOM_GET_PLATFORM_HEALTH           21u /* reset cause + IWDG/liveness supervisory state */
+#define HB_CUSTOM_FREEZE_TRACE                   22u /* diagnostic-only manual flight-recorder freeze */
+#define HB_CUSTOM_GET_FW_UPDATE_STATE             23u /* persistent boot metadata state/size/CRC */
+#define HB_CUSTOM_GET_COMMS_HEALTH                 24u /* bounded RX/TX/main-loop transport health */
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -150,6 +154,7 @@ static uint8_t s_tx_tail = 0u;
 static uint8_t s_tx_count = 0u;
 static uint8_t s_tx_active = 0u;
 static uint32_t s_tx_queue_drop = 0u;
+static uint32_t s_tx_queue_highwater = 0u;
 static uint32_t s_tx_start_fail = 0u;
 #ifdef STM32F103xE
 /* Wall-cycle profiler COMM_GET_VALUES. DWT elapsed sengaja termasuk preemption
@@ -298,6 +303,7 @@ void vesc_protocol_init(void) {
     s_tx_head = s_tx_tail = s_tx_count = s_tx_active = 0u;
     memset(s_tx_len, 0, sizeof(s_tx_len));
     s_tx_queue_drop = 0u;
+    s_tx_queue_highwater = 0u;
     s_tx_start_fail = 0u;
     s_last_hall_store_ok[0] = s_last_hall_store_ok[1] = 0u;
     memset(&s_hall_detect, 0, sizeof(s_hall_detect));
@@ -523,6 +529,7 @@ static void uart_send_payload(const uint8_t *payload, uint16_t len) {
     s_tx_len[slot] = i;
     s_tx_head = (uint8_t)((slot + 1u) % VESC_TX_QUEUE_DEPTH);
     s_tx_count++;
+    if ((uint32_t)s_tx_count > s_tx_queue_highwater) s_tx_queue_highwater=s_tx_count;
     vesc_tx_service();
 }
 
@@ -2230,13 +2237,15 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     if (op == HB_CUSTOM_GET_ISR_PROFILE) {
         if(n>=1u && d[0]!=0u)mcpwm_foc_reset_isr_profile();
         mcpwm_foc_isr_profile_t p; mcpwm_foc_get_isr_profile(&p);
-        uint8_t b[192]; int32_t j=0;
+        /* Stage-1 profiler v0x00020002 exceeds the 255-byte short-frame limit.
+         * uart_send_payload() automatically emits the normal VESC long frame. */
+        uint8_t b[320]; int32_t j=0;
         b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
         b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
 #define APPP(v) buffer_append_uint32(b,(v),&j)
         APPP(p.total_max_cycles); APPP(p.deadline_miss_count);
         APPP(p.pre_max_cycles); APPP(p.control_max_cycles); APPP(p.post_max_cycles);
-        APPP(p.pre_fault_max_cycles); APPP(p.pre_offset_max_cycles); APPP(p.pre_protect_max_cycles);
+        APPP(p.pre_gate_max_cycles); APPP(p.pre_offset_max_cycles); APPP(p.pre_protect_max_cycles);
         APPP(p.motor_step_max_cycles[0]); APPP(p.motor_step_max_cycles[1]);
         APPP(p.motor_control_max_cycles[0]); APPP(p.motor_control_max_cycles[1]);
         APPP(p.motor_hold_max_cycles[0]); APPP(p.motor_hold_max_cycles[1]);
@@ -2246,9 +2255,17 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         APPP(p.svpwm_max_cycles); APPP(p.duty_mag_max_cycles); APPP(p.overrun_total);
         for(uint8_t si=0u;si<6u;++si)APPP(p.slot_max_cycles[si]);
         for(uint8_t si=0u;si<6u;++si)APPP(p.slot_miss_count[si]);
+        for(uint8_t si=0u;si<6u;++si)APPP(p.slot_count[si]);
+        APPP(p.detail_sample_count);
+        for(uint8_t si=0u;si<6u;++si)APPP(p.detail_slot_count[si]);
+        APPP(p.steady_isr_count); APPP(p.slot_sequence_error_count);
+        APPP(p.fast_hold_svpwm_max_cycles); APPP(p.profile_revision);
         APPP(p.outer_max_cycles); APPP(p.outer_miss_count); APPP(p.outer_jitter_max_cycles);
         APPP(p.outer_period_min_cycles); APPP(p.outer_period_max_cycles);
         APPP(p.adc_heartbeat); APPP(p.motor_heartbeat[0]); APPP(p.motor_heartbeat[1]);
+        APPP(p.snapshot_dwt); APPP(p.irq_entry_count); APPP(p.irq_exit_count);
+        APPP(p.motor_step_count[0]); APPP(p.motor_step_count[1]);
+        APPP(p.dma_tc_pending_exit_count);
 #undef APPP
         uart_send_payload(b,(uint16_t)j); return;
     }
@@ -2263,6 +2280,41 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_uint32(b,w.reject_count,&j); buffer_append_uint32(b,w.last_adc_heartbeat,&j);
         buffer_append_uint32(b,w.last_motor_heartbeat[0],&j); buffer_append_uint32(b,w.last_motor_heartbeat[1],&j);
         buffer_append_uint32(b,w.last_feed_ms,&j); uart_send_payload(b,(uint16_t)j); return;
+    }
+    if (op == HB_CUSTOM_GET_COMMS_HEALTH) {
+        uint8_t b[96]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+#define APPCH(v) buffer_append_uint32(b,(uint32_t)(v),&j)
+        APPCH(s_rx_ok); APPCH(s_rx_crc_err); APPCH(s_rx_timeout_reset);
+        APPCH(s_rx_queue_drop); APPCH(s_rx_queue_highwater); APPCH(s_rt_cmd_coalesced);
+        APPCH(s_tx_queue_drop); APPCH(s_tx_start_fail); APPCH(s_tx_queue_highwater);
+        APPCH(s_process_gap_max_ms); APPCH(s_pending_count); APPCH(s_tx_count);
+        APPCH(s_tx_active); APPCH(s_rx_active);
+#ifdef STM32F103xE
+        APPCH(usart3_rx_error_count()); APPCH(usart3_rx_restart_count()); APPCH(usart3_forced_recovery_count());
+        APPCH(main_prof_vesc_max_cycles); APPCH(main_prof_house_max_cycles); APPCH(main_prof_tail_max_cycles);
+#else
+        for(uint8_t z=0u;z<6u;++z)APPCH(0u);
+#endif
+#undef APPCH
+        uart_send_payload(b,(uint16_t)j); return;
+    }
+    if (op == HB_CUSTOM_GET_FW_UPDATE_STATE) {
+        const f103_update_meta_t *m=(const f103_update_meta_t *)F103_META_BASE_ADDR;
+        const bool common=(m->magic==F103_UPDATE_META_MAGIC) &&
+                          (m->size>0u && m->size<=F103_APP_REGION_SIZE) &&
+                          (m->size==~m->size_inv) &&
+                          (m->version==F103_UPDATE_META_VERSION) &&
+                          ((uint16_t)(m->version ^ m->version_inv)==0xFFFFu);
+        const bool crc_ok=common && ((uint16_t)(m->crc16 ^ m->crc16_inv)==0xFFFFu);
+        uint8_t b[20]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=(common && crc_ok)?0u:1u;
+        buffer_append_uint32(b,common?m->state:0u,&j);
+        buffer_append_uint32(b,common?m->size:0u,&j);
+        buffer_append_uint16(b,crc_ok?m->crc16:0u,&j);
+        uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_GET_TRACE_META) {
         mcpwm_foc_trace_meta_t t; mcpwm_foc_trace_get_meta(&t);
@@ -2288,6 +2340,9 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     }
     if (op == HB_CUSTOM_CLEAR_TRACE) {
         mcpwm_foc_trace_clear();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u};uart_send_payload(b,6u);return;
+    }
+    if (op == HB_CUSTOM_FREEZE_TRACE) {
+        mcpwm_foc_trace_freeze();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u};uart_send_payload(b,6u);return;
     }
 
     if (op == HB_CUSTOM_ENCODER_DEBUG) {
@@ -2486,8 +2541,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             int16_t driven_off0,driven_off1,driven_offdc;
             uint16_t driven_samples; uint8_t driven_valid,driven_cal;
             int16_t off0,off1,offdc; uint16_t off_samples,off_settle; uint8_t off_valid;
-        } ds;
-        __disable_irq();
+        } ds = {0};
+        uint32_t snap_e0,snap_x0,snap_e1,snap_x1;
+        for(;;) {
+        mcpwm_foc_get_irq_epoch(&snap_e0,&snap_x0);
+        if(snap_e0!=snap_x0)continue;
         ds.mode=m->m_control_mode; ds.state=m->m_state; ds.fault=m->m_fault;
         ds.hall=m->m_hall_state; ds.hall_pos=m->m_hall_pos; ds.hall_prev=m->m_hall_pos_prev;
         ds.hall_dir=m->m_hall_direction; ds.interp=m->m_hall_interp_active; ds.rej_reason=m->m_hall_last_reject_reason;
@@ -2505,8 +2563,10 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         ds.driven_off0=m->m_driven_offset0; ds.driven_off1=m->m_driven_offset1; ds.driven_offdc=m->m_driven_offsetdc;
         ds.driven_samples=m->m_driven_offset_samples; ds.driven_valid=m->m_driven_offset_valid; ds.driven_cal=m->m_driven_offset_calibrating;
         ds.off0=m->m_off_offset0; ds.off1=m->m_off_offset1; ds.offdc=m->m_off_offsetdc;
-        ds.off_samples=m->m_off_offset_samples; ds.off_settle=m->m_off_settle_ticks; ds.off_valid=m->m_off_offset_valid;
-        __enable_irq();
+        ds.off_samples=m->m_off_offset_samples; ds.off_settle=m->m_off_settle_ticks; ds.off_valid=m->m_current_offset_valid;
+        mcpwm_foc_get_irq_epoch(&snap_e1,&snap_x1);
+        if(snap_e0==snap_e1 && snap_x0==snap_x1 && snap_e1==snap_x1)break;
+        }
         const uint16_t pp=mcpwm_foc_get_pole_pairs(second);
         float erpm_f=(float)ds.rpm*(float)pp;
         if(ds.hall_init && ds.hall_dir!=0 && ds.hall_period>0u && ds.hall_period<MCCONF_HALL_TIMEOUT_TICKS && ds.hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS)
@@ -2604,7 +2664,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint16(b,adc_buffer.dcl,&i); buffer_append_uint16(b,adc_buffer.rrB,&i);
             buffer_append_uint16(b,adc_buffer.rrC,&i); buffer_append_uint16(b,adc_buffer.dcr,&i);
             buffer_append_int16(b,ds.off0,&i); buffer_append_int16(b,ds.off1,&i); buffer_append_int16(b,ds.offdc,&i);
-            buffer_append_uint16(b,ds.off_samples,&i); buffer_append_uint16(b,ds.off_settle,&i); b[i++]=ds.off_valid;
+            buffer_append_uint16(b,ds.off_samples,&i); buffer_append_uint16(b,ds.off_settle,&i); b[i++]=ds.off_valid; /* current_offset_valid */
             buffer_append_uint32(b,s_tx_queue_drop,&i);
             buffer_append_uint32(b,s_tx_start_fail,&i);
             buffer_append_uint32(b,s_rx_queue_highwater,&i);
@@ -2767,6 +2827,31 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
             (unsigned long)foc_prof_regulator_max_cycles,(unsigned long)foc_prof_svpwm_max_cycles,
             (unsigned long)m->m_overrun_count,(unsigned long)s_rx_queue_drop,(unsigned long)s_tx_queue_drop,
             (unsigned long)s_process_gap_max_ms);terminal_send_text(o);return;}
+
+
+    if(!strcmp(a[0],"trace")){
+        const char *sub=ac>1?a[1]:"meta"; terminal_lower((char *)sub);
+        if(!strcmp(sub,"clear")){mcpwm_foc_trace_clear();terminal_send_text("OK trace cleared\n");return;}
+        if(!strcmp(sub,"freeze")){mcpwm_foc_trace_freeze();terminal_send_text("OK trace frozen\n");return;}
+        if(!strcmp(sub,"meta")){
+            mcpwm_foc_trace_meta_t tm;mcpwm_foc_trace_get_meta(&tm);
+            snprintf(o,sizeof(o),"trace write=%lu frozen=%u trig_motor=%u trig_fault=%u count=%u head=%u cap=%u sample=%u\n",
+                (unsigned long)tm.write_count,(unsigned)tm.frozen,(unsigned)tm.trigger_motor,(unsigned)tm.trigger_fault,
+                (unsigned)tm.count,(unsigned)tm.head,(unsigned)tm.capacity,(unsigned)tm.sample_size);
+            terminal_send_text(o);return;
+        }
+        if(!strcmp(sub,"sample")&&ac>2){
+            float xf=0.0f;if(!terminal_float(a[2],&xf)||xf<0.0f||xf>255.0f){terminal_send_text("ERR trace sample 0..255\n");return;}
+            const uint8_t ix=(uint8_t)xf;mcpwm_foc_trace_sample_t ts;
+            if(!mcpwm_foc_trace_read(ix,&ts)){terminal_send_text("ERR trace sample unavailable\n");return;}
+            snprintf(o,sizeof(o),"trace %u tick=%lu cyc=%u slot=%u ev=%u L=id:%d iq:%d idt:%d iqt:%d vd:%d vq:%d e:%d f:%u q:%u R=id:%d iq:%d idt:%d iqt:%d vd:%d vq:%d e:%d f:%u q:%u vin=%u\n",
+                (unsigned)ix,(unsigned long)ts.pwm_tick,(unsigned)ts.isr_cycles,(unsigned)ts.control_slot,(unsigned)ts.event_bits,
+                (int)ts.left_id_q4,(int)ts.left_iq_q4,(int)ts.left_id_set_q4,(int)ts.left_iq_set_q4,(int)ts.left_vd,(int)ts.left_vq,(int)ts.left_erpm,(unsigned)ts.left_fault,(unsigned)ts.left_quality,
+                (int)ts.right_id_q4,(int)ts.right_iq_q4,(int)ts.right_id_set_q4,(int)ts.right_iq_set_q4,(int)ts.right_vd,(int)ts.right_vq,(int)ts.right_erpm,(unsigned)ts.right_fault,(unsigned)ts.right_quality,(unsigned)ts.vin_adc);
+            terminal_send_text(o);return;
+        }
+        terminal_send_text("ERR trace clear|freeze|meta|sample N\n");return;
+    }
 
     bool alias_enc=!strcmp(a[0],"foc_encoder_detect");
     if(!strcmp(a[0],"detect")||alias_enc){
@@ -3189,14 +3274,15 @@ static void process_top_packet(const uint8_t *p, uint16_t len) {
 }
 
 static void process_rt_mailboxes(void) {
+    /* RX DMA bytes are parsed only by usart3_rx_check() in main context. The
+     * realtime mailbox therefore has one producer and one consumer in the same
+     * context; masking the priority-0 FOC IRQ here only adds avoidable jitter. */
     for (uint8_t mi=0u; mi<2u; ++mi) {
         uint8_t p[5]; uint8_t have=0u;
-        __disable_irq();
         if (s_rt_cmd[mi].pending && s_rt_cmd[mi].len==5u) {
             memcpy(p,(const void *)s_rt_cmd[mi].payload,5u);
             s_rt_cmd[mi].pending=0u; have=1u;
         }
-        __enable_irq();
         if (have) process_command(p,5u,mi!=0u);
     }
 }
@@ -3217,11 +3303,10 @@ void vesc_protocol_process_pending(void) {
     for (uint8_t processed = 0u; processed < 2u; ++processed) {
         uint16_t n = 0u;
         uint8_t slot = 0u;
-        __disable_irq();
-        if (s_pending_count == 0u) {
-            __enable_irq();
-            break;
-        }
+        /* complete_frame() and this consumer both execute in main context.
+         * Never hold off the 16-kHz DMA1_Channel1 IRQ while copying up to a
+         * 700-byte configuration packet. */
+        if (s_pending_count == 0u) break;
         slot = s_pending_tail;
         n = s_pending_len[slot];
         if (n > VESC_MAX_PAYLOAD) n = VESC_MAX_PAYLOAD;
@@ -3229,7 +3314,6 @@ void vesc_protocol_process_pending(void) {
         s_pending_len[slot] = 0u;
         s_pending_tail = (uint8_t)((slot + 1u) % VESC_RX_QUEUE_DEPTH);
         s_pending_count--;
-        __enable_irq();
         s_link_last_ms = HAL_GetTick();
         process_top_packet(s_process_payload, n);
         process_rt_mailboxes();

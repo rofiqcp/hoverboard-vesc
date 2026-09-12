@@ -35,12 +35,11 @@ def check_static():
     for token in ('BLDC_controller','rtwtypes.h','rtP_Left','rtP_Right','rtDW_Left','rtDW_Right'):
         assert token not in source_text, f'obsolete generated dependency in live source: {token}'
     ini=(ROOT/'platformio.ini').read_text()
-    for token in ('src_dir = Src','[env:APP_STLINK]','[env:APP_USART_PC]','[env:APP_F411]','[env:BOOTLOADER_STLINK]','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
+    for token in ('src_dir = Src','[env:APP_STLINK]','[env:APP_USART_PC]','[env:BOOTLOADER_STLINK]','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
         assert token in ini, f'platformio.ini missing {token}'
-    # Deployment may intentionally choose direct ST-Link or the resident F411
-    # gateway as the default uploader. The audit must validate both environments
-    # exist, not force one transport and fail after an intentional deployment switch.
-    assert re.search(r'^default_envs\s*=\s*(APP_STLINK|APP_F411)\s*$', ini, re.M), 'unsupported PlatformIO default_envs'
+    # Normal deployment is direct VESC protocol over USART3. ST-Link remains
+    # recovery-only and is never the default upload path.
+    assert re.search(r'^default_envs\s*=\s*APP_USART_PC\s*$', ini, re.M), 'default PlatformIO upload must use APP_USART_PC'
     # Warning policy: project sources use -Wall/-Wextra/-Werror via build_src_flags only.
     # Framework STM32Cube must not inherit project -Werror (avoids HAL_PCD unused-parameter build failure).
     before_build_flags=ini.split('build_flags =',1)[0]
@@ -105,7 +104,7 @@ def check_static():
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
     assert 'Safety gate phase 2' in mc and 'leftFeedbackReadyPost' in mc and 'rightFeedbackReadyPost' in mc and 'if(leftDriveRequest && leftFeedbackReadyPost && !leftCurrentTrip' in mc, 'bridge must arm only after FOC CCR update and post-Hall readiness check'
     assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
-    assert 'v->rpm=((float)PWM_FREQ*10.0f/(float)hall_period_i)' in mc and 'motor_pole_pairs(second)' in mc, 'VESC mc_values.rpm must be atomic ERPM'
+    assert 'v->rpm=((float)PWM_FREQ*10.0f/(float)is.hall_period)' in mc and 'motor_pole_pairs(second)' in mc and 'foc_telem_isr_snapshot(m,&is)' in mc, 'VESC mc_values.rpm must come from coherent Hall/encoder ISR snapshot'
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
     assert 'if(openloop_phase) m->m_phase=m->m_phase_openloop;' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
     assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'
@@ -232,7 +231,7 @@ def check_static():
     assert re.search(r'#define\s+PAGE1\s+\(\(uint16_t\)0x0001\)', eeh), 'EEPROM PAGE1 logical index must be 1'
     eec=(ROOT/'Src/eeprom.c').read_text()
     assert 'const uint32_t endAddress = Address + PAGE_SIZE - 1u;' in eec, 'EEPROM page erase verification must cover PAGE1 too'
-    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8002800,\s*LENGTH\s*=\s*120K', lds), 'application linker must start after 10-KiB bootloader and stay inside 120-KiB slot'
+    assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8002800,\s*LENGTH\s*=\s*240K', lds), 'application linker must start after 10-KiB bootloader and use the 240-KiB active region'
     assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*10K', bootlds), 'bootloader linker must own immutable first 10 KiB'
     mainc=(ROOT/'Src/main.c').read_text()
     assert '!vescLinkActive && !timeoutFlgSerial && enable == 0' in mainc, 'legacy blocking enable handshake must be suppressed while VESC link is armed'
@@ -278,12 +277,17 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_vesc_dual.py'])
     run([sys.executable,'tools/tests/host/test_v13_features.py'])
     run([sys.executable,'tools/tests/host/test_v14_features.py'])
+    run([sys.executable,'tools/tests/host/test_swd_boot_safety.py'])
+    run([sys.executable,'tools/tests/host/test_stlink_update_safety.py'])
     run([sys.executable,'tools/tests/host/test_bootloader_layout.py'])
+    run([sys.executable,'tools/tests/host/test_external_stream_resume.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_recovery.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_f411_route.py'])
     run([sys.executable,'tools/tests/host/test_v15_features.py'])
     run([sys.executable,'tools/tests/host/test_v16_features.py'])
+    run([sys.executable,'tools/tests/host/test_isr_profiler_stage1.py'])
+    run([sys.executable,'tools/tests/host/test_comms_isr_isolation_stage2.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])
     run([sys.executable,'tools/tests/host/test_hall_detect_algorithm.py'])
     run([sys.executable,'tools/tests/host/test_hall_3rev_runtime.py'])

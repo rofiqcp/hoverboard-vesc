@@ -42,6 +42,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f1xx_hal.h"
+#include "vesc/f103_boot_layout.h"
 
 /* Exported constants --------------------------------------------------------*/
 /* Base address of the Flash sectors */
@@ -184,8 +185,10 @@
 #endif
 
 /* Reserve the final 4 KiB of the 256-KiB Flash for two real 2-KiB pages.
- * Application Flash therefore ends at 0x0803EFFF (252 KiB used by linker). */
+ * The application region ends at 0x0803E7FF; 0x0803E800..0x0803EFFF is
+ * reserved boot metadata, and 0x0803F000..0x0803FFFF is EEPROM. */
 #define EEPROM_START_ADDRESS  ((uint32_t)0x0803F000u) /* physical 2-KiB page 126 */
+_Static_assert(EEPROM_START_ADDRESS == F103_EEPROM_BASE_ADDR, "EEPROM base must match boot flash partition");
 
 /* Pages 0 and 1 base and end addresses. */
 #define PAGE0_BASE_ADDRESS    ((uint32_t)0x0803F000u)

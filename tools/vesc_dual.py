@@ -448,6 +448,8 @@ HB_GET_TRACE_META = 18
 HB_GET_TRACE_SAMPLE = 19
 HB_CLEAR_TRACE = 20
 HB_GET_PLATFORM_HEALTH = 21
+HB_GET_COMMS_HEALTH = 24
+HB_FREEZE_TRACE = 22
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
@@ -689,6 +691,7 @@ class Diag:
     off_offset_samples: int | None = None
     off_settle_ticks: int | None = None
     off_offset_valid: bool | None = None
+    current_offset_valid: bool | None = None
     tx_queue_drops: int | None = None
     tx_start_failures: int | None = None
     rx_queue_highwater: int | None = None
@@ -790,7 +793,7 @@ def parse_diag(payload: bytes) -> Diag:
     if len(payload) >= 189:
         oo0, oo1, oodc, osamp, osettle, oval = struct.unpack_from(">3hHHB", payload, 178)
         ext.update(off_offset0=oo0, off_offset1=oo1, off_offset_dc=oodc,
-                   off_offset_samples=osamp, off_settle_ticks=osettle, off_offset_valid=bool(oval))
+                   off_offset_samples=osamp, off_settle_ticks=osettle, current_offset_valid=bool(oval))
     if len(payload) >= 197:
         txdrop, txfail = struct.unpack_from(">2I", payload, 189)
         ext.update(tx_queue_drops=txdrop, tx_start_failures=txfail)
@@ -1186,6 +1189,11 @@ class VescDual:
         with self.io_lock:
             self.send(l); self.send(self.fwd(r))
 
+    def set_rpm_one(self, erpm: int, right: bool = False) -> None:
+        """Command exactly one virtual VESC; do not energize the other endpoint with RPM=0."""
+        req = bytes((COMM_SET_RPM,)) + struct.pack(">i", int(erpm))
+        self.send_no_reply(req, right)
+
     def set_duty(self, left: float, right: float):
         l = bytes((COMM_SET_DUTY,)) + struct.pack(">i", round(left * 100000))
         r = bytes((COMM_SET_DUTY,)) + struct.pack(">i", round(right * 100000))
@@ -1198,6 +1206,11 @@ class VescDual:
             return bytes((COMM_SET_POS,)) + struct.pack(">i", round(deg * 1000000.0))
         with self.io_lock:
             self.send(enc(left_deg)); self.send(self.fwd(enc(right_deg)))
+
+    def set_pos_one(self, deg: float, right: bool = False) -> None:
+        """Command exactly one virtual VESC; useful for independent hardware validation."""
+        req = bytes((COMM_SET_POS,)) + struct.pack(">i", round(deg * 1000000.0))
+        self.send_no_reply(req, right)
 
     def brake(self, left_a: float, right_a: float):
         l = bytes((COMM_SET_CURRENT_BRAKE,)) + struct.pack(">i", round(left_a * 1000))
@@ -1351,17 +1364,35 @@ class VescDual:
         out=dict(zip(names,vals)); out.update(enabled=bool(enabled),healthy=bool(healthy),boot_iwdg=bool(boot_iwdg))
         return out
 
+    def comms_health(self) -> dict[str, int]:
+        p=self.custom_transact(HB_GET_COMMS_HEALTH,right=False,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_COMMS_HEALTH)
+        names=("rx_ok","rx_crc_err","rx_timeout_reset","rx_queue_drop","rx_queue_highwater","rt_cmd_coalesced",
+               "tx_queue_drop","tx_start_fail","tx_queue_highwater","process_gap_max_ms","pending_count","tx_count",
+               "tx_active","rx_active","uart_rx_error","uart_rx_restart","uart_forced_recovery",
+               "main_vesc_max_cycles","main_house_max_cycles","main_tail_max_cycles")
+        if status or len(p)!=6+4*len(names):
+            raise RuntimeError(f"comms_health status={status} len={len(p)}")
+        vals=struct.unpack_from(">"+"I"*len(names),p,6)
+        return dict(zip(names,vals))
+
     def isr_profile(self, reset: bool = False) -> dict[str, int]:
         names=(
             "total_max","deadline_miss","pre_max","control_max","post_max",
-            "pre_fault","pre_offset","pre_protect","left_step","right_step",
+            "pre_gate","pre_offset","pre_protect","left_step","right_step",
             "left_control","right_control","left_hold","right_hold",
             "sensor","pll","current","regulator","position_pid","speed_pid",
             "current_circle","id_pi","iq_pi","decouple_limit","svpwm","duty_mag","overrun",
             "slot0_max","slot1_max","slot2_max","slot3_max","slot4_max","slot5_max",
             "slot0_miss","slot1_miss","slot2_miss","slot3_miss","slot4_miss","slot5_miss",
+            "slot0_count","slot1_count","slot2_count","slot3_count","slot4_count","slot5_count",
+            "detail_sample_count",
+            "detail_slot0_count","detail_slot1_count","detail_slot2_count","detail_slot3_count","detail_slot4_count","detail_slot5_count",
+            "steady_isr_count","slot_sequence_errors","fast_hold_svpwm","profile_revision",
             "outer_max","outer_miss","outer_jitter","outer_period_min","outer_period_max",
-            "adc_heartbeat","left_heartbeat","right_heartbeat")
+            "adc_heartbeat","left_heartbeat","right_heartbeat",
+            "snapshot_dwt","irq_entry","irq_exit","left_step_count","right_step_count",
+            "dma_tc_pending_exit")
         p=self.custom_transact(HB_GET_ISR_PROFILE,bytes((1 if reset else 0,)),right=False,timeout=max(self.timeout,1.2))
         status=parse_custom_header(p,HB_GET_ISR_PROFILE)
         if status or len(p)!=6+4*len(names):
@@ -1388,6 +1419,10 @@ class VescDual:
     def trace_clear(self):
         p=self.custom_transact(HB_CLEAR_TRACE,right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_CLEAR_TRACE)
         if status: raise RuntimeError(f"trace_clear status={status}")
+
+    def trace_freeze(self):
+        p=self.custom_transact(HB_FREEZE_TRACE,right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_FREEZE_TRACE)
+        if status: raise RuntimeError(f"trace_freeze status={status}")
 
     def set_steering_deg(self, deg: float):
         """LEFT steering signed physical degrees for ROS/Web (-30..+30)."""

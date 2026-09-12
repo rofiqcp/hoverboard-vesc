@@ -63,13 +63,7 @@
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
 #define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   5000u 
-#define MCCONF_STEERING_SLEW_RATE_DEG_S          60u /* physical wheel slew; center-to-endpoint ~=0.5 s */
-#define MCCONF_STEERING_POSITION_KP_MULTIPLIER        3u /* 0.025 VESC base -> 0.075 effective; proportional through ~13 deg before 3-A ceiling */
-#define MCCONF_STEERING_BREAKAWAY_CURRENT_MA       3500u /* measured minimum to cross worst static steering stiction */
-#define MCCONF_STEERING_BREAKAWAY_MAX_MS               0u /* disabled: standard position PID has enough 4-A authority */
-#define MCCONF_STEERING_BREAKAWAY_DELAY_MS           150u
-#define MCCONF_STEERING_BREAKAWAY_ERROR_MDEG        1000u /* no high-current assist inside +/-1 degree */
-#define MCCONF_STEERING_BREAKAWAY_PROGRESS_COUNTS     32u /* require ~0.39 deg real rack motion; reject encoder/mechanical chatter */
+#define MCCONF_STEERING_MOTION_PROGRESS_COUNTS       32u /* commissioning motion threshold; not a torque assist */
 #define MCCONF_STEERING_CENTER_CURRENT_A           2.00f /* commissioning return-to-midpoint */
 #define MCCONF_STEERING_CENTER_TOL_COUNTS           24u /* ~0.32 deg on measured ~4500-count span */
 #define MCCONF_STEERING_CENTER_PID_MS             2500u
@@ -125,16 +119,10 @@
  * not use these limits; it follows VESC normalized PID and motor-current limits. */
 #define MCCONF_POSITION_CURRENT_MAX_MA          600u /* custom count-position ceiling */
 #define MCCONF_POSITION_DAMP_CURRENT_MA         400u /* kinetic brake; below measured 0.6 A static breakaway */
-#define MCCONF_POSITION_COUNT_BREAKAWAY_CURRENT_MA 600u /* minimum bounded torque for +/-1 Hall-count stiction */
-#define MCCONF_POSITION_COUNT_BREAKAWAY_KICK_MS   350u /* short pulse; never continuous at target */
-#define MCCONF_POSITION_COUNT_BREAKAWAY_DELAY_MS    20u /* let normal VESC PID act first */
 /* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps
  * mechanical RPM fixed-point, so 1500 ERPM/s / 15 pole-pairs = 100 RPM/s. */
 #define MCCONF_SPEED_RAMP_ERPMS_S             1500u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
-#define MCCONF_SPEED_BREAKAWAY_CURRENT_MA      1000u /* one-shot startup torque, bounded below normal 3 A limit */
-#define MCCONF_SPEED_BREAKAWAY_MAX_MS            450u /* never hold breakaway torque on a blocked rotor */
-#define MCCONF_SPEED_BREAKAWAY_EXIT_ERPM          150u /* first reliable Hall motion ends the startup kick */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               20.0f /* hard phase fault, above 15A control limit */

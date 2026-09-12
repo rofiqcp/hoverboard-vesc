@@ -62,6 +62,14 @@ link.transact=fake_transact
 off,ratio,inv=link.detect_encoder(1.25,False); assert cap[-1][0]==bytes([vd.COMM_DETECT_ENCODER])+struct.pack('>i',1250) and cap[-1][1]==vd.COMM_DETECT_ENCODER
 assert abs(off-17.25)<1e-9 and abs(ratio-15.0)<1e-9 and inv
 
+# Stage-2 communication health parser ABI.
+health_link=vd.VescDual.__new__(vd.VescDual); health_link.timeout=0.1
+health_vals=tuple(range(100,120))
+health_payload=bytes([vd.COMM_CUSTOM_APP_DATA,0x48,0x42,1,vd.HB_GET_COMMS_HEALTH,0])+struct.pack(">20I",*health_vals)
+health_link.custom_transact=lambda *a,**k: health_payload
+h=health_link.comms_health()
+assert h["rx_ok"]==100 and h["tx_queue_highwater"]==108 and h["uart_forced_recovery"]==116 and h["main_tail_max_cycles"]==119
+
 # Auto transport contract: TCP 65101 has priority; direct F411 is only fallback.
 orig_tcp,orig_direct=vd.TcpSerialTransport,vd.F411DirectTransport
 old_wait=vd.os.environ.get("VESC_TCP_WAIT_SEC")
