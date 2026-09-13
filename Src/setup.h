@@ -24,12 +24,13 @@
 #define SETUP_H
 
 #include "stm32f1xx_hal.h"
+#include <stdbool.h>
 
 void MX_GPIO_Init(void);
-void MX_TIM_Init(void);
-void MX_ADC1_Init(void);
-void MX_ADC2_Init(void);
-void UART3_Init(void);
+bool MX_TIM_Init(void);
+bool MX_ADC1_Init(void);
+bool MX_ADC2_Init(void);
+bool UART3_Init(void);
 
 #endif
 

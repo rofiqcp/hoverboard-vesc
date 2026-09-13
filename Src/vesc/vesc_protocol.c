@@ -38,7 +38,7 @@
  * COMM_CUSTOM_APP_DATA, so stock VESC commands remain wire-compatible. */
 #define HB_CUSTOM_MAGIC0              0x48u /* 'H' */
 #define HB_CUSTOM_MAGIC1              0x42u /* 'B' */
-#define HB_CUSTOM_VERSION                1u
+#define HB_CUSTOM_VERSION                2u
 #define HB_CUSTOM_GET_DIAG               1u
 #define HB_CUSTOM_GET_POS_STATE          2u
 #define HB_CUSTOM_SET_POS_LIMITS         3u
@@ -63,6 +63,27 @@
 #define HB_CUSTOM_FREEZE_TRACE                   22u /* diagnostic-only manual flight-recorder freeze */
 #define HB_CUSTOM_GET_FW_UPDATE_STATE             23u /* persistent boot metadata state/size/CRC */
 #define HB_CUSTOM_GET_COMMS_HEALTH                 24u /* bounded RX/TX/main-loop transport health */
+#define HB_CUSTOM_GET_PLATFORM_INFO                 25u /* fail-closed source/schema/build identity */
+#define HB_CUSTOM_GET_ADC_VALIDITY                  26u /* fixed-trigger CCR/zero-window evidence */
+#define HB_CUSTOM_ARM_CURRENT_STEP                  27u /* exact control-slot trace step */
+#define HB_CUSTOM_GET_STEP_STATUS                   28u
+#define HB_CUSTOM_BOOT_HANDOFF                      29u /* ACK first, reset only after UART drains */
+#define HB_CUSTOM_GET_POSITION_D_STATE              30u /* read-only process-D sign observability */
+#define HB_PLATFORM_SCHEMA 2u
+#define HB_DIAG_SCHEMA 4u
+#define HB_ISR_SCHEMA 3u
+#define HB_TRACE_SCHEMA 3u
+#define HB_FEATURE_BITMAP 0x000003FFu
+#if defined(__arm__) || defined(__thumb__)
+#define HB_MEMORY_BARRIER() __DMB()
+#else
+#define HB_MEMORY_BARRIER() __asm__ volatile("" ::: "memory")
+#endif
+#ifndef F103_BUILD_ID32
+#define F103_BUILD_ID32 0u
+#define F103_GIT_SHA_HI32 0u
+#define F103_GIT_SHA_LO16 0u
+#endif
 
 extern UART_HandleTypeDef huart3;
 extern int16_t board_temp_deg_c;
@@ -120,6 +141,12 @@ static uint8_t s_rx_frame[VESC_MAX_FRAME];
 static uint8_t s_pending_payload[VESC_RX_QUEUE_DEPTH][VESC_MAX_PAYLOAD];
 static uint8_t s_process_payload[VESC_MAX_PAYLOAD];
 static uint8_t s_config_payload[VESC_MAX_PAYLOAD];
+/* Protocol handlers run serialized in main context. Reuse one transactional
+ * MC-config workspace instead of allocating duplicate 724-byte static copies
+ * in every setter; this preserves rollback semantics while protecting stack/RAM
+ * margin on the 48-KiB F103. */
+static mc_configuration s_mc_txn_backup[2];
+static mc_configuration s_mc_txn_next[2];
 static volatile uint16_t s_pending_len[VESC_RX_QUEUE_DEPTH];
 static volatile uint8_t s_pending_head = 0u;
 static volatile uint8_t s_pending_tail = 0u;
@@ -135,6 +162,8 @@ static volatile uint32_t s_link_last_ms = 0u;
 static int64_t s_odometer_offset_m[2] = {0, 0};
 static volatile uint32_t s_rx_ok = 0u;
 static volatile uint32_t s_rx_crc_err = 0u;
+static volatile uint8_t s_probation = 0u;
+static volatile uint32_t s_fw_version_count = 0u;
 static volatile uint32_t s_rx_last_byte_ms = 0u;
 static volatile uint32_t s_rx_timeout_reset = 0u;
 /* Realtime setpoint mailbox. SET_* packets have no reply and repeated packets
@@ -156,6 +185,9 @@ static uint8_t s_tx_active = 0u;
 static uint32_t s_tx_queue_drop = 0u;
 static uint32_t s_tx_queue_highwater = 0u;
 static uint32_t s_tx_start_fail = 0u;
+static volatile uint8_t s_boot_handoff_pending=0u;
+static uint32_t s_boot_handoff_deadline_ms=0u;
+#define HB_BOOT_HANDOFF_TIMEOUT_MS 250u
 #ifdef STM32F103xE
 /* Wall-cycle profiler COMM_GET_VALUES. DWT elapsed sengaja termasuk preemption
  * FOC karena yang harus dipenuhi VESC Tool adalah latency end-to-end <20 ms. */
@@ -298,6 +330,8 @@ void vesc_protocol_init(void) {
     s_link_last_ms = 0u;
     s_rx_ok = 0u;
     s_rx_crc_err = 0u;
+    s_probation = 0u;
+    s_fw_version_count = 0u;
     memset((void *)s_rt_cmd, 0, sizeof(s_rt_cmd));
     s_rt_cmd_coalesced = 0u;
     s_tx_head = s_tx_tail = s_tx_count = s_tx_active = 0u;
@@ -331,6 +365,14 @@ void vesc_protocol_transport_reset(void) {
 }
 
 bool vesc_protocol_rx_in_progress(void) { return s_rx_active != 0u; }
+void vesc_protocol_set_probation(bool enabled) {
+    s_probation = enabled ? 1u : 0u;
+    if (enabled) {
+        mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
+        mcpwm_foc_force_bridges_off();
+    }
+}
+uint32_t vesc_protocol_fw_version_count(void) { return s_fw_version_count; }
 
 static bool rt_command_extract(const uint8_t *vp, uint16_t n, uint8_t *motor, const uint8_t **cmdp) {
     if (!vp || !motor || !cmdp) return false;
@@ -352,6 +394,8 @@ static bool rt_command_extract(const uint8_t *vp, uint16_t n, uint8_t *motor, co
     }
 }
 
+static bool probation_packet_allowed(const uint8_t *p, uint16_t len);
+
 static void complete_frame(void) {
     const uint16_t p = s_payload_start;
     const uint16_t n = s_payload_len;
@@ -369,6 +413,16 @@ static void complete_frame(void) {
          * timeout_reset() semantics and guarantees a full RX FIFO cannot make a
          * one-click VESC Tool setpoint expire while Send Alive is active. */
         const uint8_t *vp=&s_rx_frame[p];
+        /* TEST images are transport-probed before they are trusted. Drop every
+         * valid-but-disallowed packet here, before ALIVE or realtime mailboxes
+         * can touch motor ownership/watchdogs. Count it as valid wire traffic
+         * so UART recovery does not fight a healthy host, but create no side
+         * effect and do not mark the motor link active. */
+        if (s_probation && !probation_packet_allowed(vp,n)) {
+            s_rx_ok++;
+            rx_reset();
+            return;
+        }
         const bool alive_local=(n==1u && vp[0]==COMM_ALIVE);
         const bool alive_right=(n==3u && vp[0]==COMM_FORWARD_CAN &&
                                 vp[1]==VESC_SECOND_MOTOR_ID && vp[2]==COMM_ALIVE);
@@ -421,7 +475,7 @@ bool vesc_protocol_rx_byte(uint8_t byte) {
     const uint32_t now_ms = HAL_GetTick();
     if (s_rx_active && (uint32_t)(now_ms - s_rx_last_byte_ms) > VESC_RX_INTERBYTE_TIMEOUT_MS) {
         /* A truncated/corrupt long frame must never poison all later traffic.
-         * F411 upload chunks are explicitly paced on the validated 115200-baud F411<->F103 link, so 12 ms leaves margin while preventing a false start byte from swallowing later RT frames. */
+         * Direct USB-UART upload chunks are explicitly paced on the validated 115200-baud F103 link, so 12 ms leaves margin while preventing a false start byte from swallowing later RT frames. */
         rx_reset();
         s_rx_timeout_reset++;
     }
@@ -615,6 +669,17 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
 }
 
 void vesc_protocol_periodic(uint32_t now_ms) {
+    vesc_tx_service();
+    if(s_boot_handoff_pending){
+#if defined(__arm__) || defined(__thumb__)
+        const bool uart_tc=(huart3.Instance->SR & USART_SR_TC)!=0u;
+#else
+        const bool uart_tc=true;
+#endif
+        const bool tx_drained=(s_tx_count==0u)&&(s_tx_active==0u)&&(huart3.gState==HAL_UART_STATE_READY)&&uart_tc;
+        if(tx_drained){s_boot_handoff_pending=0u;f103_fw_reset_to_bootloader();}
+        if((int32_t)(now_ms-s_boot_handoff_deadline_ms)>=0){s_boot_handoff_pending=0u;}
+    }
     if (s_rx_active && (uint32_t)(now_ms - s_rx_last_byte_ms) > VESC_RX_INTERBYTE_TIMEOUT_MS) {
         rx_reset();
         s_rx_timeout_reset++;
@@ -993,72 +1058,77 @@ static bool hall_detect_motor_locked(bool second);
 static void touch_motor(bool second) { mcpwm_foc_vesc_override_touch(second); }
 
 static void reply_mcconf(bool second, COMM_PACKET_ID id) {
-    static mc_configuration c;
+    mc_configuration *const c=&s_mc_txn_next[0];
     int32_t i = 0;
     s_config_payload[i++] = (uint8_t)id;
     if (id == COMM_GET_MCCONF_DEFAULT) {
-        mcpwm_foc_get_default_configuration(&c, second);
+        mcpwm_foc_get_default_configuration(c, second);
     } else {
-        c = *mc_interface_get_configuration_motor(second);
+        *c = *mc_interface_get_configuration_motor(second);
     }
-    const int32_t n = confgenerator_serialize_mcconf(&s_config_payload[i], &c);
+    const int32_t n = confgenerator_serialize_mcconf(&s_config_payload[i], c);
     if (n > 0 && (uint32_t)(i + n) <= sizeof(s_config_payload)) uart_send_payload(s_config_payload, (uint16_t)(i + n));
 }
 
 static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
-    static mc_configuration c;
-    bool decoded = false;
-    c = *mc_interface_get_configuration_motor(second);
-    const int32_t expected = confgenerator_serialize_mcconf(s_config_payload, &c);
-    if (expected > 0 && len >= (uint16_t)expected && confgenerator_deserialize_mcconf(data, &c)) {
-        c.motor_type = MOTOR_TYPE_FOC;
-        if (c.l_current_max < 0.1f) c.l_current_max = 0.1f;
-        if (c.l_current_max > (float)I_MOT_MAX) c.l_current_max = (float)I_MOT_MAX;
-        if (c.l_current_min > -0.1f) c.l_current_min = -0.1f;
-        if (c.l_current_min < -(float)I_MOT_MAX) c.l_current_min = -(float)I_MOT_MAX;
+    mc_configuration *const backup=&s_mc_txn_backup[0];
+    mc_configuration *const c=&s_mc_txn_next[0];
+    bool committed = false;
+    *backup = *mc_interface_get_configuration_motor(second);
+    *c = *backup;
+    const int32_t expected = confgenerator_serialize_mcconf(s_config_payload, c);
+    if (expected > 0 && len >= (uint16_t)expected && confgenerator_deserialize_mcconf(data, c)) {
+        c->motor_type = MOTOR_TYPE_FOC;
+        if (c->l_current_max < 0.1f) c->l_current_max = 0.1f;
+        if (c->l_current_max > (float)I_MOT_MAX) c->l_current_max = (float)I_MOT_MAX;
+        if (c->l_current_min > -0.1f) c->l_current_min = -0.1f;
+        if (c->l_current_min < -(float)I_MOT_MAX) c->l_current_min = -(float)I_MOT_MAX;
         {
-            float commanded_abs = c.l_current_max;
-            if (-c.l_current_min > commanded_abs) commanded_abs = -c.l_current_min;
-            if (!(c.l_abs_current_max >= commanded_abs) ||
-                c.l_abs_current_max > MCCONF_L_ABS_CURRENT_MAX) {
-                c.l_abs_current_max = MCCONF_L_ABS_CURRENT_MAX;
+            float commanded_abs = c->l_current_max;
+            if (-c->l_current_min > commanded_abs) commanded_abs = -c->l_current_min;
+            if (!(c->l_abs_current_max >= commanded_abs) ||
+                c->l_abs_current_max > MCCONF_L_ABS_CURRENT_MAX) {
+                c->l_abs_current_max = MCCONF_L_ABS_CURRENT_MAX;
             }
         }
-        if (!(c.l_max_duty > 0.0f) || c.l_max_duty > MCCONF_L_MAX_DUTY) c.l_max_duty=MCCONF_L_MAX_DUTY;
-        if (!(c.l_in_current_max >= 0.1f) || c.l_in_current_max > (float)I_DC_MAX) c.l_in_current_max=MCCONF_L_IN_CURRENT_MAX;
-        if (!(c.l_in_current_min <= -0.1f) || c.l_in_current_min < -(float)I_DC_MAX) c.l_in_current_min=MCCONF_L_IN_CURRENT_MIN;
-        if (!(c.m_duty_ramp_step >= 0.0001f && c.m_duty_ramp_step <= 0.20f)) c.m_duty_ramp_step=MCCONF_DUTY_RAMP_STEP_DEFAULT;
+        if (!(c->l_max_duty > 0.0f) || c->l_max_duty > MCCONF_L_MAX_DUTY) c->l_max_duty=MCCONF_L_MAX_DUTY;
+        if (!(c->l_in_current_max >= 0.1f) || c->l_in_current_max > (float)I_DC_MAX) c->l_in_current_max=MCCONF_L_IN_CURRENT_MAX;
+        if (!(c->l_in_current_min <= -0.1f) || c->l_in_current_min < -(float)I_DC_MAX) c->l_in_current_min=MCCONF_L_IN_CURRENT_MIN;
+        if (!(c->m_duty_ramp_step >= 0.0001f && c->m_duty_ramp_step <= 0.20f)) c->m_duty_ramp_step=MCCONF_DUTY_RAMP_STEP_DEFAULT;
         /* LEFT supports the standard VESC ABI sensor-port mode on PB6/PB7.
          * RIGHT has no ABI timer route and is intentionally Hall-only. */
         if(second){
-            c.m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
-            c.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
-        }else if(c.m_sensor_port_mode==SENSOR_PORT_MODE_ABI){
-            if(c.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER && c.foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER_AB)
-                c.foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
-            if(c.m_encoder_counts<4 || c.m_encoder_counts>65536)c.m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
-            if(!(c.foc_encoder_ratio>=0.01f && c.foc_encoder_ratio<=MCCONF_ENCODER_RATIO_MAX))c.foc_encoder_ratio=(float)MCCONF_POLE_PAIRS_LEFT;
-            while(c.foc_encoder_offset>=360.0f)c.foc_encoder_offset-=360.0f;
-            while(c.foc_encoder_offset<0.0f)c.foc_encoder_offset+=360.0f;
+            c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;
+            c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+        }else if(c->m_sensor_port_mode==SENSOR_PORT_MODE_ABI){
+            if(c->foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER && c->foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER_AB)
+                c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
+            if(c->m_encoder_counts<4 || c->m_encoder_counts>65536)c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
+            if(!(c->foc_encoder_ratio>=0.01f && c->foc_encoder_ratio<=MCCONF_ENCODER_RATIO_MAX))c->foc_encoder_ratio=(float)MCCONF_POLE_PAIRS_LEFT;
+            while(c->foc_encoder_offset>=360.0f)c->foc_encoder_offset-=360.0f;
+            while(c->foc_encoder_offset<0.0f)c->foc_encoder_offset+=360.0f;
         }else{
-            c.m_sensor_port_mode=SENSOR_PORT_MODE_HALL; c.foc_sensor_mode=FOC_SENSOR_MODE_HALL;
+            c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL; c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;
         }
-        if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;
-        if (!(c.si_gear_ratio >= 0.01f && c.si_gear_ratio <= 1000.0f)) c.si_gear_ratio = 1.0f;
+        if (c->si_motor_poles < 2u || (c->si_motor_poles & 1u)) c->si_motor_poles = 30u;
+        if (!(c->si_gear_ratio >= 0.01f && c->si_gear_ratio <= 1000.0f)) c->si_gear_ratio = 1.0f;
         mc_interface_select_motor_thread(second ? 2 : 1);
-        mc_interface_set_configuration(&c);
+        mc_interface_set_configuration(c);
         /* VESC Tool SET_MCCONF is a configuration write, not a motor-detect
          * command. ABI without index is intentionally left UNSYNCED here; the
          * FOC bridge gate already prevents closed-loop drive until an explicit
          * encoder alignment/detect procedure establishes electrical zero. This
          * keeps SET_MCCONF deterministic and prevents unexpected rotor motion. */
-        (void)mc_interface_store_configuration_motor(second);
-        decoded = true;
+        if(mc_interface_store_configuration_motor(second)){
+            committed=true;
+        }else{
+            /* Never leave RAM newer than EEPROM while reporting failure. */
+            mc_interface_set_configuration(backup);
+            (void)mc_interface_store_configuration_motor(second);
+        }
     }
-    /* Upstream VESC acknowledges only a successfully deserialized MC Config.
-     * Persistence is best-effort flash IO, but malformed/wrong-signature packets
-     * must not receive a misleading Write OK ACK. */
-    if (decoded) { uint8_t ack = COMM_SET_MCCONF; uart_send_payload(&ack, 1u); }
+    /* Persistent VESC writes ACK only after the EEPROM commit barrier succeeds. */
+    if (committed) { uint8_t ack = COMM_SET_MCCONF; uart_send_payload(&ack, 1u); }
 }
 
 static void reply_appconf(bool second, COMM_PACKET_ID id) {
@@ -1084,11 +1154,16 @@ static void reply_appconf(bool second, COMM_PACKET_ID id) {
  */
 static void set_appconf(bool second, const uint8_t *data, uint16_t len,
                         bool store_to_eeprom, COMM_PACKET_ID ack_id) {
-    app_configuration tmp = *app_vesc_get_configuration(second);
+    const app_configuration backup=*app_vesc_get_configuration(second);
+    app_configuration tmp=backup;
     const int32_t expected = confgenerator_serialize_appconf(s_config_payload, &tmp);
     if (expected > 0 && len >= (uint16_t)expected && confgenerator_deserialize_appconf(data, &tmp)) {
-        if (app_vesc_set_configuration(second, &tmp) && store_to_eeprom) {
-            (void)app_vesc_store_configuration(second);
+        bool ok=app_vesc_set_configuration(second,&tmp);
+        if(ok && store_to_eeprom)ok=app_vesc_store_configuration(second);
+        if(!ok){
+            (void)app_vesc_set_configuration(second,&backup);
+            if(store_to_eeprom)(void)app_vesc_store_configuration(second);
+            return;
         }
         uint8_t ack = (uint8_t)ack_id;
         uart_send_payload(&ack, 1u);
@@ -1128,18 +1203,32 @@ static void set_battery_cut(bool second, const uint8_t *data, uint16_t len) {
     const bool forward = data[i++] != 0u;
     if (!(start > end && end >= 0.0f && start <= 80.0f)) return;
 
-    for (uint8_t motor = 0u; motor < 2u; ++motor) {
-        const bool target_second = motor != 0u;
-        if (target_second != second && !(forward && !second)) continue;
-        mc_configuration c = *mc_interface_get_configuration_motor(target_second);
-        c.l_battery_cut_start = start;
-        c.l_battery_cut_end = end;
-        mc_interface_select_motor_thread(target_second ? 2 : 1);
-        mc_interface_set_configuration(&c);
-        if (store) (void)mc_interface_store_configuration_motor(target_second);
+    bool target[2]={false,false};
+    for(uint8_t motor=0u;motor<2u;++motor){
+        const bool target_second=motor!=0u;
+        target[motor]=(target_second==second)||(forward&&!second);
+        if(!target[motor])continue;
+        s_mc_txn_backup[motor]=*mc_interface_get_configuration_motor(target_second);
+        s_mc_txn_next[motor]=s_mc_txn_backup[motor];
+        s_mc_txn_next[motor].l_battery_cut_start=start;s_mc_txn_next[motor].l_battery_cut_end=end;
+        mc_interface_select_motor_thread(target_second?2:1);
+        mc_interface_set_configuration(&s_mc_txn_next[motor]);
     }
-    mc_interface_select_motor_thread(second ? 2 : 1);
-    { uint8_t ack = COMM_SET_BATTERY_CUT; uart_send_payload(&ack, 1u); }
+    bool ok=true;
+    if(store){
+        for(uint8_t motor=0u;motor<2u && ok;++motor)if(target[motor])
+            ok=mc_interface_store_configuration_motor(motor!=0u);
+        if(!ok){
+            /* Roll RAM and any already-committed endpoint back to the old image. */
+            for(uint8_t motor=0u;motor<2u;++motor)if(target[motor]){
+                mc_interface_select_motor_thread(motor?2:1);
+                mc_interface_set_configuration(&s_mc_txn_backup[motor]);
+                (void)mc_interface_store_configuration_motor(motor!=0u);
+            }
+        }
+    }
+    mc_interface_select_motor_thread(second?2:1);
+    if(ok){uint8_t ack=COMM_SET_BATTERY_CUT;uart_send_payload(&ack,1u);}
 }
 
 /** Kirim konfigurasi limit sementara yang dipakai halaman Setup VESC Tool. */
@@ -1192,40 +1281,47 @@ static void set_mcconf_temp(bool second, COMM_PACKET_ID packet_id,
         input_max = buffer_get_float32_auto(data, &i);
     }
     const float controllers = (divide && forward && !second) ? 2.0f : 1.0f;
-    watt_min /= controllers;
-    watt_max /= controllers;
+    watt_min /= controllers; watt_max /= controllers;
 
+    bool target[2]={false,false};
     for (uint8_t motor = 0u; motor < 2u; ++motor) {
         const bool target_second = motor != 0u;
-        if (target_second != second && !(forward && !second)) continue;
-        mc_configuration c = *mc_interface_get_configuration_motor(target_second);
-        c.l_current_min_scale = current_min_scale;
-        c.l_current_max_scale = current_max_scale;
+        target[motor]=(target_second==second)||(forward&&!second);
+        if(!target[motor])continue;
+        s_mc_txn_backup[motor]=*mc_interface_get_configuration_motor(target_second);
+        s_mc_txn_next[motor]=s_mc_txn_backup[motor];
+        mc_configuration *c=&s_mc_txn_next[motor];
+        c->l_current_min_scale = current_min_scale;
+        c->l_current_max_scale = current_max_scale;
         if (packet_id == COMM_SET_MCCONF_TEMP_SETUP) {
-            const float wheel = c.si_wheel_diameter > 0.001f ? c.si_wheel_diameter : MCCONF_SI_WHEEL_DIAMETER;
-            const float gear = c.si_gear_ratio > 0.0f ? c.si_gear_ratio : 1.0f;
-            const float fact = (((float)c.si_motor_poles * 0.5f) * 60.0f * gear) /
+            const float wheel = c->si_wheel_diameter > 0.001f ? c->si_wheel_diameter : MCCONF_SI_WHEEL_DIAMETER;
+            const float gear = c->si_gear_ratio > 0.0f ? c->si_gear_ratio : 1.0f;
+            const float fact = (((float)c->si_motor_poles * 0.5f) * 60.0f * gear) /
                                (wheel * 3.14159265358979323846f);
-            c.l_min_erpm = limit_min_in * fact;
-            c.l_max_erpm = limit_max_in * fact;
+            c->l_min_erpm = limit_min_in * fact; c->l_max_erpm = limit_max_in * fact;
         } else {
-            c.l_min_erpm = limit_min_in;
-            c.l_max_erpm = limit_max_in;
+            c->l_min_erpm = limit_min_in; c->l_max_erpm = limit_max_in;
         }
-        c.l_min_duty = duty_min;
-        c.l_max_duty = duty_max;
-        c.l_watt_min = watt_min;
-        c.l_watt_max = watt_max;
-        if (has_input_limits) {
-            c.l_in_current_min = input_min;
-            c.l_in_current_max = input_max;
-        }
+        c->l_min_duty = duty_min; c->l_max_duty = duty_max;
+        c->l_watt_min = watt_min; c->l_watt_max = watt_max;
+        if (has_input_limits) { c->l_in_current_min = input_min; c->l_in_current_max = input_max; }
         mc_interface_select_motor_thread(target_second ? 2 : 1);
-        mc_interface_set_configuration(&c);
-        if (store) (void)mc_interface_store_configuration_motor(target_second);
+        mc_interface_set_configuration(c);
+    }
+    bool ok=true;
+    if(store){
+        for(uint8_t motor=0u;motor<2u && ok;++motor)if(target[motor])
+            ok=mc_interface_store_configuration_motor(motor!=0u);
+        if(!ok){
+            for(uint8_t motor=0u;motor<2u;++motor)if(target[motor]){
+                mc_interface_select_motor_thread(motor?2:1);
+                mc_interface_set_configuration(&s_mc_txn_backup[motor]);
+                (void)mc_interface_store_configuration_motor(motor!=0u);
+            }
+        }
     }
     mc_interface_select_motor_thread(second ? 2 : 1);
-    if (ack) { uint8_t id = (uint8_t)packet_id; uart_send_payload(&id, 1u); }
+    if (ack && ok) { uint8_t id = (uint8_t)packet_id; uart_send_payload(&id, 1u); }
 }
 
 static void reply_decoded_adc(void) {
@@ -2235,13 +2331,13 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_ISR_PROFILE) {
-        if(n>=1u && d[0]!=0u)mcpwm_foc_reset_isr_profile();
+        const uint8_t reset_ok=(n<1u || d[0]==0u || mcpwm_foc_reset_isr_profile())?1u:0u;
         mcpwm_foc_isr_profile_t p; mcpwm_foc_get_isr_profile(&p);
         /* Stage-1 profiler v0x00020002 exceeds the 255-byte short-frame limit.
          * uart_send_payload() automatically emits the normal VESC long frame. */
         uint8_t b[320]; int32_t j=0;
         b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
-        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+        b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=reset_ok?0u:2u;
 #define APPP(v) buffer_append_uint32(b,(v),&j)
         APPP(p.total_max_cycles); APPP(p.deadline_miss_count);
         APPP(p.pre_max_cycles); APPP(p.control_max_cycles); APPP(p.post_max_cycles);
@@ -2252,14 +2348,14 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         APPP(p.sensor_max_cycles); APPP(p.pll_max_cycles); APPP(p.current_max_cycles); APPP(p.regulator_max_cycles);
         APPP(p.position_pid_max_cycles); APPP(p.speed_pid_max_cycles); APPP(p.current_circle_max_cycles);
         APPP(p.id_pi_max_cycles); APPP(p.iq_pi_max_cycles); APPP(p.decouple_limit_max_cycles);
-        APPP(p.svpwm_max_cycles); APPP(p.duty_mag_max_cycles); APPP(p.overrun_total);
+        APPP(p.svpwm_max_cycles); APPP(p.duty_mag_max_cycles); APPP(p.reentry_guard_total);
         for(uint8_t si=0u;si<6u;++si)APPP(p.slot_max_cycles[si]);
         for(uint8_t si=0u;si<6u;++si)APPP(p.slot_miss_count[si]);
         for(uint8_t si=0u;si<6u;++si)APPP(p.slot_count[si]);
         APPP(p.detail_sample_count);
         for(uint8_t si=0u;si<6u;++si)APPP(p.detail_slot_count[si]);
         APPP(p.steady_isr_count); APPP(p.slot_sequence_error_count);
-        APPP(p.fast_hold_svpwm_max_cycles); APPP(p.profile_revision);
+        APPP(p.fast_hold_svpwm_max_cycles); APPP(p.profile_revision); APPP(p.active_slot_count); APPP(p.reset_epoch);
         APPP(p.outer_max_cycles); APPP(p.outer_miss_count); APPP(p.outer_jitter_max_cycles);
         APPP(p.outer_period_min_cycles); APPP(p.outer_period_max_cycles);
         APPP(p.adc_heartbeat); APPP(p.motor_heartbeat[0]); APPP(p.motor_heartbeat[1]);
@@ -2300,6 +2396,57 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
 #undef APPCH
         uart_send_payload(b,(uint16_t)j); return;
     }
+    if (op == HB_CUSTOM_GET_PLATFORM_INFO) {
+        uint8_t b[64]; int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1; b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+        buffer_append_uint16(b,HB_PLATFORM_SCHEMA,&j); buffer_append_uint16(b,HB_DIAG_SCHEMA,&j);
+        buffer_append_uint16(b,HB_ISR_SCHEMA,&j); buffer_append_uint16(b,HB_TRACE_SCHEMA,&j);
+        buffer_append_uint32(b,HB_FEATURE_BITMAP,&j); buffer_append_uint32(b,F103_BUILD_ID32,&j);
+        buffer_append_uint32(b,F103_GIT_SHA_HI32,&j); buffer_append_uint16(b,F103_GIT_SHA_LO16,&j);
+        buffer_append_uint16(b,MCCONF_FOC_CONTROL_DIV,&j); buffer_append_uint32(b,CPU_CLOCK_HZ,&j); buffer_append_uint32(b,PWM_FREQ_HZ,&j);
+        buffer_append_uint32(b,MCPWM_FOC_ISR_PROFILE_REVISION,&j); buffer_append_uint16(b,MCPWM_FOC_TRACE_CAPACITY,&j);
+        buffer_append_uint16(b,MCPWM_FOC_PROFILE_SLOT_CAPACITY,&j); uart_send_payload(b,(uint16_t)j); return;
+    }
+    if (op == HB_CUSTOM_GET_ADC_VALIDITY) {
+        mcpwm_foc_adc_sample_diag_t q;mcpwm_foc_get_adc_sample_diag(second,&q);
+        uint8_t b[40];int32_t j=0;b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=0u;
+        buffer_append_uint16(b,q.ccr_a,&j);buffer_append_uint16(b,q.ccr_b,&j);buffer_append_uint16(b,q.ccr_c,&j);
+        buffer_append_uint16(b,q.zero_window_counts,&j);buffer_append_uint16(b,q.min_window_counts,&j);buffer_append_uint16(b,q.guard_counts,&j);buffer_append_uint16(b,q.adc_phase_counts,&j);
+        buffer_append_uint32(b,q.invalid_count,&j);b[j++]=q.sector;b[j++]=q.window_valid;b[j++]=q.offset_valid;b[j++]=q.driven_offset_valid;b[j++]=q.bridge_settled;
+        uart_send_payload(b,(uint16_t)j);return;
+    }
+    if (op == HB_CUSTOM_ARM_CURRENT_STEP) {
+        uint8_t status=1u;uint32_t seq=0u;
+        if(n>=10u){int32_t si=0;const int32_t pre_ma=buffer_get_int32(d,&si);const int32_t step_ma=buffer_get_int32(d,&si);const uint8_t pre_n=d[si++],post_n=d[si++];
+            status=mcpwm_foc_step_test_arm((float)pre_ma*0.001f,(float)step_ma*0.001f,pre_n,post_n,second)?0u:2u;
+            mcpwm_foc_step_test_status_t st;mcpwm_foc_step_test_get(&st);seq=st.sequence;}
+        uint8_t b[10]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,status,0,0,0,0};int32_t j=6;buffer_append_uint32(b,seq,&j);uart_send_payload(b,(uint16_t)j);return;
+    }
+    if (op == HB_CUSTOM_GET_STEP_STATUS) {
+        mcpwm_foc_step_test_status_t st;mcpwm_foc_step_test_get(&st);uint8_t b[24];int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=0u;
+        buffer_append_uint32(b,st.sequence,&j);buffer_append_int16(b,st.pre_q4,&j);buffer_append_int16(b,st.step_q4,&j);
+        b[j++]=st.active;b[j++]=st.second;b[j++]=st.pre_remaining;b[j++]=st.post_remaining;b[j++]=st.step_fired;b[j++]=st.done;uart_send_payload(b,(uint16_t)j);return;
+    }
+    if (op == HB_CUSTOM_GET_POSITION_D_STATE) {
+        const mcpwm_foc_motor_t *pm=mcpwm_foc_get_motor_const(second);
+        uint8_t b[24];int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=0u;
+        buffer_append_int32(b,mcpwm_foc_get_position_user_counts(second),&j);
+        buffer_append_int32(b,mcpwm_foc_get_position_target_user_counts(second),&j);
+        buffer_append_int32(b,pm?pm->m_position_d_proc_filter_q15:0,&j);
+        b[j++]=pm?(uint8_t)pm->m_control_mode:0u;b[j++]=pm?pm->m_pos_pid_phase_mode:0u;
+        b[j++]=pm?(pm->m_conf.foc_encoder_inverted?1u:0u):0u;b[j++]=pm?(pm->m_conf.m_invert_direction?1u:0u):0u;
+        uart_send_payload(b,(uint16_t)j);return;
+    }
+
+    if (op == HB_CUSTOM_BOOT_HANDOFF) {
+        uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u};
+        if(second||s_boot_handoff_pending){b[5]=1u;uart_send_payload(b,6u);return;}
+        mcpwm_foc_force_bridges_off();
+        uart_send_payload(b,6u);s_boot_handoff_deadline_ms=HAL_GetTick()+HB_BOOT_HANDOFF_TIMEOUT_MS;HB_MEMORY_BARRIER();s_boot_handoff_pending=1u;return;
+    }
+
     if (op == HB_CUSTOM_GET_FW_UPDATE_STATE) {
         const f103_update_meta_t *m=(const f103_update_meta_t *)F103_META_BASE_ADDR;
         const bool common=(m->magic==F103_UPDATE_META_MAGIC) &&
@@ -2327,22 +2474,25 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     if (op == HB_CUSTOM_GET_TRACE_SAMPLE) {
         mcpwm_foc_trace_sample_t t; const uint8_t idx=n?d[0]:0xffu;
         const uint8_t status=(n>=1u && mcpwm_foc_trace_read(idx,&t))?0u:1u;
-        uint8_t b[64];int32_t j=0;b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=status;
+        uint8_t b[96];int32_t j=0;b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=status;
         if(!status){
             buffer_append_uint32(b,t.pwm_tick,&j);buffer_append_uint16(b,t.isr_cycles,&j);b[j++]=t.control_slot;b[j++]=t.event_bits;
 #define APPS(v) buffer_append_int16(b,(v),&j)
             APPS(t.left_id_q4);APPS(t.left_iq_q4);APPS(t.left_id_set_q4);APPS(t.left_iq_set_q4);APPS(t.left_vd);APPS(t.left_vq);APPS(t.left_erpm);
             APPS(t.right_id_q4);APPS(t.right_iq_q4);APPS(t.right_id_set_q4);APPS(t.right_iq_set_q4);APPS(t.right_vd);APPS(t.right_vq);APPS(t.right_erpm);
 #undef APPS
+            buffer_append_int32(b,t.left_id_integrator,&j);buffer_append_int32(b,t.left_iq_integrator,&j);
+            buffer_append_int32(b,t.right_id_integrator,&j);buffer_append_int32(b,t.right_iq_integrator,&j);
+            buffer_append_uint16(b,t.left_sample_window,&j);buffer_append_uint16(b,t.right_sample_window,&j);
             buffer_append_uint16(b,t.vin_adc,&j);b[j++]=t.left_fault;b[j++]=t.right_fault;b[j++]=t.left_quality;b[j++]=t.right_quality;
         }
         uart_send_payload(b,(uint16_t)j);return;
     }
     if (op == HB_CUSTOM_CLEAR_TRACE) {
-        mcpwm_foc_trace_clear();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u};uart_send_payload(b,6u);return;
+        const bool ok=mcpwm_foc_trace_clear();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,ok?0u:2u};uart_send_payload(b,6u);return;
     }
     if (op == HB_CUSTOM_FREEZE_TRACE) {
-        mcpwm_foc_trace_freeze();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u};uart_send_payload(b,6u);return;
+        const bool ok=mcpwm_foc_trace_freeze();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,ok?0u:2u};uart_send_payload(b,6u);return;
     }
 
     if (op == HB_CUSTOM_ENCODER_DEBUG) {
@@ -2391,8 +2541,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     }
     if (op == HB_CUSTOM_GET_TUNING || op == HB_CUSTOM_SET_TUNING) {
         mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+        uint8_t tuning_status=0u;
         if (op == HB_CUSTOM_SET_TUNING) {
             if (n < 20u) { uint8_t e[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,1u}; uart_send_payload(e,6u); return; }
+            mc_configuration *const backup=&s_mc_txn_backup[0];
+            *backup=m->m_conf;
             m->m_kpq_q11=buffer_get_uint16(d,&k); m->m_kiq_q16=buffer_get_uint16(d,&k);
             m->m_kpd_q11=buffer_get_uint16(d,&k); m->m_kid_q16=buffer_get_uint16(d,&k);
             m->m_kps_q11=buffer_get_uint16(d,&k); m->m_kis_q16=buffer_get_uint16(d,&k); m->m_kds_q11=buffer_get_uint16(d,&k);
@@ -2402,12 +2555,6 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             if (n >= 22u) {
                 uint16_t fa=buffer_get_uint16(d,&k);
                 if(fa<1u)fa=1u;
-                /* Custom tuning exposes Q16, while the standard VESC 6.00
-                 * MC-config wire/persistence field is float16 scale 1e4.
-                 * Canonicalize the mirrored MC field to the nearest 1e-4 grid
-                 * so GET_TUNING -> SET_TUNING(same) is idempotent and a
-                 * subsequent GET_MCCONF/reboot cannot drift by one LSB due to
-                 * float truncation (e.g. 0.1018 -> 0.1017). */
                 m->m_telem_current_filter_q16=fa;
                 uint32_t fx10000=((uint32_t)fa*10000u+32767u)/65535u;
                 if(fx10000<10u)fx10000=10u;
@@ -2415,10 +2562,17 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
                 m->m_conf.foc_current_filter_const=(float)fx10000/10000.0f;
                 if(n>=23u)store=d[22]!=0u;
             } else if (n >= 21u) store=d[20]!=0u;
-            if (store) (void)mc_interface_store_configuration_motor(second);
+            if(store && !mc_interface_store_configuration_motor(second)){
+                /* Persistent tuning is transactional: restore runtime to the
+                 * pre-command MC image and report a nonzero custom status. */
+                mc_interface_set_configuration(backup);
+                (void)mc_interface_store_configuration_motor(second);
+                m=mcpwm_foc_get_motor(second);
+                tuning_status=3u;
+            }
         }
         uint8_t b[40]; int32_t j=0;
-        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1; b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
+        b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1; b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=tuning_status;
         buffer_append_uint16(b,m->m_kpq_q11,&j); buffer_append_uint16(b,m->m_kiq_q16,&j);
         buffer_append_uint16(b,m->m_kpd_q11,&j); buffer_append_uint16(b,m->m_kid_q16,&j);
         buffer_append_uint16(b,m->m_kps_q11,&j); buffer_append_uint16(b,m->m_kis_q16,&j); buffer_append_uint16(b,m->m_kds_q11,&j);
@@ -2563,7 +2717,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         ds.driven_off0=m->m_driven_offset0; ds.driven_off1=m->m_driven_offset1; ds.driven_offdc=m->m_driven_offsetdc;
         ds.driven_samples=m->m_driven_offset_samples; ds.driven_valid=m->m_driven_offset_valid; ds.driven_cal=m->m_driven_offset_calibrating;
         ds.off0=m->m_off_offset0; ds.off1=m->m_off_offset1; ds.offdc=m->m_off_offsetdc;
-        ds.off_samples=m->m_off_offset_samples; ds.off_settle=m->m_off_settle_ticks; ds.off_valid=m->m_current_offset_valid;
+        ds.off_samples=m->m_off_offset_samples; ds.off_settle=m->m_off_settle_ticks; ds.off_valid=m->m_off_offset_valid;
         mcpwm_foc_get_irq_epoch(&snap_e1,&snap_x1);
         if(snap_e0==snap_e1 && snap_x0==snap_x1 && snap_e1==snap_x1)break;
         }
@@ -2664,7 +2818,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint16(b,adc_buffer.dcl,&i); buffer_append_uint16(b,adc_buffer.rrB,&i);
             buffer_append_uint16(b,adc_buffer.rrC,&i); buffer_append_uint16(b,adc_buffer.dcr,&i);
             buffer_append_int16(b,ds.off0,&i); buffer_append_int16(b,ds.off1,&i); buffer_append_int16(b,ds.offdc,&i);
-            buffer_append_uint16(b,ds.off_samples,&i); buffer_append_uint16(b,ds.off_settle,&i); b[i++]=ds.off_valid; /* current_offset_valid */
+            buffer_append_uint16(b,ds.off_samples,&i); buffer_append_uint16(b,ds.off_settle,&i); b[i++]=ds.off_valid; /* off_offset_valid */
             buffer_append_uint32(b,s_tx_queue_drop,&i);
             buffer_append_uint32(b,s_tx_start_fail,&i);
             buffer_append_uint32(b,s_rx_queue_highwater,&i);
@@ -2690,7 +2844,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_int32(b,m->m_position_target_counts-m->m_position_counts,&i);
             /* Keep diagnostic reply below the 256-byte local payload buffer.
              * Pre/post were measured separately during profiling; retain the
-             * actionable control/step maxima plus explicit overrun counters. */
+             * actionable control/step maxima plus explicit re-entry guard diagnostics. */
             buffer_append_uint32(b,foc_prof_sensor_max_cycles,&i);
             buffer_append_uint32(b,foc_prof_current_max_cycles,&i);
             buffer_append_uint32(b,foc_prof_regulator_max_cycles,&i);
@@ -2699,6 +2853,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
 #else
             for(uint8_t pi=0u;pi<9u;++pi)buffer_append_uint32(b,0u,&i);
 #endif
+            b[i++]=m->m_current_offset_valid; /* boot/current offset validity is distinct from off_offset_valid */
         }
         if ((uint32_t)i <= sizeof(b)) uart_send_payload(b, (uint16_t)i);
     }
@@ -2729,7 +2884,7 @@ static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)
 
 static void terminal_help(void){
     terminal_send_text("Commands:\nREAD help fw status values encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all]\n");
-    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | current_kp/current_ki V. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
+    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
     terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
 
@@ -2780,6 +2935,8 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
     }
     if(!strncmp(k,"speed_k",7)){if(v<0||v>65535.0f/MCCONF_SPEED_GAIN_SCALE||k[8])return -1;if(k[7]=='p')c->s_pid_kp=v;else if(k[7]=='i')c->s_pid_ki=v;else if(k[7]=='d')c->s_pid_kd=v;else return -1;return 1;}
     if(!strcmp(k,"speed_ramp")){if(v<100.0f||v>75000.0f)return -1;c->s_pid_ramp_erpms_s=v;return 1;}
+    if(!strcmp(k,"speed_src")){if(v!=(float)i||i<0||i>1)return -1;c->s_pid_speed_source=(S_PID_SPEED_SRC)i;return 1;}
+    if(!strcmp(k,"decoupling")){if(v!=(float)i||i<0||i>3)return -1;c->foc_cc_decoupling=(mc_foc_cc_decoupling_mode)i;return 1;}
     if(!strncmp(k,"current_k",9)){if(k[10]||v<0)return -1;if(k[9]=='p'){if(v>65535.0f/1536.0f)return -1;c->foc_current_kp=v;}else if(k[9]=='i'){if(v>65535.0f/4.608f)return -1;c->foc_current_ki=v;}else return -1;return 1;}
     return 0;
 }
@@ -2811,7 +2968,7 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(sub,"invert")&&ac>2){float x=0.0f;if(!terminal_float(a[2],&x)||(x!=0.0f&&x!=1.0f)){terminal_send_text("ERR steering invert 0|1\n");return;}terminal_send_text(mc_interface_set_steering_logical_inverted(x>0.5f)?"OK steering logical mapping saved\n":"ERR steering invert requires valid span\n");return;}
         terminal_send_text("ERR steering status|center|zero|reset|invert 0|1\n");return;
     }
-    if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f));terminal_send_text(o);return;}
+    if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb dec=%u speed_src=%u\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);terminal_send_text(o);return;}
     if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
     if(!strcmp(a[0],"perf")){
         if(ac>1&&!strcmp(a[1],"reset")){
@@ -2903,6 +3060,7 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
 
     switch (id) {
     case COMM_FW_VERSION:
+        ++s_fw_version_count;
         reply_fw_version(second);
         break;
     case COMM_ERASE_NEW_APP: {
@@ -2931,10 +3089,11 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     }
     case COMM_JUMP_TO_BOOTLOADER:
-        if (!second) {
-            /* Enter resident recovery without touching flash. The application
-             * stores a dual-word SRAM request then performs NVIC reset. */
-            f103_fw_reset_to_bootloader();
+        if (!second && !s_boot_handoff_pending) {
+            /* Legacy no-reply command remains supported, but reset is deferred
+             * until every already-queued byte has left the USART shift register. */
+            mcpwm_foc_force_bridges_off();
+            s_boot_handoff_deadline_ms=HAL_GetTick()+HB_BOOT_HANDOFF_TIMEOUT_MS;HB_MEMORY_BARRIER();s_boot_handoff_pending=1u;
         }
         break;
     case COMM_GET_VALUES:
@@ -3254,8 +3413,20 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
     mc_interface_select_motor_thread(1);
 }
 
+static bool probation_packet_allowed(const uint8_t *p, uint16_t len) {
+    if (!s_probation) return true;
+    if (!p || len == 0u) return false;
+    const COMM_PACKET_ID id=(COMM_PACKET_ID)p[0];
+    if (id==COMM_FW_VERSION || id==COMM_JUMP_TO_BOOTLOADER) return true;
+    if (id==COMM_CUSTOM_APP_DATA && len>=5u && p[1]==HB_CUSTOM_MAGIC0 && p[2]==HB_CUSTOM_MAGIC1 && p[3]==HB_CUSTOM_VERSION) {
+        const uint8_t op=p[4];
+        return op==HB_CUSTOM_GET_FW_UPDATE_STATE || op==HB_CUSTOM_GET_PLATFORM_INFO || op==HB_CUSTOM_BOOT_HANDOFF;
+    }
+    return false;
+}
+
 static void process_top_packet(const uint8_t *p, uint16_t len) {
-    if (!p || len == 0u) return;
+    if (!p || len == 0u || !probation_packet_allowed(p,len)) return;
     const COMM_PACKET_ID id = (COMM_PACKET_ID)p[0];
     if (id == COMM_FORWARD_CAN) {
         if (len >= 3u && p[1] == VESC_SECOND_MOTOR_ID) {
@@ -3274,6 +3445,10 @@ static void process_top_packet(const uint8_t *p, uint16_t len) {
 }
 
 static void process_rt_mailboxes(void) {
+    if (s_probation) {
+        for (uint8_t mi=0u; mi<2u; ++mi) s_rt_cmd[mi].pending=0u;
+        return;
+    }
     /* RX DMA bytes are parsed only by usart3_rx_check() in main context. The
      * realtime mailbox therefore has one producer and one consumer in the same
      * context; masking the priority-0 FOC IRQ here only adds avoidable jitter. */

@@ -49,9 +49,7 @@ assert 'position_p_term_q15' in mc and 'i_lim_q15=32768-' in mc and 'position_i_
 assert 'm_position_d_filter_q15' in mch and 'm_position_d_proc_filter_q15' in mch
 assert 'proc_now=position_feedback_phase_u16(m,second)' in mc and 'proc_delta=(int16_t)(proc_now-m->m_position_prev_proc_phase)' in mc
 assert 'out_q15=p_q15+(m->m_position_integrator>>16)+' in mc
-assert 'm_position_step_braking' in mch and 'm_position_brake_direction' in mch
-assert 'hall_motion_same_direction' in mc and 'position_brake_iq_q4' in mc
-assert 'm_position_motion_seen' in mch
+assert 'hall_motion_same_direction' not in mc and 'position_brake_iq_q4' not in mc, 'hidden kinetic brake helper must stay removed'
 mi=(R/'Src/motor/mc_interface.c').read_text()
 assert 'EE_CFG_SIGNATURE_V16' in mi and 'EE_CFG_SIGNATURE_V17' in mi and 'migrate_speed_pid' in mi
 
@@ -161,12 +159,12 @@ assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_handbrake(current)
 dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
-assert 'Jangan hapus nilai telemetry itu' in mc, 'idle live current telemetry path missing'
+assert 'Released bridge: publish zero current' in mc, 'standard OFF telemetry zero contract missing'
 assert 'steering_center_after_span_calibration' in mci, 'steering detect must have bounded midpoint finalizer'
 assert 'ok=mc_interface_store_configuration_motor(false);' in vp, 'Detect Encoder must persist detected ABI electrical config before success'
 assert 'MCCONF_STEERING_CENTER_TOL_COUNTS' in mci and 'steering_stage_set(0xE8u)' in mci, 'detect must fail closed when midpoint centering fails'
 assert 'mcpwm_foc_steering_rebase_center()' in mci, 'successful detect must rebase measured midpoint to logical zero'
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_idle_live=1 rx_fifo16=1 vesc_request_reply=1 brake_dynamic=1 std_pos=1 custom_count_cap=1 std_openloop=1')
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo16=1 vesc_request_reply=1 hidden_brake_removed=1 std_pos=1 custom_count_cap=1 std_openloop=1')
 
 assert 'MCCONF_STEERING_POS_MIN_DEG' in (R/'Src/motor/mcconf_default.h').read_text()
 assert '0 -> -30, 180 -> 0, 360 -> +30' in vp

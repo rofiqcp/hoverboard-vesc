@@ -3,7 +3,7 @@ import argparse, time
 from vesc_dual import VescDual, parse_fw
 CPU_HZ=64_000_000
 PWM_HZ=16_000
-PROFILE_REV=0x00020002
+PROFILE_REV=0x00030000
 
 def delta32(a,b): return (b-a)&0xffffffff
 
@@ -23,8 +23,8 @@ def main():
         dx=delta32(base['irq_exit'],p['irq_exit'])
         dc=delta32(base['snapshot_dwt'],p['snapshot_dwt'])
         freq=(de*CPU_HZ/dc) if dc else 0.0
-        slots=[p[f'slot{i}_count'] for i in range(6)]
-        dslots=[p[f'detail_slot{i}_count'] for i in range(6)]
+        active=max(1,min(6,p['active_slot_count'])); slots=[p[f'slot{i}_count'] for i in range(active)]
+        dslots=[p[f'detail_slot{i}_count'] for i in range(active)]
         steady=p['steady_isr_count']
         expected_detail=steady/31.0 if steady else 0.0
         checks={

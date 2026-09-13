@@ -34,12 +34,15 @@ def main():
     ap.add_argument('--max-input-current',type=float,default=15.5)
     ap.add_argument('--max-erpm',type=float,default=15000.0)
     ap.add_argument('--out',default='tools/results_duty100.csv')
+    ap.add_argument('--arm',action='store_true',help='required for the +/-100% duty sweep')
     a=ap.parse_args()
+    if not a.arm: ap.error('motor actuation requires --arm on a mechanically safe rig/dyno')
     steps=[0.0,.05,.10,.15,.20,.25,.30,.35,.40,.45,.50,.55,.60,.65,.70,.75,.80,.85,.90,.95,1.00,.95,.90,.85,.80,.75,.70,.65,.60,.55,.50,.45,.40,.35,.30,.25,.20,.15,.10,.05,0.0,-.05,-.10,-.15,-.20,-.25,-.30,-.35,-.40,-.45,-.50,-.55,-.60,-.65,-.70,-.75,-.80,-.85,-.90,-.95,-1.00,-.95,-.90,-.85,-.80,-.75,-.70,-.65,-.60,-.55,-.50,-.45,-.40,-.35,-.30,-.25,-.20,-.15,-.10,-.05,0.0]
     motors=[]
     if a.motor in ('left','both'): motors.append((False,'left'))
     if a.motor in ('right','both'): motors.append((True,'right'))
-    link=VescDual(a.port,1000000,timeout=.5)
+    link=VescDual(a.port,115200,timeout=.5)
+    link.require_platform_compatible(True)
     rows=[]
     try:
         stop_all(link); time.sleep(.25)

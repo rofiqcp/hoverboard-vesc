@@ -24,10 +24,21 @@
 
 static UART_HandleTypeDef huart3;
 
+static inline void f103_debug_keepalive(void) {
+    __HAL_RCC_AFIO_CLK_ENABLE();
+    uint32_t mapr=AFIO->MAPR;
+    mapr&=~AFIO_MAPR_SWJ_CFG_Msk;
+    mapr|=AFIO_MAPR_SWJ_CFG_RESET;
+    AFIO->MAPR=mapr;
+    DBGMCU->CR|=DBGMCU_CR_DBG_IWDG_STOP;
+    __DSB();
+    __ISB();
+}
+
 void SysTick_Handler(void) { HAL_IncTick(); }
 static uint8_t rx_payload[RX_MAX_PAYLOAD];
 
-/* Candidate storage is external to the F103 (NUC/F411 host). The resident
+/* Candidate storage is external to the F103 (PC/NUC host). The resident
  * bootloader writes only one active page at a time and journals completed
  * pages in the 2-KiB metadata page. */
 static bool stage_session_active = false;
@@ -47,6 +58,16 @@ volatile uint32_t boot_diag_copy_addr = 0u;
 volatile uint32_t boot_diag_copy_size = 0u;
 volatile uint32_t boot_diag_copy_crc_stage = 0u;
 volatile uint32_t boot_diag_copy_crc_app = 0u;
+
+static __attribute__((noreturn)) void boot_fault_hold(uint32_t code) {
+    __disable_irq();
+    boot_diag_copy_code = code;
+    for (;;) { f103_debug_keepalive(); __NOP(); }
+}
+void HardFault_Handler(void) { boot_fault_hold(0x48415244u); }
+void MemManage_Handler(void) { boot_fault_hold(0x4D454D46u); }
+void BusFault_Handler(void) { boot_fault_hold(0x42555346u); }
+void UsageFault_Handler(void) { boot_fault_hold(0x55534147u); }
 
 static uint16_t crc16(const uint8_t *data, uint32_t len) {
     uint16_t crc = 0u;
@@ -113,7 +134,7 @@ static bool boot_clock_init(void) {
     return HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) == HAL_OK;
 }
 
-static void uart_init(void) {
+static bool uart_init(void) {
     huart3.Instance = USART3;
     huart3.Init.BaudRate = F103_VESC_UART_BAUD;
     huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -122,7 +143,8 @@ static void uart_init(void) {
     huart3.Init.Mode = UART_MODE_TX_RX;
     huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-    (void)HAL_UART_Init(&huart3);
+    if (HAL_UART_Init(&huart3) != HAL_OK) { ++boot_diag_uart_errors; return false; }
+    return true;
 }
 
 #define RAMFUNC __attribute__((section(".ramfunc"), noinline, long_call))
@@ -604,22 +626,20 @@ static bool recovery_command(uint16_t len) {
 }
 
 int main(void) {
+    /* Earliest resident action: recover SW-DP and freeze IWDG while halted. */
+    f103_debug_keepalive();
     /* Startup SystemInit() leaves the MCU on HSI=8 MHz but the CMSIS variable
      * defaults to 72 MHz. Fix the software model first, then raise the actual
      * clock to the same 64/32-MHz tree as the application before USART3 init. */
     SystemCoreClockUpdate();
     HAL_Init();
-    __HAL_RCC_AFIO_CLK_ENABLE();
-    /* Resident recovery must never repurpose SWD. Freeze IWDG whenever a
-     * debugger halts the core so connect-under-reset is a fallback, not a
-     * requirement. */
-    __HAL_AFIO_REMAP_SWJ_ENABLE();
-    __HAL_DBGMCU_FREEZE_IWDG();
+    /* Reassert after HAL_Init as well; no peripheral init may strand SWD. */
+    f103_debug_keepalive();
     if (!boot_clock_init()) {
-        for (;;) { }
+        for (;;) { f103_debug_keepalive(); __NOP(); }
     }
     safe_gpio_init();
-    uart_init();
+    bool uart_ready = uart_init();
 
     volatile uint32_t *const boot_request = (volatile uint32_t *)F103_BOOT_REQUEST_ADDR;
     const bool force_recovery = boot_request[0] == F103_BOOT_REQUEST_MAGIC &&
@@ -665,12 +685,24 @@ int main(void) {
     if (!recovery) recovery = true;
 
     uint32_t blink = HAL_GetTick();
+    uint32_t debug_keepalive = blink;
+    uint32_t uart_retry = blink;
     while (recovery) {
-        uint16_t len = 0u;
-        if (recv_payload(50u, &len)) recovery_command(len);
-        if ((HAL_GetTick() - blink) >= RECOVERY_IDLE_BLINK_MS) {
-            HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_2); blink = HAL_GetTick();
+        const uint32_t now=HAL_GetTick();
+        if (!uart_ready) {
+            if ((uint32_t)(now-uart_retry) >= 100u) {
+                uart_retry=now; uart_ready=uart_init();
+            }
+        } else {
+            uint16_t len = 0u;
+            if (recv_payload(50u, &len)) recovery_command(len);
+        }
+        if ((uint32_t)(now-debug_keepalive) >= 25u) {
+            debug_keepalive=now; f103_debug_keepalive();
+        }
+        if ((uint32_t)(now-blink) >= RECOVERY_IDLE_BLINK_MS) {
+            HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_2); blink = now;
         }
     }
-    for (;;) { }
+    for (;;) { f103_debug_keepalive(); __NOP(); }
 }

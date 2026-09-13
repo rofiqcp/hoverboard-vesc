@@ -63,7 +63,22 @@ static volatile uint32_t foc_irq_dma_tc_pending_exit_count=0u;
 static mcpwm_foc_trace_sample_t s_foc_trace[MCPWM_FOC_TRACE_CAPACITY];
 static volatile uint8_t s_foc_trace_head=0u, s_foc_trace_count=0u, s_foc_trace_frozen=0u;
 static volatile uint8_t s_foc_trace_trigger_motor=0u, s_foc_trace_trigger_fault=0u;
-static volatile uint32_t s_foc_trace_write_count=0u;
+static volatile uint8_t s_foc_trace_clear_req=0u, s_foc_trace_freeze_req=0u;
+static volatile uint8_t s_foc_trace_fault_pending=0u, s_foc_trace_fault_motor=0u, s_foc_trace_fault_code=0u;
+static volatile uint32_t s_foc_trace_write_count=0u, s_foc_trace_req_seq=0u, s_foc_trace_ack_seq=0u;
+static volatile uint8_t s_foc_trace_event_latch=0u;
+/* Patch each captured row with this IRQ's full elapsed time at ISR exit. */
+static volatile uint8_t s_foc_trace_cycle_pending=0u, s_foc_trace_cycle_index=0u;
+typedef struct {
+    volatile uint32_t sequence;
+    volatile int16_t pre_q4, step_q4;
+    volatile uint8_t active, second, pre_remaining, post_remaining, step_fired, done;
+    volatile uint8_t settling;
+    volatile uint16_t settle_remaining;
+} foc_step_test_state_t;
+static foc_step_test_state_t s_foc_step_test={0};
+static void foc_trace_service_requests_isr(void);
+static void foc_trace_clear_isr_owned(void);
 volatile uint8_t encoder_detect_stage = 0u;
 /* Startup-align black box. Kept separate from full encoder detect so HOME
  * failures after reboot can be diagnosed without repeating hard-stop calibration. */
@@ -110,10 +125,12 @@ static volatile uint8_t foc_isr_profile_slot=0xffu;
  * 31 is coprime with CONTROL_DIV=6, so samples walk across every scheduler
  * slot without modulo/division or continuous DWT reads in the hot path. */
 #define FOC_PROF_SAMPLE_PERIOD 31u
-#define FOC_ISR_PROFILE_REVISION 0x00020002u
+#define FOC_ISR_PROFILE_REVISION MCPWM_FOC_ISR_PROFILE_REVISION
+_Static_assert(MCCONF_FOC_CONTROL_DIV >= 1u && MCCONF_FOC_CONTROL_DIV <= MCPWM_FOC_PROFILE_SLOT_CAPACITY, "FOC control divider exceeds profiler slot capacity");
 static uint8_t foc_prof_sample_down=0u;
 static uint8_t foc_prof_detail_sample=0u;
 static volatile uint32_t foc_prof_detail_sample_count=0u;
+static volatile uint32_t foc_prof_reset_request=0u, foc_prof_reset_ack=0u;
 static volatile uint32_t foc_prof_detail_slot_count[6]={0u,0u,0u,0u,0u,0u};
 static volatile uint32_t foc_isr_steady_count=0u;
 static volatile uint32_t foc_isr_slot_sequence_error_count=0u;
@@ -280,24 +297,67 @@ static int16_t foc_trace_erpm(const mcpwm_foc_motor_t *m, bool second) {
     return (int16_t)CLAMP(e,-32768,32767);
 }
 
+static uint8_t foc_trace_quality(const mcpwm_foc_motor_t *m, bool second) {
+    uint8_t q=0u;
+    if(m->m_current_offset_valid)q|=1u<<0;
+    if(m->m_driven_offset_valid)q|=1u<<1;
+    if(m->m_sample_window_valid)q|=1u<<2;
+    if(m->m_bridge_settle_ticks==0u)q|=1u<<3;
+    if(m->m_id_sat_hold)q|=1u<<4;
+    if(m->m_iq_sat_hold)q|=1u<<5;
+    if(second ? ((RIGHT_TIM->BDTR&TIM_BDTR_MOE)!=0u) : ((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u))q|=1u<<6;
+    if(m->m_dq_sample_fresh)q|=1u<<7;
+    return q;
+}
+
+static void foc_sample_window_update(mcpwm_foc_motor_t *m, bool second) {
+    uint16_t mx=m->m_ccr_a; if(m->m_ccr_b>mx)mx=m->m_ccr_b; if(m->m_ccr_c>mx)mx=m->m_ccr_c;
+    const uint16_t win=(mx<pwm_res)?(uint16_t)(pwm_res-mx):0u;
+    m->m_sample_zero_window_counts=win;
+    m->m_sample_guard_counts=FOC_CURRENT_SAMPLE_GUARD_COUNTS;
+    m->m_sample_adc_phase_counts=pwm_res;
+    m->m_sample_sector=(uint8_t)((((uint32_t)m->m_phase*6u)>>16)+1u);
+    m->m_sample_window_valid=(win>=FOC_CURRENT_SAMPLE_GUARD_COUNTS)?1u:0u;
+    if(m->m_sample_window_min_counts==0u || win<m->m_sample_window_min_counts)m->m_sample_window_min_counts=win;
+    const bool bridge_on=second ? ((RIGHT_TIM->BDTR&TIM_BDTR_MOE)!=0u) : ((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u);
+    if(bridge_on && m->m_control_mode!=CONTROL_MODE_NONE && !m->m_sample_window_valid)m->m_sample_invalid_count++;
+}
+
 static void foc_trace_capture_internal(uint8_t slot) {
     if(s_foc_trace_frozen)return;
     const uint8_t idx=s_foc_trace_head;
     mcpwm_foc_trace_sample_t *t=&s_foc_trace[idx];
     uint32_t g=t->guard; if(g&1u)g++;
     t->guard=g+1u; FOC_MEMORY_BARRIER();
-    t->pwm_tick=buzzerTimer; t->isr_cycles=(uint16_t)CLAMP((int32_t)foc_isr_cycles,0,65535);
-    t->control_slot=slot; t->event_bits=(uint8_t)(((LEFT_TIM->BDTR&TIM_BDTR_MOE)?1u:0u)|((RIGHT_TIM->BDTR&TIM_BDTR_MOE)?2u:0u));
+    t->pwm_tick=buzzerTimer; t->isr_cycles=0u;
+    t->control_slot=slot;
+    t->event_bits=(uint8_t)(((LEFT_TIM->BDTR&TIM_BDTR_MOE)?1u:0u)|((RIGHT_TIM->BDTR&TIM_BDTR_MOE)?2u:0u)|s_foc_trace_event_latch);
+    s_foc_trace_event_latch=0u;
     t->left_id_q4=m_motor_1.m_id_q4; t->left_iq_q4=m_motor_1.m_iq_q4; t->left_id_set_q4=m_motor_1.m_id_set_q4; t->left_iq_set_q4=m_motor_1.m_iq_set_q4;
     t->left_vd=m_motor_1.m_vd; t->left_vq=m_motor_1.m_vq; t->left_erpm=foc_trace_erpm(&m_motor_1,false);
     t->right_id_q4=m_motor_2.m_id_q4; t->right_iq_q4=m_motor_2.m_iq_q4; t->right_id_set_q4=m_motor_2.m_id_set_q4; t->right_iq_set_q4=m_motor_2.m_iq_set_q4;
     t->right_vd=m_motor_2.m_vd; t->right_vq=m_motor_2.m_vq; t->right_erpm=foc_trace_erpm(&m_motor_2,true);
+    t->left_id_integrator=m_motor_1.m_id_integrator; t->left_iq_integrator=m_motor_1.m_iq_integrator;
+    t->right_id_integrator=m_motor_2.m_id_integrator; t->right_iq_integrator=m_motor_2.m_iq_integrator;
+    t->left_sample_window=m_motor_1.m_sample_zero_window_counts; t->right_sample_window=m_motor_2.m_sample_zero_window_counts;
     t->vin_adc=(uint16_t)(batVoltage>0?batVoltage:0); t->left_fault=(uint8_t)m_motor_1.m_fault; t->right_fault=(uint8_t)m_motor_2.m_fault;
-    t->left_quality=0u; t->right_quality=0u;
+    t->left_quality=foc_trace_quality(&m_motor_1,false); t->right_quality=foc_trace_quality(&m_motor_2,true);
     FOC_MEMORY_BARRIER(); t->guard=g+2u;
     s_foc_trace_head=(uint8_t)((idx+1u)%MCPWM_FOC_TRACE_CAPACITY);
     if(s_foc_trace_count<MCPWM_FOC_TRACE_CAPACITY)s_foc_trace_count++;
     s_foc_trace_write_count++;
+    s_foc_trace_cycle_index=idx; FOC_MEMORY_BARRIER(); s_foc_trace_cycle_pending=1u;
+}
+
+static void foc_trace_finalize_isr_cycles(uint32_t elapsed) {
+    if(!s_foc_trace_cycle_pending)return;
+    const uint8_t idx=s_foc_trace_cycle_index;
+    if(idx>=MCPWM_FOC_TRACE_CAPACITY){s_foc_trace_cycle_pending=0u;return;}
+    mcpwm_foc_trace_sample_t *t=&s_foc_trace[idx];
+    uint32_t g=t->guard;if(g&1u)g++;
+    t->guard=g+1u;FOC_MEMORY_BARRIER();
+    t->isr_cycles=(uint16_t)(elapsed>65535u?65535u:elapsed);
+    FOC_MEMORY_BARRIER();t->guard=g+2u;s_foc_trace_cycle_pending=0u;
 }
 
 
@@ -562,6 +622,7 @@ static void foc_isr_monitor_end(uint32_t start, uint32_t post_start, uint8_t det
      * this handler completed. Do not clear either flag here. */
     if((DMA1->ISR & DMA_ISR_TCIF1)!=0u)foc_irq_dma_tc_pending_exit_count++;
 #endif
+    foc_trace_finalize_isr_cycles(elapsed);
     foc_irq_exit_count++;
     foc_isr_cycles = elapsed;
     if (elapsed > foc_isr_cycles_max) foc_isr_cycles_max = elapsed;
@@ -570,7 +631,7 @@ static void foc_isr_monitor_end(uint32_t start, uint32_t post_start, uint8_t det
      * ada DWT read tambahan di hot path; startup diberi slot 0xff dan tidak
      * dicampur dengan statistik scheduler steady-state. */
     const uint8_t slot=foc_isr_profile_slot;
-    if(slot<6u){
+    if(slot<MCCONF_FOC_CONTROL_DIV){
         foc_isr_slot_count[slot]++;
         if(elapsed>foc_isr_slot_max_cycles[slot])foc_isr_slot_max_cycles[slot]=elapsed;
         if(elapsed>FOC_ISR_BUDGET_CYCLES)foc_isr_slot_miss_count[slot]++;
@@ -578,22 +639,33 @@ static void foc_isr_monitor_end(uint32_t start, uint32_t post_start, uint8_t det
 }
 
 
-void mcpwm_foc_reset_isr_profile(void) {
+static void foc_isr_profile_clear_isr_owned(void) {
     foc_isr_cycles_max=0u; foc_isr_deadline_miss_count=0u; foc_isr_profile_slot=0xffu;
     foc_prof_sample_down=0u; foc_prof_detail_sample=0u; foc_prof_detail_sample_count=0u;
     foc_isr_steady_count=0u; foc_isr_slot_sequence_error_count=0u; foc_isr_expected_slot=0xffu;
-    for(uint8_t i=0u;i<6u;++i){foc_isr_slot_max_cycles[i]=0u;foc_isr_slot_miss_count[i]=0u;foc_isr_slot_count[i]=0u;foc_prof_detail_slot_count[i]=0u;}
+    for(uint8_t i=0u;i<MCPWM_FOC_PROFILE_SLOT_CAPACITY;++i){foc_isr_slot_max_cycles[i]=0u;foc_isr_slot_miss_count[i]=0u;foc_isr_slot_count[i]=0u;foc_prof_detail_slot_count[i]=0u;}
     foc_prof_pre_max_cycles=foc_prof_control_max_cycles=foc_prof_post_max_cycles=0u;
     foc_prof_pre_gate_max_cycles=foc_prof_pre_offset_max_cycles=foc_prof_pre_protect_max_cycles=0u;
     for(uint8_t i=0u;i<2u;++i){foc_prof_motor_step_max_cycles[i]=0u;foc_prof_motor_control_max_cycles[i]=0u;foc_prof_motor_hold_max_cycles[i]=0u;}
     foc_prof_sensor_max_cycles=foc_prof_current_max_cycles=foc_prof_regulator_max_cycles=foc_prof_svpwm_max_cycles=0u;
     foc_prof_pll_max_cycles=foc_prof_position_pid_max_cycles=foc_prof_speed_pid_max_cycles=0u;
     foc_prof_current_circle_max_cycles=foc_prof_id_pi_max_cycles=foc_prof_iq_pi_max_cycles=0u;
-    foc_prof_decouple_limit_max_cycles=foc_prof_duty_mag_max_cycles=0u;
-    foc_prof_fast_hold_svpwm_max_cycles=0u;
+    foc_prof_decouple_limit_max_cycles=foc_prof_duty_mag_max_cycles=foc_prof_fast_hold_svpwm_max_cycles=0u;
     m_motor_1.m_overrun_count=0u; m_motor_2.m_overrun_count=0u;
+}
+
+bool mcpwm_foc_reset_isr_profile(void) {
     outer_control_max_cycles=0u; outer_control_miss_count=0u; outer_control_jitter_max_cycles=0u;
     outer_control_period_min_cycles=UINT32_MAX; outer_control_period_max_cycles=0u;
+#if defined(__arm__) || defined(__thumb__)
+    const uint32_t req=foc_prof_reset_request+1u; foc_prof_reset_request=req; FOC_MEMORY_BARRIER();
+    if((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk)==0u){foc_isr_profile_clear_isr_owned();foc_prof_reset_ack=req;return true;}
+    const uint32_t start=DWT->CYCCNT;
+    while(foc_prof_reset_ack!=req){ if((uint32_t)(DWT->CYCCNT-start)>(FOC_ISR_BUDGET_CYCLES*16u))return false; }
+    return true;
+#else
+    const uint32_t req=foc_prof_reset_request+1u; foc_prof_reset_request=req; foc_isr_profile_clear_isr_owned(); foc_prof_reset_ack=req; return true;
+#endif
 }
 void mcpwm_foc_get_irq_epoch(uint32_t *entry, uint32_t *exit) {
     FOC_MEMORY_BARRIER();
@@ -608,8 +680,9 @@ void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
      * entire snapshot if an IRQ entered while any field was copied; this keeps
      * max/count/stage data from different frames out of one diagnostic record
      * without ever masking the motor interrupt. */
-    uint32_t e0,x0,e1,x1;
-    for(;;) {
+    uint32_t e0=0u,x0=0u,e1=0u,x1=0u;
+    bool snapshot_ok=false;
+    for(uint8_t retry=0u; retry<64u; ++retry) {
         mcpwm_foc_get_irq_epoch(&e0,&x0);
         if(e0!=x0)continue;
         out->total_max_cycles=foc_isr_cycles_max; out->deadline_miss_count=foc_isr_deadline_miss_count;
@@ -619,7 +692,7 @@ void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
         out->sensor_max_cycles=foc_prof_sensor_max_cycles; out->pll_max_cycles=foc_prof_pll_max_cycles; out->current_max_cycles=foc_prof_current_max_cycles; out->regulator_max_cycles=foc_prof_regulator_max_cycles;
         out->position_pid_max_cycles=foc_prof_position_pid_max_cycles; out->speed_pid_max_cycles=foc_prof_speed_pid_max_cycles; out->current_circle_max_cycles=foc_prof_current_circle_max_cycles;
         out->id_pi_max_cycles=foc_prof_id_pi_max_cycles; out->iq_pi_max_cycles=foc_prof_iq_pi_max_cycles; out->decouple_limit_max_cycles=foc_prof_decouple_limit_max_cycles;
-        out->svpwm_max_cycles=foc_prof_svpwm_max_cycles; out->duty_mag_max_cycles=foc_prof_duty_mag_max_cycles; out->overrun_total=m_motor_1.m_overrun_count+m_motor_2.m_overrun_count;
+        out->svpwm_max_cycles=foc_prof_svpwm_max_cycles; out->duty_mag_max_cycles=foc_prof_duty_mag_max_cycles; out->reentry_guard_total=m_motor_1.m_overrun_count+m_motor_2.m_overrun_count;
         for(uint8_t i=0u;i<6u;++i){out->slot_max_cycles[i]=foc_isr_slot_max_cycles[i];out->slot_miss_count[i]=foc_isr_slot_miss_count[i];out->slot_count[i]=foc_isr_slot_count[i];}
         out->outer_max_cycles=outer_control_max_cycles; out->outer_miss_count=outer_control_miss_count;
         out->outer_jitter_max_cycles=outer_control_jitter_max_cycles;
@@ -634,9 +707,13 @@ void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
         for(uint8_t i=0u;i<6u;++i)out->detail_slot_count[i]=foc_prof_detail_slot_count[i];
         out->steady_isr_count=foc_isr_steady_count; out->slot_sequence_error_count=foc_isr_slot_sequence_error_count;
         out->fast_hold_svpwm_max_cycles=foc_prof_fast_hold_svpwm_max_cycles;
-        out->profile_revision=FOC_ISR_PROFILE_REVISION;
+        out->profile_revision=FOC_ISR_PROFILE_REVISION; out->active_slot_count=MCCONF_FOC_CONTROL_DIV; out->reset_epoch=foc_prof_reset_ack;
         mcpwm_foc_get_irq_epoch(&e1,&x1);
-        if(e0==e1 && x0==x1 && e1==x1)break;
+        if(e0==e1 && x0==x1 && e1==x1){snapshot_ok=true;break;}
+    }
+    if(!snapshot_ok){
+        memset(out,0,sizeof(*out));
+        out->profile_revision=0u;
     }
 }
 
@@ -1231,13 +1308,13 @@ static void decoupling_coeff_recompute(mcpwm_foc_motor_t *m) {
 static void motor_fault_set(mcpwm_foc_motor_t *m, mc_fault_code code) {
     if(!m)return;
     m->m_fault=code;
-    if(code!=FAULT_CODE_NONE && !s_foc_trace_frozen){
-        /* First fault owns the black box. Capture one trigger-state sample then
-         * freeze all older pre-fault history without any formatting/memcpy. */
-        foc_trace_capture_internal(0xfeu);
-        s_foc_trace_trigger_motor=(m==&m_motor_2)?2u:1u;
-        s_foc_trace_trigger_fault=(uint8_t)code;
-        s_foc_trace_frozen=1u;
+    if(code!=FAULT_CODE_NONE && !s_foc_trace_frozen && !s_foc_trace_fault_pending){
+        /* Single-writer trace contract: fault setters may run in main or ISR,
+         * therefore they only latch a trigger. DMA1_Channel1 owns ring writes,
+         * trigger capture and freeze at the next deterministic ISR boundary. */
+        s_foc_trace_fault_motor=(m==&m_motor_2)?2u:1u;
+        s_foc_trace_fault_code=(uint8_t)code;
+        FOC_MEMORY_BARRIER(); s_foc_trace_fault_pending=1u;
     }
     /* Timeout telah dikonversi saat config berubah. Fault path ISR sekarang
      * O(1), tanpa software divide 64-bit pada kondisi yang justru kritis. */
@@ -1276,6 +1353,12 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_state = MC_STATE_OFF;
     m->m_control_mode = CONTROL_MODE_NONE;
     m->m_fault = FAULT_CODE_NONE;
+    m->m_sample_zero_window_counts=pwm_res/2u;
+    m->m_sample_window_min_counts=0u;
+    m->m_sample_guard_counts=FOC_CURRENT_SAMPLE_GUARD_COUNTS;
+    m->m_sample_adc_phase_counts=pwm_res;
+    m->m_sample_window_valid=1u;
+    m->m_sample_sector=1u;
     m->m_kpq_q11=MCCONF_FOC_CURRENT_KP_Q11; m->m_kiq_q16=MCCONF_FOC_CURRENT_KI_Q16;
     m->m_kpd_q11=MCCONF_FOC_ID_KP_Q11; m->m_kid_q16=MCCONF_FOC_ID_KI_Q16;
     m->m_kps_q11=MCCONF_SPEED_KP_Q11; m->m_kis_q16=MCCONF_SPEED_KI_Q16; m->m_kds_q11=MCCONF_SPEED_KD_Q11;
@@ -2434,6 +2517,13 @@ detect_fail:
     return false;
 }
 
+void mcpwm_foc_force_bridges_off(void){
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
+    LEFT_TIM->BDTR&=~TIM_BDTR_MOE;
+    RIGHT_TIM->BDTR&=~TIM_BDTR_MOE;
+}
+
 void mcpwm_foc_release_motor(bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     /* Fail-safe ordering: hardware output off FIRST. If the ADC ISR pre-empts
@@ -3144,15 +3234,16 @@ static void encoder_tachometer_update_non_isr(mcpwm_foc_motor_t *m) {
 
     int32_t pos;
     uint32_t counts,ratio_q16;
-    uint32_t e0,x0,e1,x1;
-    for(;;) {
+    uint32_t e0=0u,x0=0u,e1=0u,x1=0u;
+    bool snapshot_ok=false;
+    for(uint8_t retry=0u; retry<32u; ++retry) {
         mcpwm_foc_get_irq_epoch(&e0,&x0);
         if(e0!=x0)continue;
         pos=m->m_position_counts; counts=m->m_encoder_counts; ratio_q16=m->m_encoder_ratio_q16;
         mcpwm_foc_get_irq_epoch(&e1,&x1);
-        if(e0==e1 && x0==x1 && e1==x1)break;
+        if(e0==e1 && x0==x1 && e1==x1){snapshot_ok=true;break;}
     }
-    if(counts<4u || ratio_q16==0u)return;
+    if(!snapshot_ok || counts<4u || ratio_q16==0u)return;
 
     if(!s_left_abi_tacho_tracking){
         s_left_abi_tacho_pos_last=pos;
@@ -4602,6 +4693,45 @@ void mcpwm_foc_adc_int_handler(void) {
     if(++s_foc_control_div>=MCCONF_FOC_CONTROL_DIV)s_foc_control_div=0u;
     const bool update_left=(control_slot==0u);
     const bool update_right=(MCCONF_FOC_CONTROL_DIV<=1u)?update_left:(control_slot==1u);
+    if(update_left)foc_sample_window_update(&m_motor_1,false);
+    if(update_right)foc_sample_window_update(&m_motor_2,true);
+
+    const bool step_slot=s_foc_step_test.active &&
+        ((s_foc_step_test.second==0u && update_left)||(s_foc_step_test.second!=0u && update_right));
+    bool step_capture=false,step_failed=false;
+    if(step_slot){
+        mcpwm_foc_motor_t *sm=s_foc_step_test.second?&m_motor_2:&m_motor_1;
+        if(sm->m_fault!=FAULT_CODE_NONE || sm->m_control_mode!=CONTROL_MODE_CURRENT){
+            step_failed=true;
+        }else if(s_foc_step_test.settling){
+            const bool ready=sm->m_current_offset_valid && sm->m_driven_offset_valid &&
+                !sm->m_driven_offset_calibrating && sm->m_bridge_settle_ticks==0u &&
+                sm->m_sample_window_valid;
+            if(ready){
+                /* Start the authoritative trace only after powered-offset settle. */
+                foc_trace_clear_isr_owned();
+                s_foc_step_test.settling=0u;
+            }else if(s_foc_step_test.settle_remaining>0u){
+                s_foc_step_test.settle_remaining--;
+                if(s_foc_step_test.settle_remaining==0u)step_failed=true;
+            }else step_failed=true;
+        }
+        if(step_failed){
+            s_foc_step_test.active=0u;s_foc_step_test.done=1u;s_foc_step_test.settling=0u;
+            s_foc_trace_event_latch|=1u<<6;step_capture=true;
+            mcpwm_foc_release_motor(s_foc_step_test.second!=0u);
+            mcpwm_foc_vesc_override_clear(s_foc_step_test.second!=0u);
+        }else if(!s_foc_step_test.settling){
+            step_capture=true;s_foc_trace_event_latch|=1u<<2;
+            if(s_foc_step_test.pre_remaining>0u){
+                s_foc_step_test.pre_remaining--;
+            }else if(!s_foc_step_test.step_fired){
+                sm->m_iq_target_q4=s_foc_step_test.step_q4;sm->m_iq_set_q4=s_foc_step_test.step_q4;
+                sm->m_iq_set_ramp_q16=(int32_t)s_foc_step_test.step_q4*65536;
+                s_foc_step_test.step_fired=1u;s_foc_trace_event_latch|=1u<<3;
+            }
+        }
+    }
     uint32_t profMotorStart=0u;
     if(foc_prof_detail_sample)profMotorStart=DWT->CYCCNT;
     motor_control_step(&m_motor_1,false,curL_phaA,curL_phaB,curL_DC,update_left);
@@ -4620,7 +4750,19 @@ void mcpwm_foc_adc_int_handler(void) {
         volatile uint32_t *const dst=update_right?&foc_prof_motor_control_max_cycles[1]:&foc_prof_motor_hold_max_cycles[1];
         if(used>*dst)*dst=used;
     }
-    if(update_right){foc_motor_heartbeat[1]++;foc_trace_capture_internal(control_slot);}
+    if(update_right)foc_motor_heartbeat[1]++;
+    /* During a synchronized step, capture only after powered-offset settling;
+     * otherwise retain the historical RIGHT-slot cadence (PWM/CONTROL_DIV). */
+    if(step_capture || (!s_foc_step_test.active && !step_failed && update_right))foc_trace_capture_internal(control_slot);
+    if(step_failed)s_foc_trace_frozen=1u;
+    if(step_capture && s_foc_step_test.step_fired && s_foc_step_test.active){
+        if(s_foc_step_test.post_remaining>0u)s_foc_step_test.post_remaining--;
+        if(s_foc_step_test.post_remaining==0u){
+            s_foc_step_test.active=0u;s_foc_step_test.done=1u;s_foc_trace_frozen=1u;
+            mcpwm_foc_release_motor(s_foc_step_test.second!=0u);
+            mcpwm_foc_vesc_override_clear(s_foc_step_test.second!=0u);
+        }
+    }
     foc_iqL_q4=m_motor_1.m_iq_q4;foc_idL_q4=m_motor_1.m_id_q4;
     foc_iqR_q4=m_motor_2.m_iq_q4;foc_idR_q4=m_motor_2.m_id_q4;
     LEFT_TIM->LEFT_TIM_U=m_motor_1.m_ccr_a;LEFT_TIM->LEFT_TIM_V=m_motor_1.m_ccr_b;LEFT_TIM->LEFT_TIM_W=m_motor_1.m_ccr_c;
@@ -4681,6 +4823,8 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     /* Count actual CPU entry into DMA1 Channel1, independent of motor mode. */
     foc_irq_entry_count++;
     DMA1->IFCR = DMA_IFCR_CTCIF1;
+    if(foc_prof_reset_ack!=foc_prof_reset_request){foc_isr_profile_clear_isr_owned();FOC_MEMORY_BARRIER();foc_prof_reset_ack=foc_prof_reset_request;}
+    foc_trace_service_requests_isr();
 
     if(offsetcount < 2000) {  // calibrate ADC offsets
         foc_isr_profile_slot=0xffu;
@@ -4747,15 +4891,15 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     const uint8_t rightDriveRequest=(rightSourceEnable!=0u)&&(m_motor_2.m_control_mode!=CONTROL_MODE_NONE)&&
         rightFeedbackReady&&m_motor_2.m_current_offset_valid;
     const uint8_t isrSlot=s_foc_control_div;
-    foc_isr_profile_slot=(isrSlot<6u)?isrSlot:0xffu;
-    if(isrSlot<6u){
+    foc_isr_profile_slot=(isrSlot<MCCONF_FOC_CONTROL_DIV)?isrSlot:0xffu;
+    if(isrSlot<MCCONF_FOC_CONTROL_DIV){
         if(foc_isr_expected_slot!=0xffu && isrSlot!=foc_isr_expected_slot)foc_isr_slot_sequence_error_count++;
-        foc_isr_expected_slot=(uint8_t)((isrSlot+1u)>=6u?0u:(isrSlot+1u));
+        foc_isr_expected_slot=(uint8_t)((isrSlot+1u)>=MCCONF_FOC_CONTROL_DIV?0u:(isrSlot+1u));
         foc_isr_steady_count++;
     }
     if(foc_prof_sample_down==0u){
         foc_prof_detail_sample=1u; foc_prof_sample_down=(uint8_t)(FOC_PROF_SAMPLE_PERIOD-1u);
-        if(isrSlot<6u)foc_prof_detail_slot_count[isrSlot]++;
+        if(isrSlot<MCCONF_FOC_CONTROL_DIV)foc_prof_detail_slot_count[isrSlot]++;
     }else {foc_prof_detail_sample=0u;foc_prof_sample_down--;}
     uint32_t focPreFaultEnd=0u, focPreOffsetEnd=0u;
     if(foc_prof_detail_sample){
@@ -5064,6 +5208,11 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
         foc_prof_detail_sample_count++;
     }
     mcpwm_foc_adc_int_handler();
+    if(s_foc_trace_fault_pending && !s_foc_trace_frozen){
+        s_foc_trace_event_latch|=1u<<6;foc_trace_capture_internal(0xfeu);
+        s_foc_trace_trigger_motor=s_foc_trace_fault_motor;s_foc_trace_trigger_fault=s_foc_trace_fault_code;
+        s_foc_trace_fault_pending=0u;s_foc_trace_frozen=1u;s_foc_step_test.active=0u;s_foc_step_test.done=1u;
+    }
     if(foc_prof_detail_sample){
         focPostStart=DWT->CYCCNT;
         const uint32_t control=focPostStart-focControlStart;
@@ -5205,11 +5354,30 @@ void mcpwm_foc_get_liveness(uint32_t *adc_heartbeat,uint32_t motor_heartbeat[2])
     if(adc_heartbeat)*adc_heartbeat=foc_adc_heartbeat;
     if(motor_heartbeat){motor_heartbeat[0]=foc_motor_heartbeat[0];motor_heartbeat[1]=foc_motor_heartbeat[1];}
 }
-void mcpwm_foc_trace_freeze(void){s_foc_trace_frozen=1u;}
-void mcpwm_foc_trace_clear(void){
+static void foc_trace_clear_isr_owned(void){
     s_foc_trace_head=0u;s_foc_trace_count=0u;s_foc_trace_frozen=0u;
     s_foc_trace_trigger_motor=0u;s_foc_trace_trigger_fault=0u;s_foc_trace_write_count=0u;
+    s_foc_trace_fault_pending=0u;s_foc_trace_event_latch=0u;s_foc_trace_cycle_pending=0u;
 }
+static void foc_trace_service_requests_isr(void){
+    if(s_foc_trace_clear_req){foc_trace_clear_isr_owned();s_foc_trace_clear_req=0u;FOC_MEMORY_BARRIER();s_foc_trace_ack_seq=s_foc_trace_req_seq;}
+    if(s_foc_trace_freeze_req){s_foc_trace_frozen=1u;s_foc_trace_freeze_req=0u;FOC_MEMORY_BARRIER();s_foc_trace_ack_seq=s_foc_trace_req_seq;}
+}
+static bool foc_trace_request_wait(bool clear){
+    const uint32_t req=s_foc_trace_req_seq+1u;s_foc_trace_req_seq=req;
+    if(clear)s_foc_trace_clear_req=1u;else s_foc_trace_freeze_req=1u;
+    FOC_MEMORY_BARRIER();
+#if defined(__arm__) || defined(__thumb__)
+    if((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk)==0u){if(clear)foc_trace_clear_isr_owned();else s_foc_trace_frozen=1u;s_foc_trace_clear_req=s_foc_trace_freeze_req=0u;s_foc_trace_ack_seq=req;return true;}
+    const uint32_t start=DWT->CYCCNT;
+    while(s_foc_trace_ack_seq!=req){if((uint32_t)(DWT->CYCCNT-start)>(FOC_ISR_BUDGET_CYCLES*16u))return false;}
+#else
+    if(clear)foc_trace_clear_isr_owned();else s_foc_trace_frozen=1u;s_foc_trace_clear_req=s_foc_trace_freeze_req=0u;s_foc_trace_ack_seq=req;
+#endif
+    return true;
+}
+bool mcpwm_foc_trace_freeze(void){return foc_trace_request_wait(false);}
+bool mcpwm_foc_trace_clear(void){return foc_trace_request_wait(true);}
 void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out){
     if(!out)return;
     out->write_count=s_foc_trace_write_count;
@@ -5229,6 +5397,46 @@ bool mcpwm_foc_trace_read(uint8_t chronological_index,mcpwm_foc_trace_sample_t *
         const uint32_t b=src->guard;if(a==b && !(b&1u)){*out=tmp;return true;}
     }
     return false;
+}
+
+void mcpwm_foc_get_adc_sample_diag(bool second,mcpwm_foc_adc_sample_diag_t *out){
+    if(!out)return;
+    const mcpwm_foc_motor_t *m=second?&m_motor_2:&m_motor_1;
+    uint32_t e0=0u,x0=0u,e1=0u,x1=0u;
+    bool snapshot_ok=false;
+    for(uint8_t retry=0u; retry<32u; ++retry){
+        mcpwm_foc_get_irq_epoch(&e0,&x0);if(e0!=x0)continue;
+        out->ccr_a=m->m_ccr_a;out->ccr_b=m->m_ccr_b;out->ccr_c=m->m_ccr_c;
+        out->zero_window_counts=m->m_sample_zero_window_counts;out->min_window_counts=m->m_sample_window_min_counts;
+        out->guard_counts=m->m_sample_guard_counts;out->adc_phase_counts=m->m_sample_adc_phase_counts;out->invalid_count=m->m_sample_invalid_count;
+        out->sector=m->m_sample_sector;out->window_valid=m->m_sample_window_valid;out->offset_valid=m->m_current_offset_valid;
+        out->driven_offset_valid=m->m_driven_offset_valid;out->bridge_settled=(m->m_bridge_settle_ticks==0u)?1u:0u;
+        mcpwm_foc_get_irq_epoch(&e1,&x1);if(e0==e1&&x0==x1&&e1==x1){snapshot_ok=true;break;}
+    }
+    if(!snapshot_ok){ memset(out,0,sizeof(*out)); out->window_valid=0u; }
+}
+
+bool mcpwm_foc_step_test_arm(float pre_a,float step_a,uint8_t pre_samples,uint8_t post_samples,bool second){
+    mcpwm_foc_motor_t *m=second?&m_motor_2:&m_motor_1;
+    const uint16_t requested=(uint16_t)pre_samples+(uint16_t)post_samples;
+    if(s_foc_step_test.active || m->m_fault!=FAULT_CODE_NONE || pre_samples<2u || post_samples<2u ||
+       requested>MCPWM_FOC_TRACE_CAPACITY)return false;
+    const int16_t pre=amp_to_q4(m,pre_a), step=amp_to_q4(m,step_a);
+    if(!mcpwm_foc_trace_clear())return false;
+    /* Command exactly the clamped value that is reported back in step_status. */
+    mcpwm_foc_set_current((float)pre/(float)FOC_CURRENT_Q4_PER_A,second);
+    mcpwm_foc_vesc_override_touch(second);
+    s_foc_step_test.sequence++;s_foc_step_test.pre_q4=pre;s_foc_step_test.step_q4=step;s_foc_step_test.second=second?1u:0u;
+    s_foc_step_test.pre_remaining=pre_samples;s_foc_step_test.post_remaining=post_samples;s_foc_step_test.step_fired=0u;s_foc_step_test.done=0u;
+    s_foc_step_test.settling=1u;s_foc_step_test.settle_remaining=255u;
+    FOC_MEMORY_BARRIER();s_foc_step_test.active=1u;return true;
+}
+void mcpwm_foc_step_test_get(mcpwm_foc_step_test_status_t *out){
+    if(!out)return;
+    FOC_MEMORY_BARRIER();
+    out->sequence=s_foc_step_test.sequence;out->pre_q4=s_foc_step_test.pre_q4;out->step_q4=s_foc_step_test.step_q4;
+    out->active=s_foc_step_test.active;out->second=s_foc_step_test.second;out->pre_remaining=s_foc_step_test.pre_remaining;out->post_remaining=s_foc_step_test.post_remaining;
+    out->step_fired=s_foc_step_test.step_fired;out->done=s_foc_step_test.done;FOC_MEMORY_BARRIER();
 }
 
 static float q4_to_amp(int16_t q){return (float)q/(float)FOC_CURRENT_Q4_PER_A;}
@@ -5354,9 +5562,10 @@ typedef struct {
 } foc_telem_isr_snapshot_t;
 
 static void foc_telem_isr_snapshot(const mcpwm_foc_motor_t *m, foc_telem_isr_snapshot_t *o) {
-    uint32_t e0,x0,e1,x1;
+    uint32_t e0=0u,x0=0u,e1=0u,x1=0u;
     if(!m||!o)return;
-    for(;;) {
+    bool snapshot_ok=false;
+    for(uint8_t retry=0u; retry<32u; ++retry) {
         mcpwm_foc_get_irq_epoch(&e0,&x0);
         if(e0!=x0)continue;
         o->rpm=m->m_rpm; o->duty=m->m_duty_now_permille; o->vd=m->m_vd; o->vq=m->m_vq;
@@ -5368,8 +5577,9 @@ static void foc_telem_isr_snapshot(const mcpwm_foc_motor_t *m, foc_telem_isr_sna
         o->control_mode=m->m_control_mode; o->driven_offset_valid=m->m_driven_offset_valid;
         o->driven_offset_calibrating=m->m_driven_offset_calibrating; o->bridge_settle_ticks=m->m_bridge_settle_ticks;
         mcpwm_foc_get_irq_epoch(&e1,&x1);
-        if(e0==e1 && x0==x1 && e1==x1)break;
+        if(e0==e1 && x0==x1 && e1==x1){snapshot_ok=true;break;}
     }
+    if(!snapshot_ok) memset(o,0,sizeof(*o));
 }
 
 static void foc_telem_consume_main(mcpwm_foc_motor_t *m, int16_t *id_q4, int16_t *iq_q4, int16_t *ibus_counts,

@@ -49,11 +49,15 @@ DMA_HandleTypeDef hdma_usart3_rx;
 DMA_HandleTypeDef hdma_usart3_tx;
 volatile adc_buf_t adc_buffer;
 
+static volatile uint8_t s_uart3_dma_init_ok = 0u;
+#define HAL_OK_OR_RETURN(expr) do { if ((expr) != HAL_OK) return false; } while (0)
+
 
 
 /* USART3 init function */
-void UART3_Init(void)
+bool UART3_Init(void)
 {
+  s_uart3_dma_init_ok = 1u;
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
 
@@ -73,7 +77,8 @@ void UART3_Init(void)
   huart3.Init.Mode = UART_MODE_TX_RX;
   huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  HAL_UART_Init(&huart3);
+  if (HAL_UART_Init(&huart3) != HAL_OK) return false;
+  return s_uart3_dma_init_ok != 0u;
 }
 
 void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
@@ -112,7 +117,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     hdma_usart3_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
     hdma_usart3_rx.Init.Mode = DMA_CIRCULAR;
     hdma_usart3_rx.Init.Priority = DMA_PRIORITY_VERY_HIGH;
-    HAL_DMA_Init(&hdma_usart3_rx);
+    if (HAL_DMA_Init(&hdma_usart3_rx) != HAL_OK) { s_uart3_dma_init_ok = 0u; return; }
     __HAL_LINKDMA(uartHandle,hdmarx,hdma_usart3_rx);
 
     /* USART3_TX Init */
@@ -127,7 +132,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
      * the 16-kHz FOC ISR itself at the highest NVIC priority. A UART byte DMA
      * transfer is only one byte, so this cannot starve the ADC frame. */
     hdma_usart3_tx.Init.Priority = DMA_PRIORITY_HIGH;
-    HAL_DMA_Init(&hdma_usart3_tx);
+    if (HAL_DMA_Init(&hdma_usart3_tx) != HAL_OK) { s_uart3_dma_init_ok = 0u; return; }
     __HAL_LINKDMA(uartHandle,hdmatx,hdma_usart3_tx);
 
     /* USART3 interrupt Init */
@@ -289,7 +294,7 @@ void MX_GPIO_Init(void) {
   HAL_GPIO_Init(RIGHT_TIM_WL_PORT, &GPIO_InitStruct);
 }
 
-void MX_TIM_Init(void) {
+bool MX_TIM_Init(void) {
   __HAL_RCC_TIM1_CLK_ENABLE();
   __HAL_RCC_TIM8_CLK_ENABLE();
 
@@ -305,11 +310,11 @@ void MX_TIM_Init(void) {
   htim_right.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
   htim_right.Init.RepetitionCounter = 0;
   htim_right.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  HAL_TIM_PWM_Init(&htim_right);
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Init(&htim_right));
 
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_ENABLE;
   sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
-  HAL_TIMEx_MasterConfigSynchronization(&htim_right, &sMasterConfig);
+  HAL_OK_OR_RETURN(HAL_TIMEx_MasterConfigSynchronization(&htim_right, &sMasterConfig));
 
   sConfigOC.OCMode       = TIM_OCMODE_PWM1;
   sConfigOC.Pulse        = 0;
@@ -318,9 +323,9 @@ void MX_TIM_Init(void) {
   sConfigOC.OCFastMode   = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState  = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_SET;
-  HAL_TIM_PWM_ConfigChannel(&htim_right, &sConfigOC, TIM_CHANNEL_1);
-  HAL_TIM_PWM_ConfigChannel(&htim_right, &sConfigOC, TIM_CHANNEL_2);
-  HAL_TIM_PWM_ConfigChannel(&htim_right, &sConfigOC, TIM_CHANNEL_3);
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_ConfigChannel(&htim_right, &sConfigOC, TIM_CHANNEL_1));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_ConfigChannel(&htim_right, &sConfigOC, TIM_CHANNEL_2));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_ConfigChannel(&htim_right, &sConfigOC, TIM_CHANNEL_3));
 
   sBreakDeadTimeConfig.OffStateRunMode  = TIM_OSSR_ENABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
@@ -329,7 +334,7 @@ void MX_TIM_Init(void) {
   sBreakDeadTimeConfig.BreakState       = TIM_BREAK_DISABLE;
   sBreakDeadTimeConfig.BreakPolarity    = TIM_BREAKPOLARITY_LOW;
   sBreakDeadTimeConfig.AutomaticOutput  = TIM_AUTOMATICOUTPUT_DISABLE;
-  HAL_TIMEx_ConfigBreakDeadTime(&htim_right, &sBreakDeadTimeConfig);
+  HAL_OK_OR_RETURN(HAL_TIMEx_ConfigBreakDeadTime(&htim_right, &sBreakDeadTimeConfig));
 
   htim_left.Instance               = LEFT_TIM;
   htim_left.Init.Prescaler         = 0;
@@ -338,15 +343,15 @@ void MX_TIM_Init(void) {
   htim_left.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
   htim_left.Init.RepetitionCounter = 0;
   htim_left.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  HAL_TIM_PWM_Init(&htim_left);
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Init(&htim_left));
 
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_ENABLE;
-  HAL_TIMEx_MasterConfigSynchronization(&htim_left, &sMasterConfig);
+  HAL_OK_OR_RETURN(HAL_TIMEx_MasterConfigSynchronization(&htim_left, &sMasterConfig));
 
   sTimConfig.InputTrigger = TIM_TS_ITR0;
   sTimConfig.SlaveMode    = TIM_SLAVEMODE_GATED;
-  HAL_TIM_SlaveConfigSynchronization(&htim_left, &sTimConfig);
+  HAL_OK_OR_RETURN(HAL_TIM_SlaveConfigSynchronization(&htim_left, &sTimConfig));
 
   // Start counting >0 to effectively offset timers by the time it takes for one ADC conversion to complete.
   // This method allows that the Phase currents ADC measurements are properly aligned with LOW-FET ON region for both motors
@@ -359,9 +364,9 @@ void MX_TIM_Init(void) {
   sConfigOC.OCFastMode   = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState  = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_SET;
-  HAL_TIM_PWM_ConfigChannel(&htim_left, &sConfigOC, TIM_CHANNEL_1);
-  HAL_TIM_PWM_ConfigChannel(&htim_left, &sConfigOC, TIM_CHANNEL_2);
-  HAL_TIM_PWM_ConfigChannel(&htim_left, &sConfigOC, TIM_CHANNEL_3);
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_ConfigChannel(&htim_left, &sConfigOC, TIM_CHANNEL_1));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_ConfigChannel(&htim_left, &sConfigOC, TIM_CHANNEL_2));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_ConfigChannel(&htim_left, &sConfigOC, TIM_CHANNEL_3));
 
   sBreakDeadTimeConfig.OffStateRunMode  = TIM_OSSR_ENABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
@@ -370,31 +375,32 @@ void MX_TIM_Init(void) {
   sBreakDeadTimeConfig.BreakState       = TIM_BREAK_DISABLE;
   sBreakDeadTimeConfig.BreakPolarity    = TIM_BREAKPOLARITY_LOW;
   sBreakDeadTimeConfig.AutomaticOutput  = TIM_AUTOMATICOUTPUT_DISABLE;
-  HAL_TIMEx_ConfigBreakDeadTime(&htim_left, &sBreakDeadTimeConfig);
+  HAL_OK_OR_RETURN(HAL_TIMEx_ConfigBreakDeadTime(&htim_left, &sBreakDeadTimeConfig));
 
   LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
   RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
 
-  HAL_TIM_PWM_Start(&htim_left, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim_left, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim_left, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Start(&htim_left, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim_left, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Start(&htim_left, TIM_CHANNEL_3);  
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Start(&htim_left, TIM_CHANNEL_1));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Start(&htim_left, TIM_CHANNEL_2));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Start(&htim_left, TIM_CHANNEL_3));
+  HAL_OK_OR_RETURN(HAL_TIMEx_PWMN_Start(&htim_left, TIM_CHANNEL_1));
+  HAL_OK_OR_RETURN(HAL_TIMEx_PWMN_Start(&htim_left, TIM_CHANNEL_2));
+  HAL_OK_OR_RETURN(HAL_TIMEx_PWMN_Start(&htim_left, TIM_CHANNEL_3));
 
-  HAL_TIM_PWM_Start(&htim_right, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim_right, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim_right, TIM_CHANNEL_3);
-  HAL_TIMEx_PWMN_Start(&htim_right, TIM_CHANNEL_1);
-  HAL_TIMEx_PWMN_Start(&htim_right, TIM_CHANNEL_2);
-  HAL_TIMEx_PWMN_Start(&htim_right, TIM_CHANNEL_3);
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Start(&htim_right, TIM_CHANNEL_1));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Start(&htim_right, TIM_CHANNEL_2));
+  HAL_OK_OR_RETURN(HAL_TIM_PWM_Start(&htim_right, TIM_CHANNEL_3));
+  HAL_OK_OR_RETURN(HAL_TIMEx_PWMN_Start(&htim_right, TIM_CHANNEL_1));
+  HAL_OK_OR_RETURN(HAL_TIMEx_PWMN_Start(&htim_right, TIM_CHANNEL_2));
+  HAL_OK_OR_RETURN(HAL_TIMEx_PWMN_Start(&htim_right, TIM_CHANNEL_3));
 
   htim_left.Instance->RCR = 1;
 
   __HAL_TIM_ENABLE(&htim_right);
+  return true;
 }
 
-void MX_ADC1_Init(void) {
+bool MX_ADC1_Init(void) {
   ADC_MultiModeTypeDef multimode;
   ADC_ChannelConfTypeDef sConfig;
 
@@ -407,7 +413,7 @@ void MX_ADC1_Init(void) {
   hadc1.Init.ExternalTrigConv      = ADC_EXTERNALTRIGCONV_T8_TRGO;
   hadc1.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion       = 5;
-  HAL_ADC_Init(&hadc1);
+  HAL_OK_OR_RETURN(HAL_ADC_Init(&hadc1));
   /**Enable or disable the remapping of ADC1_ETRGREG:
     * ADC1 External Event regular conversion is connected to TIM8 TRG0
     */
@@ -428,32 +434,32 @@ void MX_ADC1_Init(void) {
   /**Configure the ADC multi-mode
     */
   multimode.Mode = ADC_DUALMODE_REGSIMULT;
-  HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode);
+  HAL_OK_OR_RETURN(HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode));
 
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   sConfig.Channel = ADC_CHANNEL_11;  // pc1 left cur  ->  right
   sConfig.Rank    = 1;
-  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc1, &sConfig));
 
   // sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
   sConfig.Channel = ADC_CHANNEL_0;  // pa0 right a   ->  left
   sConfig.Rank    = 2;
-  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc1, &sConfig));
 
   sConfig.Channel = ADC_CHANNEL_14;  // pc4 left b   -> right
   sConfig.Rank    = 3;
-  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc1, &sConfig));
 
   sConfig.Channel = ADC_CHANNEL_12;  // pc2 vbat
   sConfig.Rank    = 4;
-  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc1, &sConfig));
 
   //temperature requires at least 17.1uS sampling time
   sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
   sConfig.Channel = ADC_CHANNEL_TEMPSENSOR;  // internal temp
   sConfig.Rank    = 5;
-  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc1, &sConfig));
 
   hadc1.Instance->CR2 |= ADC_CR2_DMA | ADC_CR2_TSVREFE;
 
@@ -470,10 +476,11 @@ void MX_ADC1_Init(void) {
 
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  return true;
 }
 
 /* ADC2 init function */
-void MX_ADC2_Init(void) {
+bool MX_ADC2_Init(void) {
   ADC_ChannelConfTypeDef sConfig;
 
   __HAL_RCC_ADC2_CLK_ENABLE();
@@ -489,33 +496,34 @@ void MX_ADC2_Init(void) {
   hadc2.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
   hadc2.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
   hadc2.Init.NbrOfConversion       = 5;
-  HAL_ADC_Init(&hadc2);
+  HAL_OK_OR_RETURN(HAL_ADC_Init(&hadc2));
 
  
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   sConfig.Channel = ADC_CHANNEL_10;  // pc0 right cur   -> left
   sConfig.Rank    = 1;
-  HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
   // sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
   sConfig.Channel = ADC_CHANNEL_13;  // pc3 right b   -> left
   sConfig.Rank    = 2;
-  HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
   sConfig.Channel = ADC_CHANNEL_15;  // pc5 left c   -> right
   sConfig.Rank    = 3;
-  HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
   sConfig.Channel = ADC_CHANNEL_2;  // PA2 spare paired ADC2 sample
   sConfig.Rank    = 4;
-  HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
   // sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;   // Commented-out to make `uart-l-rx` ADC sample time the same as `uart-l-tx`
   sConfig.Channel = ADC_CHANNEL_3;  // PA3 spare paired ADC2 sample
   sConfig.Rank    = 5;
-  HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
   hadc2.Instance->CR2 |= ADC_CR2_DMA;
   __HAL_ADC_ENABLE(&hadc2);
+  return true;
 }

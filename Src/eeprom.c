@@ -59,6 +59,7 @@ static HAL_StatusTypeDef EE_Format(void);
 static uint16_t EE_FindValidPage(uint8_t Operation);
 static uint16_t EE_VerifyPageFullWriteVariable(uint16_t VirtAddress, uint16_t Data);
 static uint16_t EE_PageTransfer(uint16_t VirtAddress, uint16_t Data);
+static volatile uint8_t s_ee_healthy = 0u;
 static uint16_t EE_VerifyPageFullyErased(uint32_t Address);
 
 /**
@@ -68,7 +69,7 @@ static uint16_t EE_VerifyPageFullyErased(uint32_t Address);
   * @retval - Flash error code: on write Flash error
   *         - FLASH_COMPLETE: on success
   */
-uint16_t EE_Init(void)
+static uint16_t EE_Init_Impl(void)
 {
   uint16_t pagestatus0 = 6, pagestatus1 = 6;
   uint16_t varidx = 0;
@@ -309,6 +310,19 @@ uint16_t EE_Init(void)
   }
 
   return HAL_OK;
+}
+
+uint16_t EE_Init(void)
+{
+  s_ee_healthy = 0u;
+  const uint16_t st = EE_Init_Impl();
+  if (st == HAL_OK) s_ee_healthy = 1u;
+  return st;
+}
+
+uint8_t EE_IsHealthy(void)
+{
+  return s_ee_healthy;
 }
 
 /**

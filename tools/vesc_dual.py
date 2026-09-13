@@ -11,10 +11,7 @@ polls selective mc_values telemetry from both motors.
 from __future__ import annotations
 import argparse
 import os
-import signal
-import socket
 import struct
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -43,6 +40,8 @@ COMM_GET_APPCONF_DEFAULT = 18
 COMM_TERMINAL_CMD = 20
 COMM_PRINT = 21
 COMM_ROTOR_POSITION = 22
+COMM_DETECT_MOTOR_R_L = 25
+COMM_DETECT_MOTOR_FLUX_LINKAGE = 26
 COMM_DETECT_ENCODER = 27
 COMM_REBOOT = 29
 COMM_DETECT_HALL_FOC = 28
@@ -55,6 +54,7 @@ COMM_SET_MCCONF_TEMP = 48
 COMM_SET_MCCONF_TEMP_SETUP = 49
 COMM_GET_VALUES_SELECTIVE = 50
 COMM_GET_VALUES_SETUP_SELECTIVE = 51
+COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP = 57
 COMM_DETECT_APPLY_ALL_FOC = 58
 COMM_PING_CAN = 62
 COMM_APP_DISABLE_OUTPUT = 63
@@ -69,368 +69,110 @@ COMM_SHUTDOWN = 156
 RIGHT_ID = 2
 POLE_PAIRS = 15
 STOP_ERPM = 5 * POLE_PAIRS  # 5 mechanical rpm
+DEFAULT_BAUD = 115200
+EXPECTED_LOCAL_TARGETS = {"motor_left", "f103rc_bootloader"}
 # STM32F1 EEPROM emulation can compact a 205-variable page on persistent writes.
 # Keep normal request/reply deadlines short; only commands that explicitly store
 # configuration get this bounded hardware-aware deadline.
 PERSISTENT_WRITE_TIMEOUT = 8.0
 
 
-def _discover_f411_cdc() -> str:
-    """Return the BlackPill F411 USB CDC path, never an unrelated ttyUSB sensor."""
-    configured = os.environ.get("VESC_F411_USB", "").strip()
-    if configured:
-        return configured
-    by_id = "/dev/serial/by-id"
+def _stable_serial_path(device: str) -> str:
+    """Prefer /dev/serial/by-id so an F103 USB-UART keeps a stable name."""
+    if os.name != "posix":
+        return device
+    root = Path("/dev/serial/by-id")
     try:
-        for name in sorted(os.listdir(by_id)):
-            upper = name.upper()
-            if "STMICROELECTRONICS" in upper and "F411" in upper and "CDC" in upper:
-                return os.path.realpath(os.path.join(by_id, name))
+        target = os.path.realpath(device)
+        for q in sorted(root.iterdir()):
+            if os.path.realpath(str(q)) == target:
+                return str(q)
     except OSError:
         pass
-    return "/dev/ttyACM0"
+    return device
 
 
-def _proc_cmdline(pid: int) -> str:
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
-    except Exception:
-        return ""
-
-
-def _parent_pid(pid: int) -> int:
-    try:
-        return int(Path(f"/proc/{pid}/stat").read_text().split()[3])
-    except Exception:
-        return 0
-
-
-def _cdc_holders(path: str) -> list[tuple[int, str]]:
-    real = os.path.realpath(path)
-    try:
-        r = subprocess.run(["fuser", real], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           text=True, timeout=1.0, check=False)
-    except Exception:
+def _direct_serial_candidates() -> list[tuple[str, str]]:
+    """Enumerate generic USB-UART ports; no intermediate MCU gateway assumptions."""
+    if serial is None:
         return []
+    import serial.tools.list_ports
+    ranked=[]
+    for q in serial.tools.list_ports.comports():
+        dev=_stable_serial_path(q.device)
+        meta=" ".join(str(x or "") for x in (q.description,q.manufacturer,q.hwid)).lower()
+        if q.vid is None and "/dev/ttyUSB" not in q.device and "/dev/ttyACM" not in q.device and "usb" not in meta:
+            continue
+        score=0
+        if q.vid is not None: score+=100
+        if "ch340" in meta or "ch341" in meta or q.vid==0x1A86: score+=80
+        if "cp210" in meta or q.vid==0x10C4: score+=60
+        if "ftdi" in meta or q.vid==0x0403: score+=50
+        if "/dev/serial/by-id/" in dev: score+=30
+        if "/dev/ttyUSB" in q.device: score+=20
+        ranked.append((-score,dev,q.description or "USB serial"))
+    ranked.sort(key=lambda x:(x[0],x[1]))
     out=[]
-    for tok in r.stdout.split():
-        if tok.isdigit():
-            pid=int(tok)
-            if pid != os.getpid():
-                out.append((pid, _proc_cmdline(pid)))
+    seen=set()
+    for _,dev,desc in ranked:
+        if dev not in seen:
+            seen.add(dev); out.append((dev,desc))
     return out
 
 
-def _reclaim_official_f411_holder(path: str) -> list[int]:
-    """Release only our stmf4_hmi_bridge, never an arbitrary tty owner.
-
-    The ros2 launch ancestor is SIGSTOP-ed first so respawn cannot race an
-    exclusive direct-CDC maintenance session. The caller must SIGCONT returned
-    PIDs after closing the CDC.
-    """
-    holders=_cdc_holders(path)
-    if not holders:
-        return []
-    official=[x for x in holders if "stmf4_hmi_bridge" in x[1]]
-    unknown=[x for x in holders if x not in official]
-    if unknown:
-        raise RuntimeError("F411 CDC busy by unknown process(es): " +
-                           ", ".join(f"{pid}:{cmd[:80]}" for pid,cmd in unknown))
-    suspended=[]
-    for child,_ in official:
-        pid=_parent_pid(child)
-        while pid>1:
-            cmd=_proc_cmdline(pid)
-            if "ros2 launch " in cmd or ("/opt/ros/" in cmd and " launch " in cmd):
-                if pid not in suspended:
-                    os.kill(pid, signal.SIGSTOP); suspended.append(pid)
-                    print(f"[VESC-AUTO] paused ROS launch pid={pid} for direct F411 fallback", flush=True)
-                break
-            pid=_parent_pid(pid)
-    pids=[pid for pid,_ in official]
-    for pid in pids:
-        try: os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError: pass
-    deadline=time.monotonic()+4.0
-    while time.monotonic()<deadline:
-        if not any(pid in [p for p,_ in _cdc_holders(path)] for pid in pids):
-            return suspended
-        time.sleep(.10)
-    for pid in pids:
-        try: os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError: pass
-    deadline=time.monotonic()+1.0
-    while time.monotonic()<deadline:
-        if not _cdc_holders(path):
-            return suspended
-        time.sleep(.05)
-    for pid in suspended:
-        try: os.kill(pid, signal.SIGCONT)
-        except ProcessLookupError: pass
-    raise RuntimeError("F411 CDC could not be released for direct fallback")
-
-
-def _resume_pids(pids: list[int]) -> None:
-    for pid in reversed(pids):
-        try:
-            os.kill(pid, signal.SIGCONT)
-            print(f"[VESC-AUTO] resumed ROS launch pid={pid}", flush=True)
-        except ProcessLookupError:
-            pass
-
-
-
-class TcpSerialTransport:
-    """Small pyserial-compatible adapter for the ROS maintenance TCP bridge."""
-    def __init__(self, endpoint: str, timeout: float = 0.01):
-        target = endpoint.strip()
-        if target in {"maintenance", "ros", "python-maintenance"}:
-            target = os.environ.get("VESC_PYTHON_MAINTENANCE", "tcp://127.0.0.1:65101")
-        if not target.startswith("tcp://"):
-            raise ValueError(f"invalid TCP endpoint: {endpoint}")
-        host_port = target[6:]
-        host, sep, port_text = host_port.rpartition(":")
-        if not sep or not host or not port_text.isdigit():
-            raise ValueError(f"TCP endpoint must be tcp://HOST:PORT: {endpoint}")
-        self.sock = socket.create_connection((host, int(port_text)), timeout=2.0)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.timeout = max(0.0, float(timeout))
-        self.sock.settimeout(self.timeout)
-        self.endpoint = f"tcp://{host}:{int(port_text)}"
-
-    @property
-    def in_waiting(self) -> int:
-        try:
-            data = self.sock.recv(65535, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-            return len(data)
-        except (BlockingIOError, InterruptedError, socket.timeout):
-            return 0
-
-    def write(self, data: bytes) -> int:
-        self.sock.sendall(data)
-        return len(data)
-
-    def read(self, size: int = 1) -> bytes:
-        try:
-            return self.sock.recv(max(1, int(size)))
-        except socket.timeout:
-            return b""
-
-    def flush(self) -> None:
-        return
-
-    def reset_input_buffer(self) -> None:
-        old = self.sock.gettimeout()
-        try:
-            self.sock.setblocking(False)
-            while True:
-                try:
-                    if not self.sock.recv(4096):
-                        break
-                except BlockingIOError:
-                    break
-        finally:
-            self.sock.settimeout(old)
-
-    def reset_output_buffer(self) -> None:
-        return
-
-    def close(self) -> None:
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        self.sock.close()
-
-
-class F411DirectTransport:
-    """VESC byte stream tunneled directly over the BlackPill F411 USB CDC gateway."""
-    def __init__(self, path: str | None = None, timeout: float = 0.01, reclaim: bool = False):
-        if serial is None:
-            raise RuntimeError("pyserial required for direct F411 USB mode")
-        self.path = path or _discover_f411_cdc()
-        self.timeout = max(0.0, float(timeout))
-        self._suspended_launch_pids = _reclaim_official_f411_holder(self.path) if reclaim else []
-        # Poll USB CDC at 1 ms. With the F411/F103 UART fixed at 115200 baud the round-trip is normally
-        # sub-millisecond to a few milliseconds; a 10-ms tty read timeout turns
-        # an otherwise healthy request into artificial 10-ms latency whenever
-        # the reply is not already queued at the first read.
-        try:
-            self.ser = serial.Serial(
-                self.path, 1000000, timeout=0.001, write_timeout=2.0, exclusive=True)
-            self.linebuf = bytearray()
-            self.rawbuf = bytearray()
-            self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
-            self.ser.write(b"\n"); self.ser.flush(); time.sleep(0.03); self.ser.reset_input_buffer()
-            self._command("VESC:MODE:MAINTENANCE", "VESC:MODE:MAINTENANCE", 3.0)
-            self._command("VESC:STATUS", "mode=MAINTENANCE", 2.0)
-            self._last_maintenance_keepalive = time.monotonic()
-            time.sleep(0.30)
-        except Exception:
-            try:
-                if hasattr(self, "ser") and self.ser is not None:
-                    self.ser.close()
-            except Exception:
-                pass
-            _resume_pids(self._suspended_launch_pids)
-            self._suspended_launch_pids=[]
-            raise
-
-    def _consume_line(self, line: str) -> None:
-        if line.startswith("VESC:ERR:"):
-            raise RuntimeError(line)
-        if line.startswith("VESC:RX:"):
-            hx = line[8:].strip()
-            if hx:
-                try:
-                    self.rawbuf.extend(bytes.fromhex(hx))
-                except ValueError as exc:
-                    raise RuntimeError(f"bad F411 VESC hex: {hx[:80]}") from exc
-
-    def _maintenance_keepalive(self) -> None:
-        """Refresh the F411 maintenance lease during long blocking VESC commands.
-
-        F411 intentionally expires maintenance ownership after a few seconds.
-        Encoder/steering detection can legitimately take tens of seconds, so
-        keep the lease alive while this direct transport remains the exclusive
-        CDC owner. The gateway ACK is a normal text line and _pump() ignores it.
-        """
-        now = time.monotonic()
-        last = getattr(self, "_last_maintenance_keepalive", 0.0)
-        if now - last < 1.5:
-            return
-        self.ser.write(b"VESC:MODE:MAINTENANCE\n")
-        self.ser.flush()
-        self._last_maintenance_keepalive = now
-
-    def _pump(self, deadline: float) -> None:
-        while time.monotonic() < deadline:
-            self._maintenance_keepalive()
-            waiting = self.ser.in_waiting
-            chunk = self.ser.read(waiting or 1)
-            if not chunk:
-                return
-            self.linebuf.extend(chunk)
-            while b"\n" in self.linebuf:
-                raw, _, rest = self.linebuf.partition(b"\n")
-                self.linebuf[:] = rest
-                line = raw.decode(errors="replace").strip()
-                if line:
-                    self._consume_line(line)
-            if self.rawbuf:
-                return
-
-    def _command(self, text: str, expect: str, timeout: float) -> str:
-        self.ser.write((text + "\n").encode()); self.ser.flush()
-        deadline = time.monotonic() + timeout
-        collected = bytearray()
-        while time.monotonic() < deadline:
-            chunk = self.ser.read(self.ser.in_waiting or 1)
-            if not chunk:
-                continue
-            collected.extend(chunk)
-            while b"\n" in collected:
-                raw, _, rest = collected.partition(b"\n")
-                collected[:] = rest
-                line = raw.decode(errors="replace").strip()
-                if line.startswith("VESC:ERR:"):
-                    raise RuntimeError(line)
-                if expect in line:
-                    return line
-        raise TimeoutError(f"F411 command timeout: {text}")
-
-    @property
-    def in_waiting(self) -> int:
-        self._pump(time.monotonic() + 0.001)
-        return len(self.rawbuf)
-
-    def write(self, data: bytes) -> int:
-        # USB CDC is packetized; Mini-PC->F411 is 1 Mbaud while F411->F103 is validated at 115200 baud. The
-        # old unconditional 2-ms sleep after every VESC frame was inherited from
-        # the 115200-baud bridge and alone added >=2 ms request latency. Normal
-        # realtime/setpoint frames fit in one chunk, so do not pace them. Only
-        # yield briefly between chunks of a genuinely large frame (MC/App config
-        # or firmware transfer) so the F411 command parser can drain CDC input.
-        chunks = list(range(0, len(data), 48))
-        for index, off in enumerate(chunks):
-            chunk = data[off:off + 48]
-            line = b"VESC:TX:M:" + chunk.hex().upper().encode() + b"\n"
-            self.ser.write(line); self.ser.flush()
-            if index + 1 < len(chunks):
-                time.sleep(0.0002)
-        return len(data)
-
-    def read(self, size: int = 1) -> bytes:
-        if not self.rawbuf:
-            self._pump(time.monotonic() + self.timeout)
-        n = min(max(1, int(size)), len(self.rawbuf))
-        out = bytes(self.rawbuf[:n]); del self.rawbuf[:n]
-        return out
-
-    def flush(self) -> None:
-        self.ser.flush()
-
-    def reset_input_buffer(self) -> None:
-        self.linebuf.clear(); self.rawbuf.clear(); self.ser.reset_input_buffer()
-
-    def reset_output_buffer(self) -> None:
-        self.ser.reset_output_buffer()
-
-    def close(self) -> None:
-        try:
-            try:
-                self._command("VESC:MODE:RUNTIME", "VESC:MODE:RUNTIME", 1.5)
-            except Exception:
-                pass
-            self.ser.close()
-        finally:
-            _resume_pids(self._suspended_launch_pids)
-            self._suspended_launch_pids=[]
-
-
-def open_transport(port: str, baud: int = 115200, timeout: float = 0.01):
-    """Open one of the supported VESC links.
-
-    - ``auto``: Python-maintenance TCP first, then direct F411 USB CDC.
-    - ``maintenance`` / ``tcp://...``: ROS maintenance bridge.
-    - ``direct`` / ``usb`` / ``f411``: exclusive F411 CDC gateway access.
-    - explicit ``/dev/...``: raw VESC UART for legacy USB-UART commissioning.
-    """
-    target = (port or "auto").strip()
-    if target == "auto":
-        endpoint = os.environ.get("VESC_PYTHON_MAINTENANCE", "tcp://127.0.0.1:65101")
-        # Bila ROS/F411 sedang aktif, localhost:65101 adalah authority tertinggi
-        # dan harus dipakai tanpa merebut /dev/ttyACM0. Probe maksimal 5 detik;
-        # hanya bila route itu benar-benar tidak ada, fallback ke CDC F411.
-        wait_s=min(5.0,max(0.0,float(os.environ.get("VESC_TCP_WAIT_SEC","5.0"))))
-        deadline=time.monotonic()+wait_s; last=None; attempts=0
-        while True:
-            attempts += 1
-            try:
-                tr=TcpSerialTransport(endpoint, timeout=timeout)
-                print(f"[VESC-AUTO] TCP maintenance {tr.endpoint} selected after {attempts} probe(s)", flush=True)
-                return tr
-            except OSError as exc:
-                last=exc
-                if time.monotonic()>=deadline:
-                    break
-                time.sleep(min(.20,max(0.0,deadline-time.monotonic())))
-        cdc=_discover_f411_cdc()
-        print(f"[VESC-AUTO] TCP unavailable within {wait_s:.1f}s ({last}); direct F411 CDC fallback {cdc}", flush=True)
-        return F411DirectTransport(cdc, timeout=timeout, reclaim=True)
-    if target in {"maintenance", "ros", "python-maintenance"} or target.startswith("tcp://"):
-        return TcpSerialTransport(target, timeout=timeout)
-    if target in {"direct", "usb", "f411", "direct-usb"}:
-        return F411DirectTransport(_discover_f411_cdc(), timeout=timeout)
-    if target.startswith("f411:") or target.startswith("direct:"):
-        _, path = target.split(":", 1)
-        return F411DirectTransport(path or _discover_f411_cdc(), timeout=timeout)
+def _probe_f103_uart(path: str, baud: int = DEFAULT_BAUD, timeout: float = 0.01):
+    """Open and positively identify an F103 VESC/bootloader on a USB-UART."""
     if serial is None:
-        raise RuntimeError("pyserial required for direct serial: python -m pip install pyserial")
-    return serial.Serial(target, baud, timeout=timeout)
+        raise RuntimeError("pyserial required: python -m pip install pyserial")
+    ser=serial.Serial(path,baud,timeout=max(0.002,timeout),write_timeout=2,exclusive=True)
+    try:
+        try: ser.reset_input_buffer(); ser.reset_output_buffer()
+        except Exception: pass
+        dec=PacketDecoder()
+        ser.write(frame(bytes((COMM_FW_VERSION,)))); ser.flush()
+        deadline=time.monotonic()+0.8
+        while time.monotonic()<deadline:
+            data=ser.read(ser.in_waiting or 1)
+            for payload in dec.feed(data):
+                if payload and payload[0]==COMM_FW_VERSION and len(payload)>=4:
+                    end=payload.find(b"\0",3)
+                    name=payload[3:end if end>=0 else len(payload)].decode(errors="replace")
+                    if name not in EXPECTED_LOCAL_TARGETS:
+                        raise RuntimeError(f"unexpected VESC target {name!r}; expected direct F103 {sorted(EXPECTED_LOCAL_TARGETS)}")
+                    return ser,name
+        raise TimeoutError("no COMM_FW_VERSION reply")
+    except Exception:
+        ser.close(); raise
+
+
+def open_transport(port: str, baud: int = DEFAULT_BAUD, timeout: float = 0.01):
+    """Open the direct PC/NUC <-> F103 USART3 USB-UART link."""
+    target=(port or "auto").strip()
+    if target in {"direct","usb"}:
+        target="auto"
+    if target=="auto":
+        errors=[]
+        for dev,desc in _direct_serial_candidates():
+            try:
+                ser,name=_probe_f103_uart(dev,baud,timeout)
+                print(f"[VESC-AUTO] direct F103 UART selected {dev} ({desc}) target={name}",flush=True)
+                return ser
+            except Exception as exc:
+                errors.append(f"{dev}:{type(exc).__name__}")
+        if not errors:
+            raise RuntimeError("no USB-UART ports detected for F103")
+        raise RuntimeError("no F103 VESC target responded: "+", ".join(errors))
+    if target.startswith("direct:"):
+        target=target.split(":",1)[1]
+    # Explicit device names are not trusted implicitly. Positively identify
+    # the direct F103 endpoint exactly like AUTO so a wrong USB-UART cannot
+    # receive motor/config traffic merely because the path exists.
+    ser,name=_probe_f103_uart(target,baud,timeout)
+    print(f"[VESC-DIRECT] verified {target} target={name}",flush=True)
+    return ser
 
 HB_MAGIC = b"HB"
-HB_VERSION = 1
+HB_VERSION = 2
 HB_GET_DIAG = 1
 HB_GET_POS_STATE = 2
 HB_SET_POS_LIMITS = 3
@@ -449,6 +191,17 @@ HB_GET_TRACE_SAMPLE = 19
 HB_CLEAR_TRACE = 20
 HB_GET_PLATFORM_HEALTH = 21
 HB_GET_COMMS_HEALTH = 24
+HB_GET_PLATFORM_INFO = 25
+HB_GET_ADC_VALIDITY = 26
+HB_ARM_CURRENT_STEP = 27
+HB_GET_STEP_STATUS = 28
+HB_GET_POSITION_D_STATE = 30
+HB_BOOT_HANDOFF = 29
+HB_PLATFORM_SCHEMA = 2
+HB_DIAG_SCHEMA = 4
+HB_ISR_SCHEMA = 3
+HB_TRACE_SCHEMA = 3
+HB_ISR_PROFILE_REVISION = 0x00030000
 HB_FREEZE_TRACE = 22
 
 # currentMotor,currentIn,Id,Iq,duty,rpm,Vin,fault,vescId,Vd,Vq
@@ -707,7 +460,7 @@ class Diag:
     prof_current_max_cycles: int | None = None
     prof_regulator_max_cycles: int | None = None
     prof_svpwm_max_cycles: int | None = None
-    profiler_overrun_total: int | None = None
+    profiler_reentry_guard_total: int | None = None
 
     def short(self) -> str:
         return (
@@ -793,7 +546,7 @@ def parse_diag(payload: bytes) -> Diag:
     if len(payload) >= 189:
         oo0, oo1, oodc, osamp, osettle, oval = struct.unpack_from(">3hHHB", payload, 178)
         ext.update(off_offset0=oo0, off_offset1=oo1, off_offset_dc=oodc,
-                   off_offset_samples=osamp, off_settle_ticks=osettle, current_offset_valid=bool(oval))
+                   off_offset_samples=osamp, off_settle_ticks=osettle, off_offset_valid=bool(oval))
     if len(payload) >= 197:
         txdrop, txfail = struct.unpack_from(">2I", payload, 189)
         ext.update(tx_queue_drops=txdrop, tx_start_failures=txfail)
@@ -811,7 +564,9 @@ def parse_diag(payload: bytes) -> Diag:
                    position_last_motion_count=last_motion, position_error_counts=pos_error,
                    prof_sensor_max_cycles=ps, prof_current_max_cycles=pc,
                    prof_regulator_max_cycles=pr, prof_svpwm_max_cycles=pv,
-                   profiler_overrun_total=po)
+                   profiler_reentry_guard_total=po)
+    if len(payload) >= 254:
+        ext["current_offset_valid"] = bool(payload[253])
     return Diag(
         vesc_id=vid, control_mode=mode, state=state, fault=fault, hall=hall,
         override=bool(own), hall_store_ok=bool(store_ok), link_armed=bool(link_armed),
@@ -877,7 +632,7 @@ def _unpack_float32_auto(data: bytes, offset: int) -> tuple[float, int]:
 
 
 class VescDual:
-    def __init__(self, port: str, baud: int = 115200, timeout: float = 0.15):
+    def __init__(self, port: str, baud: int = DEFAULT_BAUD, timeout: float = 0.15):
         self.ser = open_transport(port, baud, timeout=0.01)
         # A software reboot can leave an incomplete pre-reset VESC frame in the
         # USB-UART driver's RX queue. Start each new host session at a packet
@@ -1075,6 +830,32 @@ class VescDual:
         with self.io_lock:
             self.send(self.fwd(req) if right else req)
             self.ser.flush()
+
+    def measure_r_l(self, right: bool = False) -> dict[str, float]:
+        """Non-persistent VESC R/L measurement. Firmware restores MC config after reply."""
+        req=bytes((COMM_DETECT_MOTOR_R_L,))
+        p=self.transact(self.fwd(req) if right else req,COMM_DETECT_MOTOR_R_L,12.0)
+        if len(p)!=13: raise RuntimeError(f"measure_r_l unexpected length {len(p)}")
+        r_raw,l_raw,ld_raw=struct.unpack_from(">iii",p,1)
+        r=r_raw/1_000_000.0; l=l_raw/1_000_000_000.0; ld_lq=ld_raw/1_000_000_000.0
+        if not (r>0.0 and l>0.0): raise RuntimeError(f"measure_r_l invalid R/L r={r} l={l}")
+        return {"r_ohm":r,"l_h":l,"ld_lq_h":ld_lq}
+
+    def measure_flux_openloop(self, current_a: float, erpm_per_sec: float, duty: float,
+                              resistance_ohm: float, inductance_h: float,
+                              right: bool = False) -> float:
+        """Non-persistent VESC open-loop flux measurement using an already qualified R/L model."""
+        if not (0.0<abs(current_a)<=15.0 and 50.0<=abs(erpm_per_sec)<=20000.0 and
+                0.0<abs(duty)<=1.0 and 0.0<resistance_ohm<=2.0 and 0.0<inductance_h<=0.1):
+            raise ValueError("invalid flux measurement arguments")
+        req=bytearray((COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,))
+        req+=struct.pack(">iiiii",round(current_a*1e3),round(erpm_per_sec*1e3),round(duty*1e3),
+                         round(resistance_ohm*1e6),round(inductance_h*1e8))
+        p=self.transact(self.fwd(bytes(req)) if right else bytes(req),COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,15.0)
+        if len(p)!=14: raise RuntimeError(f"measure_flux_openloop unexpected length {len(p)}")
+        flux=struct.unpack_from(">i",p,1)[0]/1e7
+        if not (0.0001<=flux<=1.0): raise RuntimeError(f"measure_flux_openloop invalid flux={flux}")
+        return flux
 
     def detect_encoder(self, current_a: float = 1.0, right: bool = False):
         """Commands::measureEncoder packet/reply format from VESC Tool."""
@@ -1283,6 +1064,7 @@ class VescDual:
         return Tuning(*vals,telem_filter_q16=filt,current_limit_q4=ilim)
 
     def set_tuning(self, tune: Tuning, right: bool = False, store: bool = False) -> Tuning:
+        self.require_platform_compatible(require_build=True)
         vals=(tune.kpq,tune.kiq,tune.kpd,tune.kid,tune.kps,tune.kis,tune.kds,tune.kpp,tune.kip,tune.kdp)
         data=struct.pack(">10HHB",*vals,max(1,min(65535,int(tune.telem_filter_q16))),1 if store else 0)
         p=self.custom_transact(HB_SET_TUNING,data,right=right)
@@ -1292,6 +1074,7 @@ class VescDual:
         return Tuning(*vals2,telem_filter_q16=filt,current_limit_q4=ilim)
 
     def set_id_test(self, current_a: float, phase_deg: float = 0.0, right: bool = False):
+        self.require_platform_compatible(require_build=True)
         data=struct.pack(">ii",round(current_a*1000.0),round(phase_deg*1000.0))
         p=self.custom_transact(HB_SET_ID_TEST,data,right=right)
         status=parse_custom_header(p,HB_SET_ID_TEST)
@@ -1376,19 +1159,49 @@ class VescDual:
         vals=struct.unpack_from(">"+"I"*len(names),p,6)
         return dict(zip(names,vals))
 
+    def platform_info(self) -> dict[str, int | str]:
+        p=self.custom_transact(HB_GET_PLATFORM_INFO,right=False,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_PLATFORM_INFO)
+        if status or len(p)!=46: raise RuntimeError(f"platform_info status={status} len={len(p)}")
+        platform_schema,diag_schema,isr_schema,trace_schema=struct.unpack_from(">4H",p,6)
+        features,build_id,git_hi=struct.unpack_from(">3I",p,14)
+        git_lo,control_div=struct.unpack_from(">2H",p,26)
+        cpu_hz,pwm_hz,profile_revision=struct.unpack_from(">3I",p,30)
+        trace_capacity,slot_capacity=struct.unpack_from(">2H",p,42)
+        return dict(platform_schema=platform_schema,diag_schema=diag_schema,isr_schema=isr_schema,trace_schema=trace_schema,
+                    features=features,build_id=build_id,git_sha=f"{git_hi:08x}{git_lo:04x}",control_div=control_div,
+                    cpu_hz=cpu_hz,pwm_hz=pwm_hz,profile_revision=profile_revision,trace_capacity=trace_capacity,slot_capacity=slot_capacity)
+
+    def require_platform_compatible(self, require_build: bool = True) -> dict[str, int | str]:
+        x=self.platform_info()
+        expected=(HB_PLATFORM_SCHEMA,HB_DIAG_SCHEMA,HB_ISR_SCHEMA,HB_TRACE_SCHEMA,HB_ISR_PROFILE_REVISION)
+        got=(x['platform_schema'],x['diag_schema'],x['isr_schema'],x['trace_schema'],x['profile_revision'])
+        if got!=expected: raise RuntimeError(f"TUNING_REFUSED schema mismatch got={got} expected={expected}")
+        if x['cpu_hz']!=64_000_000 or x['pwm_hz']!=16_000 or not (1<=x['control_div']<=6):
+            raise RuntimeError(f"TUNING_REFUSED platform timing mismatch {x}")
+        if require_build:
+            try:
+                from build_identity import compute
+                local=compute(Path(__file__).resolve().parents[1])
+                if x['build_id']!=local['build_id32']:
+                    raise RuntimeError(f"TUNING_REFUSED build mismatch fw=0x{x['build_id']:08x} local=0x{local['build_id32']:08x}")
+            except ImportError:
+                raise RuntimeError('TUNING_REFUSED local build identity unavailable')
+        return x
+
     def isr_profile(self, reset: bool = False) -> dict[str, int]:
         names=(
             "total_max","deadline_miss","pre_max","control_max","post_max",
             "pre_gate","pre_offset","pre_protect","left_step","right_step",
             "left_control","right_control","left_hold","right_hold",
             "sensor","pll","current","regulator","position_pid","speed_pid",
-            "current_circle","id_pi","iq_pi","decouple_limit","svpwm","duty_mag","overrun",
+            "current_circle","id_pi","iq_pi","decouple_limit","svpwm","duty_mag","reentry_guard",
             "slot0_max","slot1_max","slot2_max","slot3_max","slot4_max","slot5_max",
             "slot0_miss","slot1_miss","slot2_miss","slot3_miss","slot4_miss","slot5_miss",
             "slot0_count","slot1_count","slot2_count","slot3_count","slot4_count","slot5_count",
             "detail_sample_count",
             "detail_slot0_count","detail_slot1_count","detail_slot2_count","detail_slot3_count","detail_slot4_count","detail_slot5_count",
-            "steady_isr_count","slot_sequence_errors","fast_hold_svpwm","profile_revision",
+            "steady_isr_count","slot_sequence_errors","fast_hold_svpwm","profile_revision","active_slot_count","reset_epoch",
             "outer_max","outer_miss","outer_jitter","outer_period_min","outer_period_max",
             "adc_heartbeat","left_heartbeat","right_heartbeat",
             "snapshot_dwt","irq_entry","irq_exit","left_step_count","right_step_count",
@@ -1411,10 +1224,83 @@ class VescDual:
     def trace_sample(self, index: int) -> dict[str, int]:
         if index < 0 or index > 255: raise ValueError("trace index out of range")
         p=self.custom_transact(HB_GET_TRACE_SAMPLE,bytes((index,)),right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_GET_TRACE_SAMPLE)
-        if status or len(p)!=48: raise RuntimeError(f"trace_sample status={status} len={len(p)}")
-        vals=struct.unpack_from(">IHBB14hH4B",p,6)
-        names=("pwm_tick","isr_cycles","control_slot","event_bits","left_id_q4","left_iq_q4","left_id_set_q4","left_iq_set_q4","left_vd","left_vq","left_erpm","right_id_q4","right_iq_q4","right_id_set_q4","right_iq_set_q4","right_vd","right_vq","right_erpm","vin_adc","left_fault","right_fault","left_quality","right_quality")
+        if status or len(p)!=68: raise RuntimeError(f"trace_sample status={status} len={len(p)}")
+        vals=struct.unpack_from(">IHBB14h4i3H4B",p,6)
+        names=("pwm_tick","isr_cycles","control_slot","event_bits",
+               "left_id_q4","left_iq_q4","left_id_set_q4","left_iq_set_q4","left_vd","left_vq","left_erpm",
+               "right_id_q4","right_iq_q4","right_id_set_q4","right_iq_set_q4","right_vd","right_vq","right_erpm",
+               "left_id_integrator","left_iq_integrator","right_id_integrator","right_iq_integrator",
+               "left_sample_window","right_sample_window","vin_adc","left_fault","right_fault","left_quality","right_quality")
         return dict(zip(names,vals))
+
+    def download_trace(self) -> list[dict[str, int]]:
+        """Download one frozen chronological ISR trace snapshot."""
+        meta=self.trace_meta()
+        if not meta["frozen"]:
+            raise RuntimeError(f"TRACE_NOT_FROZEN meta={meta}")
+        rows=[]
+        for i in range(meta["count"]):
+            rows.append(self.trace_sample(i))
+        return rows
+
+    def adc_validity(self, right: bool = False) -> dict[str, int]:
+        p=self.custom_transact(HB_GET_ADC_VALIDITY,right=right,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_GET_ADC_VALIDITY)
+        if status or len(p)!=29: raise RuntimeError(f"adc_validity status={status} len={len(p)}")
+        vals=struct.unpack_from(">7HI5B",p,6)
+        names=("ccr_a","ccr_b","ccr_c","zero_window","min_window","guard","adc_phase","invalid_count",
+               "sector","window_valid","offset_valid","driven_offset_valid","bridge_settled")
+        return dict(zip(names,vals))
+
+    def arm_current_step(self, pre_a: float, step_a: float, pre_samples: int = 8, post_samples: int = 24, right: bool = False) -> int:
+        self.require_platform_compatible(require_build=True)
+        if not (2<=pre_samples<40 and 2<=post_samples<40 and pre_samples+post_samples<=40):
+            raise ValueError("step samples must each be 2..39 and total <= trace capacity 40")
+        data=struct.pack(">iiBB",round(pre_a*1000.0),round(step_a*1000.0),pre_samples,post_samples)
+        p=self.custom_transact(HB_ARM_CURRENT_STEP,data,right=right,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_ARM_CURRENT_STEP)
+        if status or len(p)!=10: raise RuntimeError(f"arm_current_step status={status} len={len(p)}")
+        return struct.unpack_from(">I",p,6)[0]
+
+    def step_status(self, right: bool = False) -> dict[str, int]:
+        p=self.custom_transact(HB_GET_STEP_STATUS,right=right,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_GET_STEP_STATUS)
+        if status or len(p)!=20: raise RuntimeError(f"step_status status={status} len={len(p)}")
+        seq,pre_q4,step_q4,active,second,pre_n,post_n,fired,done=struct.unpack_from(">Ihh6B",p,6)
+        return dict(sequence=seq,pre_q4=pre_q4,step_q4=step_q4,active=active,second=second,pre_remaining=pre_n,post_remaining=post_n,step_fired=fired,done=done)
+
+    def position_d_state(self, right: bool = False) -> dict[str, int]:
+        p=self.custom_transact(HB_GET_POSITION_D_STATE,right=right,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_GET_POSITION_D_STATE)
+        if status or len(p)!=22: raise RuntimeError(f"position_d_state status={status} len={len(p)}")
+        pos,target,dproc=struct.unpack_from(">iii",p,6)
+        mode,phase_mode,enc_inv,motor_inv=struct.unpack_from(">4B",p,18)
+        return dict(position=pos,target=target,dproc_q15=dproc,control_mode=mode,phase_mode=phase_mode,encoder_inverted=enc_inv,motor_inverted=motor_inv)
+
+    def boot_handoff(self) -> None:
+        p=self.custom_transact(HB_BOOT_HANDOFF,right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_BOOT_HANDOFF)
+        if status: raise RuntimeError(f"boot_handoff status={status}")
+
+    def trace_all(self) -> list[dict[str, int]]:
+        meta=self.trace_meta()
+        return [self.trace_sample(i) for i in range(meta["count"])]
+
+    def run_current_step(self, pre_a: float, step_a: float, pre_samples: int = 8,
+                         post_samples: int = 24, right: bool = False,
+                         timeout: float = 1.0) -> list[dict[str, int]]:
+        """Run one firmware-synchronized step and return the frozen raw trace."""
+        seq=self.arm_current_step(pre_a,step_a,pre_samples,post_samples,right)
+        deadline=time.monotonic()+timeout
+        st=None
+        while time.monotonic()<deadline:
+            st=self.step_status(right)
+            if st["sequence"]!=seq: raise RuntimeError(f"step sequence changed {st['sequence']} != {seq}")
+            if st["done"] and not st["active"]: break
+            time.sleep(0.002)
+        else: raise TimeoutError(f"current step seq={seq} did not complete: {st}")
+        meta=self.trace_meta()
+        if not meta["frozen"]: raise RuntimeError(f"step trace not frozen: {meta}")
+        rows=self.trace_all()
+        if not rows: raise RuntimeError("step trace empty")
+        t0=[i for i,r in enumerate(rows) if r["event_bits"]&(1<<3)]
+        if len(t0)!=1: raise RuntimeError(f"step trace needs exactly one t0 marker, got {t0}")
+        return rows
 
     def trace_clear(self):
         p=self.custom_transact(HB_CLEAR_TRACE,right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_CLEAR_TRACE)
@@ -1544,8 +1430,8 @@ def parse_fw(p: bytes) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("port", nargs="?", default="auto",
-                    help="auto | maintenance | direct | direct:/dev/ttyACM0 | raw /dev/ttyUSBx")
-    ap.add_argument("--baud", type=int, default=1000000)
+                    help="auto | direct | direct:/dev/ttyUSB0 | raw /dev/ttyUSBx")
+    ap.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     ap.add_argument("--command-hz", type=float, default=50.0)
     ap.add_argument("--telemetry-hz", type=float, default=50.0,
                     help="selective VESC telemetry polling; default 50 Hz")

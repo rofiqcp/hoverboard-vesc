@@ -114,6 +114,7 @@ static void app_flags_unpack(adc_config *c, uint16_t f) {
 }
 
 bool app_vesc_store_configuration(bool second) {
+    if (!EE_IsHealthy()) return false;
     const app_configuration *a=&s_conf[second?1u:0u];
     const adc_config *c=&a->app_adc_conf; const uint8_t b=(uint8_t)(APP_EE_BASE+(second?APP_EE_STRIDE:0u));
     /* EEPROM emulation executes from the same STM32F1 flash as the FOC ISR.
@@ -121,7 +122,7 @@ bool app_vesc_store_configuration(bool second) {
      * marker so interrupted updates never boot as a partially valid App Config. */
     mcpwm_foc_release_motor(false);
     mcpwm_foc_release_motor(true);
-    bool ok=true; HAL_FLASH_Unlock();
+    bool ok=true; if (HAL_FLASH_Unlock() != HAL_OK) return false;
     if (!app_ee_write_if_changed(b,0u)) {
         HAL_FLASH_Lock();
         return false;
@@ -154,6 +155,7 @@ bool app_vesc_store_configuration(bool second) {
 }
 
 bool app_vesc_load_configuration(bool second) {
+    if (!EE_IsHealthy()) return false;
     const uint8_t b=(uint8_t)(APP_EE_BASE+(second?APP_EE_STRIDE:0u)); uint16_t key=0u,sig=0u,v16=0u,flags=0u; uint32_t u=0u;
     if(!app_ee_read(APP_EE_KEY_SLOT,&key)||key!=(uint16_t)APP_EE_KEY_VALUE||!app_ee_read(b,&sig)||sig!=APP_EE_SIGNATURE)return false;
     app_configuration a=s_conf[second?1u:0u]; adc_config *c=&a.app_adc_conf;

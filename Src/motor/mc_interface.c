@@ -9,6 +9,14 @@
 #include "motor/mc_interface.h"
 
 static int s_motor_selected = 1;
+static bool persistence_ready(void) {
+#ifdef STM32F103xE
+    return EE_IsHealthy() != 0u;
+#else
+    return true;
+#endif
+}
+
 volatile uint8_t steering_detect_stage = 0u;
 static inline void steering_stage_set(uint8_t stage) {
     steering_detect_stage = stage;
@@ -578,12 +586,13 @@ center_fail:
 }
 
 bool mc_interface_store_steering_calibration(void){
+    if (!persistence_ready()) return false;
     if(!mcpwm_foc_steering_is_calibrated())return false;
     const int32_t span=mcpwm_foc_steering_span_counts();
     const uint32_t u=(uint32_t)span, inv=~u; bool ok=true;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_release_motor(true);
-    HAL_FLASH_Unlock();
+    if (HAL_FLASH_Unlock() != HAL_OK) return false;
     ok &= ee_write_slot(EE_L_STEER_CAL_MAGIC,0u);
     ok &= ee_write_u32_pair(EE_L_STEER_SPAN_LO,u);
     ok &= ee_write_u32_pair(EE_L_STEER_SPAN_INV_LO,inv);
@@ -592,6 +601,7 @@ bool mc_interface_store_steering_calibration(void){
 }
 
 bool mc_interface_load_steering_calibration(void){
+    if (!persistence_ready()) return false;
     uint16_t magic=0u; uint32_t u=0u,inv=0u;
     if(!ee_read_slot(EE_L_STEER_CAL_MAGIC,&magic) ||
        (magic!=EE_L_STEER_CAL_MAGIC_VALUE && magic!=EE_L_STEER_CAL_MAGIC_INVERTED) ||
@@ -608,13 +618,14 @@ float mc_interface_get_steering_deg(void){return mcpwm_foc_get_steering_deg();}
 bool mc_interface_set_steering_deg(float deg){return mcpwm_foc_set_steering_deg(deg);}
 
 bool mc_interface_reset_steering_calibration(void){
+    if (!persistence_ready()) return false;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
     mcpwm_foc_steering_clear_calibration();
     s_steering_logical_inverted=false;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_release_motor(true);
-    bool ok=true; HAL_FLASH_Unlock();
+    bool ok=true; if (HAL_FLASH_Unlock() != HAL_OK) return false;
     ok &= ee_write_slot(EE_L_STEER_CAL_MAGIC,0u);
     ok &= ee_write_u32_pair(EE_L_STEER_SPAN_LO,0u);
     ok &= ee_write_u32_pair(EE_L_STEER_SPAN_INV_LO,~0u);
@@ -773,6 +784,7 @@ void mc_interface_get_steering_span_diag(int32_t *neg1,int32_t *pos1,int32_t *ne
 }
 
 bool mc_interface_store_configuration_motor(bool second) {
+    if (!persistence_ready()) return false;
     mcpwm_foc_motor_t *m = mcpwm_foc_get_motor(second);
     const uint8_t hall_base = second ? EE_R_HALL0 : EE_L_HALL0;
     const uint8_t gain_base = second ? EE_R_KPQ : EE_L_KPQ;
@@ -814,7 +826,7 @@ bool mc_interface_store_configuration_motor(bool second) {
     mcpwm_foc_release_motor(true);
     const uint8_t signature_slot=second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     bool ok = true;
-    HAL_FLASH_Unlock();
+    if (HAL_FLASH_Unlock() != HAL_OK) return false;
     /* Invalidate FIRST. If invalidation itself fails, abort before touching any
      * payload. Once invalid, never restore VALID unless every payload write did
      * succeed; this is the EEPROM-emulation commit barrier. */
@@ -1062,6 +1074,7 @@ bool mc_interface_store_configuration_motor(bool second) {
 }
 
 bool mc_interface_load_configuration_motor(bool second) {
+    if (!persistence_ready()) return false;
     uint16_t key = 0u, sig = 0u;
     const uint8_t sig_slot = second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
     if (!ee_read_slot(EE_CFG_KEY, &key) || key != (uint16_t)FLASH_WRITE_KEY ||

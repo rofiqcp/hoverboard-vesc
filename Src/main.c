@@ -15,10 +15,11 @@
 #include "comms.h"
 #include "platform_watchdog.h"
 
-void SystemClock_Config(void);
+bool SystemClock_Config(void);
 
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
+extern UART_HandleTypeDef huart3;
 extern volatile adc_buf_t adc_buffer;
 extern InputStruct input1[];
 extern InputStruct input2[];
@@ -57,6 +58,7 @@ static int16_t cmdRRateFixdt = 0;
 static int32_t cmdLFixdt = 0;
 static int32_t cmdRFixdt = 0;
 static uint32_t buzzerTimerPrev = 0;
+static uint32_t debugKeepalivePrevMs = 0u;
 
 static void cycleCounterInit(void) {
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -70,15 +72,54 @@ static uint8_t controllerFaultActive(void) {
 
 static inline void f103_debug_keepalive(void) {
 #if defined(__arm__) || defined(__thumb__)
+  /* Do not trust future HAL AFIO remap helpers: several F1 macros OR the full
+   * SWJ field and can disable SW-DP. Preserve every non-debug remap while
+   * forcing PA13/PA14 back to the reset/full-SWJ state. */
   __HAL_RCC_AFIO_CLK_ENABLE();
-  __HAL_AFIO_REMAP_SWJ_ENABLE();
-  __HAL_DBGMCU_FREEZE_IWDG();
+  uint32_t mapr=AFIO->MAPR;
+  mapr&=~AFIO_MAPR_SWJ_CFG_Msk;
+  mapr|=AFIO_MAPR_SWJ_CFG_RESET;
+  AFIO->MAPR=mapr;
+  DBGMCU->CR|=DBGMCU_CR_DBG_IWDG_STOP;
   __DSB();
   __ISB();
 #endif
 }
 
+static __attribute__((noreturn)) void startup_fail_safe(uint32_t stage) {
+  /* Never spin in a half-initialized motor application. Keep both advanced
+   * timer outputs inert and continuously restore SWD so normal attach remains
+   * possible without connect-under-reset. */
+  boot_reset_stage = stage;
+#if defined(STM32F103xE)
+  __disable_irq();
+  __HAL_RCC_TIM1_CLK_ENABLE();
+  __HAL_RCC_TIM8_CLK_ENABLE();
+  TIM1->BDTR &= ~TIM_BDTR_MOE; TIM8->BDTR &= ~TIM_BDTR_MOE;
+  TIM1->CCR1=TIM1->CCR2=TIM1->CCR3=0u;
+  TIM8->CCR1=TIM8->CCR2=TIM8->CCR3=0u;
+  volatile uint32_t *const boot_request=(volatile uint32_t *)F103_BOOT_REQUEST_ADDR;
+  boot_request[0]=F103_BOOT_REQUEST_MAGIC; boot_request[1]=F103_BOOT_REQUEST_MAGIC_INV;
+  *(volatile uint32_t *)F103_RESET_REASON_ADDR = stage;
+  __DSB(); __ISB(); NVIC_SystemReset();
+#endif
+  for (;;) { f103_debug_keepalive(); __asm__ volatile("" ::: "memory"); }
+}
+
+static bool usart3_dma_runtime_healthy(void) {
+#if defined(STM32F103xE)
+  return huart3.hdmarx != NULL && huart3.hdmarx->Instance != NULL &&
+         (huart3.Instance->CR3 & USART_CR3_DMAR) != 0u &&
+         (huart3.hdmarx->Instance->CCR & DMA_CCR_EN) != 0u;
+#else
+  return true;
+#endif
+}
+
 int main(void) {
+  /* First application action after C runtime: keep SWD alive and stop IWDG
+   * while halted, before HAL or any peripheral remap can run. */
+  f103_debug_keepalive();
   /* Capture the reset source before HAL/application code can obscure it, then
    * clear sticky RCC reset flags so the next reboot has an unambiguous cause. */
 #ifdef STM32F103xE
@@ -101,14 +142,13 @@ int main(void) {
   HAL_NVIC_SetPriority(PendSV_IRQn, 0, 0);
   HAL_NVIC_SetPriority(SysTick_IRQn, 3, 0);
 
-  SystemClock_Config();
+  if (!SystemClock_Config()) startup_fail_safe(0x434C4B46u); /* CLKF */
   cycleCounterInit();
 
   __HAL_RCC_DMA1_CLK_DISABLE();
   MX_GPIO_Init();
-  MX_TIM_Init();
-  MX_ADC1_Init();
-  MX_ADC2_Init();
+  if (!MX_TIM_Init()) startup_fail_safe(0x54494D46u); /* TIMF */
+  if (!MX_ADC1_Init() || !MX_ADC2_Init()) startup_fail_safe(0x41444346u); /* ADCF */
   BLDC_Init();
 
   /* Defensive post-init restore. Any future AFIO remap added by peripheral
@@ -117,9 +157,9 @@ int main(void) {
 
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
   Input_Lim_Init();
-  Input_Init();
-  HAL_ADC_Start(&hadc1);
-  HAL_ADC_Start(&hadc2);
+  if (!Input_Init()) startup_fail_safe(0x55415246u); /* UARF */
+  if (HAL_ADC_Start(&hadc1) != HAL_OK || HAL_ADC_Start(&hadc2) != HAL_OK)
+    startup_fail_safe(0x41445346u); /* ADSF */
 
   /* Bootloader hands off with PRIMASK set so no peripheral IRQ can run before
    * C runtime and all HAL handles are initialized. Enable globally only here,
@@ -151,27 +191,24 @@ int main(void) {
    * every intentional blocking commissioning helper services the same health gate. */
   platform_watchdog_init();
 
-  /* A freshly streamed image gets one guarded test boot. Both bridges remain
-   * torque-off while real ADC/FOC liveness services the hardware watchdog.
-   * If this image resets before confirmation, TEST metadata persists and the
-   * resident bootloader stays in recovery for host-LKG restore. */
-  if (f103_fw_test_pending()) {
-    mcpwm_foc_release_motor(false);
-    mcpwm_foc_release_motor(true);
-    LEFT_TIM->BDTR &= ~TIM_BDTR_MOE;
-    RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
-    const uint32_t fw_test_start = HAL_GetTick();
-    while ((uint32_t)(HAL_GetTick() - fw_test_start) < 3000u) {
-      platform_watchdog_service();
-      HAL_Delay(1u);
-    }
-    if (!f103_fw_confirm_running_image()) {
-      *(volatile uint32_t *)F103_RESET_REASON_ADDR = F103_RESET_REASON_FW_UPDATE;
-      NVIC_SystemReset();
-    }
-  }
+  /* TEST images must prove normal main-context + USART protocol health, not
+   * merely ADC/FOC ISR liveness. Until confirmation all actuator commands are
+   * inhibited. A broken candidate automatically falls back to resident recovery
+   * after 15 s instead of requiring a manual reset. */
+  bool fw_test_probation = f103_fw_test_pending();
+  const uint32_t fw_test_start = HAL_GetTick();
+  const uint32_t fw_test_fw_base = vesc_protocol_fw_version_count();
+  uint32_t fw_test_loops = 0u;
+  platform_watchdog_status_t fw_test_wd_base;
+  platform_watchdog_get_status(&fw_test_wd_base);
+  if (fw_test_probation) vesc_protocol_set_probation(true);
 
   while (1) {
+    if (fw_test_probation) {
+      ++fw_test_loops;
+      mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
+      mcpwm_foc_force_bridges_off();
+    }
     uint32_t prof0=DWT->CYCCNT;
     /* Deadline control didahulukan dari parser komunikasi. Upstream VESC
      * menjalankan speed/position pada PID thread terpisah; pada bare-metal F103
@@ -179,6 +216,13 @@ int main(void) {
      * packet/config work. Paket yang baru tiba menjadi setpoint tick berikutnya
      * (latensi <=1 ms), tetapi burst VESC tidak boleh menambah jitter kontrol. */
     uint32_t vesc_now_ms = HAL_GetTick();
+    /* Keep SWD recoverable during long runtime as well as startup. If a future
+     * AFIO remap accidentally touches SWJ_CFG, restore PA13/PA14 within 100 ms
+     * so normal ST-Link attach never depends on a manual reset. */
+    if ((uint32_t)(vesc_now_ms - debugKeepalivePrevMs) >= 25u) {
+      debugKeepalivePrevMs = vesc_now_ms;
+      f103_debug_keepalive();
+    }
     mcpwm_foc_outer_control_non_isr(vesc_now_ms);
     platform_watchdog_service();
 
@@ -190,6 +234,23 @@ int main(void) {
     vesc_now_ms = HAL_GetTick();
     vesc_protocol_periodic(vesc_now_ms);
     usart3_recovery_tick(vesc_now_ms);
+    if (fw_test_probation) {
+      mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
+      mcpwm_foc_force_bridges_off();
+      platform_watchdog_status_t w; platform_watchdog_get_status(&w);
+      const uint32_t elapsed=(uint32_t)(vesc_now_ms-fw_test_start);
+      const bool protocol_ok=vesc_protocol_fw_version_count()!=fw_test_fw_base;
+      const bool realtime_ok=w.enabled && w.last_health_ok && w.feed_count>fw_test_wd_base.feed_count;
+      const bool main_ok=fw_test_loops>=100u;
+      if (elapsed>=3000u && protocol_ok && realtime_ok && main_ok &&
+          usart3_dma_runtime_healthy() && !controllerFaultActive()) {
+        if (!f103_fw_confirm_running_image()) f103_fw_reset_to_bootloader();
+        fw_test_probation=false;
+        vesc_protocol_set_probation(false);
+      } else if (elapsed>=15000u) {
+        f103_fw_reset_to_bootloader();
+      }
+    }
     uint32_t profd=DWT->CYCCNT-prof0;
     // cppcheck-suppress unsignedLessThanZero -- CYCCNT dan maksimum profiler sama-sama uint32_t.
     if(profd>main_prof_vesc_max_cycles)main_prof_vesc_max_cycles=profd;
@@ -291,7 +352,7 @@ int main(void) {
   }
 }
 
-void SystemClock_Config(void) {
+bool SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct;
   RCC_ClkInitTypeDef RCC_ClkInitStruct;
   RCC_PeriphCLKInitTypeDef PeriphClkInit;
@@ -304,7 +365,7 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI_DIV2;
   RCC_OscInitStruct.PLL.PLLMUL          = RCC_PLL_MUL16;
-  HAL_RCC_OscConfig(&RCC_OscInitStruct);
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) return false;
 
   /**Initializes the CPU, AHB and APB busses clocks
     */
@@ -314,7 +375,7 @@ void SystemClock_Config(void) {
   RCC_ClkInitStruct.APB1CLKDivider      = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider      = RCC_HCLK_DIV1;
 
-  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) return false;
 
   PeriphClkInit.PeriphClockSelection    = RCC_PERIPHCLK_ADC;
   /* PCLK2 runtime adalah 64 MHz. STM32F103xC/D/E membatasi ADCCLK sampai
@@ -322,11 +383,11 @@ void SystemClock_Config(void) {
    * dual-ADC jauh di dalam frame PWM 62,5 us. Nilai ADC_CLOCK_DIV di config.h
    * wajib sama karena dipakai untuk offset sinkronisasi TIM8 terhadap ADC. */
   PeriphClkInit.AdcClockSelection       = RCC_ADCPCLK2_DIV6;  // 10,667 MHz
-  HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit);
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) return false;
 
   /**Configure the Systick interrupt time
     */
-  HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq() / 1000);
+  if (HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq() / 1000) != 0u) return false;
 
   /**Configure the Systick
     */
@@ -334,4 +395,5 @@ void SystemClock_Config(void) {
 
   /* SysTick_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(SysTick_IRQn, 3, 0);
+  return true;
 }

@@ -57,5 +57,5 @@ assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8002800,\s*LENGTH\s*=\s*2
 assert re.search(r'FLASH\s+\(rx\)\s*:\s*ORIGIN\s*=\s*0x8000000,\s*LENGTH\s*=\s*10K',bld)
 # Stock SET MCCONF ACK and default/read separation.
 assert 'uint8_t ack = COMM_SET_MCCONF' in vp
-assert 'if (id == COMM_GET_MCCONF_DEFAULT)' in vp and 'mcpwm_foc_get_default_configuration(&c, second)' in vp
+assert 'if (id == COMM_GET_MCCONF_DEFAULT)' in vp and 'mcpwm_foc_get_default_configuration(c, second)' in vp
 print('V14_FEATURE_STATIC_PASS fw=6.00 mcconf=6.00 hall_live=1 hall_eeprom=dual telemetry=vesc eeprom_reserved=1 can2=1')

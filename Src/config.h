@@ -32,6 +32,11 @@
  * dalam satuan cycle timer 64 MHz. */
 #define ADC_CLOCK_DIV            6
 #define ADC_TOTAL_CONV_TIME      (ADC_CLOCK_DIV * ADC_CONV_CLOCK_CYCLES)
+/* Conservative fixed-trigger current-sample qualification. The sample is only
+ * declared window-valid when the centered low-side zero-vector half-window
+ * exceeds dead-time + one ADC conversion alignment interval + settling margin. */
+#define FOC_CURRENT_SAMPLE_SETTLE_COUNTS  16u
+#define FOC_CURRENT_SAMPLE_GUARD_COUNTS   ((uint16_t)(DEAD_TIME + ADC_TOTAL_CONV_TIME + FOC_CURRENT_SAMPLE_SETTLE_COUNTS))
 
 #define BAT_FILT_COEF            655
 #define BAT_CALIB_REAL_VOLTAGE   3970
@@ -135,7 +140,7 @@
 #define USART3_BAUD              F103_VESC_UART_BAUD
 #define USART3_WORDLENGTH        UART_WORDLENGTH_8B
 
-/* Batas watchdog aktuator lokal. ROS/F411 boleh lebih ketat, tetapi F103 adalah
+/* Batas watchdog aktuator lokal. host command layer boleh lebih ketat, tetapi F103 adalah
  * otoritas terakhir yang benar-benar mematikan PWM bila command stream hilang. */
 #define VESC_RUNTIME_TIMEOUT_DEFAULT_MS  300u
 #define VESC_RUNTIME_TIMEOUT_MIN_MS       50u

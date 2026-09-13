@@ -405,38 +405,22 @@ int main(void){
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("legacy enable must not bypass owned VESC timeout");
     mcpwm_foc_vesc_override_clear(false); enable=0u; motorRunReq=0u;
 
-    /* Telemetry sensor harus tetap live ketika bridge released. Baseline high-Z
-     * dipelajari terpisah dari offset kontrol, dan perubahan ADC saat idle harus
-     * muncul di Id/Iq/Ibattery tanpa pernah mengaktifkan PWM/proteksi arus. */
+    /* Standard VESC telemetry must report zero motor/input current while the
+     * bridge is released. Raw high-Z ADC/baseline information belongs only to
+     * project diagnostic packets and must never leak into COMM_GET_VALUES. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     legacy_sync();
-    mc_configuration telem=m_motor_1.m_conf; telem.foc_current_filter_const=0.10f;
-    mcpwm_foc_set_configuration(&telem,false);
-    adc_buffer.rlA=1977; adc_buffer.rlB=1994; adc_buffer.dcl=1925;
-    adc_buffer.rrB=1965; adc_buffer.rrC=1939; adc_buffer.dcr=1862; adc_buffer.batt1=2000;
-    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
-    LEFT_TIM->BDTR&=~TIM_BDTR_MOE; RIGHT_TIM->BDTR&=~TIM_BDTR_MOE;
-    /* Learn the actual high-Z amplifier zero after startup. */
     adc_buffer.rlA=2263; adc_buffer.rlB=2281; adc_buffer.dcl=1925;
     for(int i=0;i<(int)MCCONF_OFF_TELEM_SETTLE_SAMPLES+300;i++)DMA1_Channel1_IRQHandler();
-    legacy_sync(); /* telemetry LPF/average sekarang non-ISR */
-    if(!m_motor_1.m_off_offset_valid)return fail("OFF telemetry offset did not calibrate");
-    mc_values off0; mcpwm_foc_get_values(&off0,false);
-    if(fabsf(off0.current_in)>0.05f || fabsf(off0.id)+fabsf(off0.iq)>0.10f)return fail("OFF baseline not near zero");
-    /* Simulasikan perubahan sensor saat manual back-drive. COMM_GET_VALUES harus
-     * memperlihatkan perubahan nyata walaupun state motor tetap OFF. */
-    m_motor_1.m_hall_direction=1; m_motor_1.m_hall_ticks=0u; m_motor_1.m_rpm=1;
+    legacy_sync();
+    if(!m_motor_1.m_off_offset_valid)return fail("OFF diagnostic offset did not calibrate");
     adc_buffer.rlA=2251; adc_buffer.rlB=2293; adc_buffer.dcl=1915;
     for(int i=0;i<120;i++)DMA1_Channel1_IRQHandler();
-    legacy_sync(); /* ambil snapshot sensor OFF ke telemetry slow-path */
+    legacy_sync();
     mc_values offv; mcpwm_foc_get_values(&offv,false);
-    if(m_motor_1.m_state!=MC_STATE_OFF || m_motor_1.m_vd!=0 || m_motor_1.m_vq!=0)return fail("undriven telemetry must keep bridge/control off");
-    if(fabsf(offv.current_in)<0.01f)return fail("OFF live Ibattery telemetry missing");
-    if(fabsf(offv.id)+fabsf(offv.iq)<0.01f)return fail("OFF live Id/Iq telemetry missing");
-    if(fabsf(offv.current_in)>2.0f || fabsf(offv.id)+fabsf(offv.iq)>3.0f)return fail("OFF live current telemetry unreasonable");
-    if(m_motor_1.m_current_trip_count!=0u)return fail("OFF telemetry must never feed over-current protection");
-    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("OFF telemetry must not arm bridge");
-    if(m_motor_1.m_telem_avg_samples!=0u)return fail("COMM_GET_VALUES must read/reset current average window");
+    if(m_motor_1.m_state!=MC_STATE_OFF || (LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("released bridge state regression");
+    if(fabsf(offv.current_in)>0.001f || fabsf(offv.id)>0.001f || fabsf(offv.iq)>0.001f || fabsf(offv.current_motor)>0.001f)
+        return fail("standard OFF current telemetry must be zero");
 
     /* One Hall count is four mechanical degrees at 15 pole-pairs. Kp=0.060
      * would request about 0.24 A with a 1 A motor-current limit, but the
@@ -536,6 +520,9 @@ int main(void){
 
     /* VESC current semantics: current_motor is SIGN(Ibus)*sqrt(Id^2+Iq^2),
      * current_in is battery/DC-bus current, and Id/Iq remain separate. */
+    m_motor_1.m_control_mode=CONTROL_MODE_CURRENT; m_motor_1.m_driven_offset_valid=1u;
+    m_motor_1.m_driven_offset_calibrating=0u; m_motor_1.m_bridge_settle_ticks=0u; LEFT_TIM->BDTR|=TIM_BDTR_MOE;
+    m_motor_1.m_telem_sum_id_q4=600; m_motor_1.m_telem_sum_iq_q4=800; m_motor_1.m_telem_sum_ibus_counts=-50; m_motor_1.m_telem_avg_samples=1u;
     m_motor_1.m_id_q4=600;   /* raw/control 0.75 A */
     m_motor_1.m_iq_q4=800;   /* raw/control 1.00 A */
     m_motor_1.m_current_in_counts=-50;
@@ -548,6 +535,7 @@ int main(void){
     if(fabsf(pvals.id-0.75f)>0.01f || fabsf(pvals.iq-1.00f)>0.01f)return fail("VESC Id/Iq scaling");
     m_motor_1.m_current_in_counts=50;
     m_motor_1.m_current_in_telem_counts=50;
+    m_motor_1.m_telem_sum_id_q4=600; m_motor_1.m_telem_sum_iq_q4=800; m_motor_1.m_telem_sum_ibus_counts=50; m_motor_1.m_telem_avg_samples=1u;
     mcpwm_foc_get_values(&pvals,false);
     if(fabsf(pvals.current_motor+1.25f)>0.01f || fabsf(pvals.current_in+1.00f)>0.01f)return fail("VESC regenerative current signs");
 

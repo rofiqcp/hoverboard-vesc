@@ -1,118 +1,128 @@
 #!/usr/bin/env python3
-import csv,json,math,statistics,sys,time
+"""Trace-authoritative FOC bandwidth qualification. D and Q are always equal unless a future saliency model proves otherwise."""
+from __future__ import annotations
+import argparse,csv,json,math,statistics,time
 from dataclasses import replace
 from pathlib import Path
-sys.path.insert(0,'/home/otomasi/agv/hoverboard-vesc/tools')
 from vesc_dual import VescDual,Tuning
-PORT='/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0'
-OUT=Path('/home/otomasi/agv/data/esc/tuning_staged_20260911/foc')
-TARGET_A=0.50
-STEP_S=0.45
-BASELINE_S=0.12
-DT=0.008
-ABORT_A=2.5
+Q4_PER_A=800.0
+def d32(a,b): return (b-a)&0xffffffff
 
 def q(v,s): return max(0,min(65535,round(v*s)))
-def tune(orig, **kw):
-    p=orig.physical
-    vals=dict(kpq=orig.kpq,kiq=orig.kiq,kpd=orig.kpd,kid=orig.kid,kps=orig.kps,kis=orig.kis,kds=orig.kds,kpp=orig.kpp,kip=orig.kip,kdp=orig.kdp,telem_filter_q16=orig.telem_filter_q16,current_limit_q4=orig.current_limit_q4)
-    if 'q_kp' in kw: vals['kpq']=q(kw['q_kp'],1536)
-    if 'q_ki' in kw: vals['kiq']=q(kw['q_ki'],4.608)
-    if 'd_kp' in kw: vals['kpd']=q(kw['d_kp'],1536)
-    if 'd_ki' in kw: vals['kid']=q(kw['d_ki'],4.608)
-    return Tuning(**vals)
+def tuning_from_model(orig:Tuning,r:float,l:float,tc_us:float)->Tuning:
+    bw=1.0/(tc_us*1e-6); kp=l*bw; ki=r*bw
+    return replace(orig,kpq=q(kp,1536),kpd=q(kp,1536),kiq=q(ki,4.608),kid=q(ki,4.608))
 
-def stop(v,right):
-    try:v.terminal('stop',right)
-    except Exception:pass
-    time.sleep(.12)
+def metrics(rows,right,pre_a,step_a,ts):
+    p='right_' if right else 'left_'; sig=[r[p+'iq_q4']/Q4_PER_A for r in rows]; cross=[r[p+'id_q4']/Q4_PER_A for r in rows]
+    event=next((i for i,r in enumerate(rows) if r['event_bits']&(1<<3)),None)
+    if event is None: return {"pass":False,"reason":"no exact t0 event"}
+    y0=statistics.mean(sig[:max(1,event)]) if event else pre_a; amp=step_a-y0
+    post=sig[event:]; pcross=cross[event:]; rise=None
+    if abs(amp)>1e-6:
+        th=y0+0.9*amp
+        for i,y in enumerate(post):
+            if (amp>0 and y>=th) or (amp<0 and y<=th): rise=i*ts; break
+    norm=[(y-y0)/(amp if abs(amp)>1e-9 else 1.0) for y in post]
+    # norm is already oriented by amp, so positive and negative steps share one overshoot formula.
+    overs=max(0.0,(max(norm)-1.0)*100.0)
+    tail=post[-max(3,min(8,len(post))):]; mean=statistics.mean(tail); sd=statistics.pstdev(tail) if len(tail)>1 else 0.0
+    quality_key=p+'quality'; faults=p+'fault'; sat=sum(1 for r in rows[event:] if r[quality_key]&0x30)
+    badq=sum(1 for r in rows[event:] if (r[quality_key]&0xCF)!=0xCF)
+    fault=max((r[faults] for r in rows),default=0); crosspk=max((abs(x) for x in pcross),default=0.0)
+    err=abs(step_a-mean); risev=rise if rise is not None else 9.99
+    score=120*err+25*sd+0.35*overs+8*crosspk+3*min(risev,1.0)+100*sat+100*badq+(1000 if fault else 0)
+    ok=(fault==0 and sat==0 and badq==0 and rise is not None)
+    return {"pass":ok,"score":score,"rise90_s":risev,"overshoot_pct":overs,"steady_mean_a":mean,"steady_error_a":step_a-mean,
+            "steady_std_a":sd,"cross_peak_a":crosspk,"saturation_samples":sat,"bad_quality_samples":badq,"fault":fault,"event_index":event}
 
-def run_step(v,right,axis,tun,label):
-    v.set_tuning(tun,right,store=False); stop(v,right)
-    d0=v.diag(right); rows=[]; t0=time.monotonic()
-    while time.monotonic()-t0<BASELINE_S:
-        x=v.values(right); rows.append((time.monotonic()-t0,0.0,x.id,x.iq,x.vd,x.vq,x.current_motor,x.duty,x.rpm,x.vin,x.fault)); time.sleep(DT)
-    ts=time.monotonic()
-    if axis=='q':
-        if right:v.set_current(0.0,TARGET_A)
-        else:v.set_current(TARGET_A,0.0)
-    else:
-        v.set_id_test(TARGET_A,0.0,right)
-    aborted=''
-    try:
-        while time.monotonic()-ts<STEP_S:
-            v.alive(right)
-            x=v.values(right); tgt=TARGET_A
-            rows.append((time.monotonic()-t0,tgt,x.id,x.iq,x.vd,x.vq,x.current_motor,x.duty,x.rpm,x.vin,x.fault))
-            if x.fault: aborted=f'fault={x.fault}'; break
-            if max(abs(x.id),abs(x.iq),abs(x.current_motor))>ABORT_A: aborted=f'current>{ABORT_A}A'; break
-            if x.vin<35.0: aborted=f'vin={x.vin:.1f}'; break
-            time.sleep(DT)
-    finally: stop(v,right)
-    d1=v.diag(right)
-    step=[r for r in rows if r[1]!=0.0]
-    sig=[r[2] if axis=='d' else r[3] for r in step]
-    cross=[r[3] if axis=='d' else r[2] for r in step]
-    tt=[r[0]-BASELINE_S for r in step]
-    steady=sig[-max(3,min(12,len(sig))):] if sig else []
-    mean=statistics.mean(steady) if steady else 0.0
-    std=statistics.pstdev(steady) if len(steady)>1 else 0.0
-    err=TARGET_A-mean
-    peak=max(sig) if sig else 0.0
-    overs=max(0.0,(peak-TARGET_A)/TARGET_A*100.0)
-    crosspk=max((abs(x) for x in cross),default=0.0)
-    rise=9.99
-    for t,y in zip(tt,sig):
-        if y>=0.9*TARGET_A: rise=max(0.0,t); break
-    trip_delta=(d1.current_trips or 0)-(d0.current_trips or 0)
-    score=80*abs(err)+25*std+0.25*overs+6*crosspk+0.8*min(rise,1.0)+50*max(0,trip_delta)
-    if aborted:score+=1000
-    status='PASS' if not aborted and trip_delta==0 else 'ABORT'
-    out=OUT/(('right' if right else 'left')+'_'+axis)/f'{label}.csv'; out.parent.mkdir(parents=True,exist_ok=True)
-    with out.open('w',newline='') as f:
-        w=csv.writer(f); w.writerow(['t_s','target_a','id_a','iq_a','vd_v','vq_v','motor_current_a','duty','erpm','vin_v','fault'])
-        w.writerows(rows)
-        w.writerow([]); w.writerow(['SUMMARY','status','score','steady_mean_a','steady_error_a','steady_std_a','overshoot_pct','rise90_s','cross_peak_a','trip_delta','note'])
-        w.writerow(['SUMMARY',status,score,mean,err,std,overs,rise,crosspk,trip_delta,aborted])
-    return dict(status=status,score=score,mean=mean,error=err,std=std,overshoot=overs,rise=rise,cross_peak=crosspk,trip_delta=trip_delta,note=aborted,file=str(out),physical=tun.physical)
-
-def sweep(v,right,axis,param,orig,base_phys,scales):
-    res=[]
-    for i,s in enumerate(scales,1):
-        kw={param:base_phys*s}; tun=tune(orig,**kw)
-        label=f'{param}_v{i}_{s:.2f}x'; print('BEGIN',('R' if right else 'L'),axis,label,kw,flush=True)
-        r=run_step(v,right,axis,tun,label); r.update(var=i,scale=s,param=param,value=base_phys*s)
-        res.append(r); print('RESULT',label,json.dumps({k:r[k] for k in ('status','score','mean','error','std','overshoot','rise','cross_peak','trip_delta')},sort_keys=True),flush=True)
-        if r['status']!='PASS': break
-    good=[r for r in res if r['status']=='PASS']
-    return (min(good,key=lambda x:x['score']) if good else None),res
+def _gain_key(t):
+    return (t.kpq,t.kiq,t.kpd,t.kid,t.kps,t.kis,t.kds,t.kpp,t.kip,t.kdp,t.telem_filter_q16)
 
 def main():
-    OUT.mkdir(parents=True,exist_ok=True); v=VescDual(PORT,baud=115200,timeout=.8)
-    allres={}; finals={}
+    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--arm',action='store_true')
+    ap.add_argument('--model',default='/home/otomasi/agv/data/esc/model_qualification_latest.json'); ap.add_argument('--motor',choices=('left','right','both'),default='both')
+    ap.add_argument('--tc-us',default='600,800,1000,1250,1500'); ap.add_argument('--pre-a',type=float,default=0.25); ap.add_argument('--step-a',type=float,default=0.75)
+    ap.add_argument('--pre-samples',type=int,default=8); ap.add_argument('--post-samples',type=int,default=24); ap.add_argument('--apply-best-ram',action='store_true'); ap.add_argument('--store-best',action='store_true')
+    ap.add_argument('--output',default='/home/otomasi/agv/data/esc/foc_trace_tuning_latest.json'); a=ap.parse_args()
+    if not a.arm: raise SystemExit('ARM_REQUIRED: synchronized current steps energize the motor')
+    model=json.loads(Path(a.model).read_text())
+    if not model.get('pass'): raise SystemExit('TUNING_REFUSED: motor model qualification did not PASS')
+    tcs=[float(x) for x in a.tc_us.split(',') if x.strip()]
+    if not tcs or any(x<=0 for x in tcs): raise SystemExit('TUNING_REFUSED: tc-us must be positive')
+    if a.pre_samples<2 or a.post_samples<2 or a.pre_samples+a.post_samples>40:
+        raise SystemExit('TUNING_REFUSED: pre/post samples must each be >=2 and total <=40')
+    link=VescDual(a.port,115200,timeout=1.0); out={"candidates":{},"model":str(a.model)}
+    choices=[]; originals={}; winners={}; success=False; persistence_started=False
     try:
-        orig={False:v.get_tuning(False),True:v.get_tuning(True)}
-        for right in (False,True):
-            name='right' if right else 'left'; cur=orig[right]; p=cur.physical
-            # Q: Kp then Ki
-            b,r=sweep(v,right,'q','q_kp',cur,p['foc_q_kp'],[0.85,0.95,1.05,1.15,1.25]); allres[name+'_q_kp']=r
-            if not b: raise RuntimeError(name+' q_kp no safe winner')
-            cur=tune(cur,q_kp=b['value']); p=cur.physical
-            b2,r=sweep(v,right,'q','q_ki',cur,p['foc_q_ki'],[0.75,0.90,1.00,1.10,1.25]); allres[name+'_q_ki']=r
-            if not b2: raise RuntimeError(name+' q_ki no safe winner')
-            cur=tune(cur,q_ki=b2['value'])
-            # D: Kp then Ki
-            p=cur.physical; b3,r=sweep(v,right,'d','d_kp',cur,p['foc_d_kp'],[0.85,0.95,1.05,1.15,1.25]); allres[name+'_d_kp']=r
-            if not b3: raise RuntimeError(name+' d_kp no safe winner')
-            cur=tune(cur,d_kp=b3['value']); p=cur.physical
-            b4,r=sweep(v,right,'d','d_ki',cur,p['foc_d_ki'],[0.75,0.90,1.00,1.10,1.25]); allres[name+'_d_ki']=r
-            if not b4: raise RuntimeError(name+' d_ki no safe winner')
-            cur=tune(cur,d_ki=b4['value']); finals[name]=cur
-            v.set_tuning(cur,right,store=False); stop(v,right)
-            print('FOC_WINNER',name,json.dumps(cur.physical,sort_keys=True),flush=True)
-        (OUT/'summary.json').write_text(json.dumps({'results':allres,'finals':{k:v.physical for k,v in finals.items()}},indent=2,sort_keys=True)+'\n')
-        print('FOC_STAGE_PASS',json.dumps({k:v.physical for k,v in finals.items()},sort_keys=True),flush=True)
+        plat=link.require_platform_compatible(require_build=True); out['platform']=plat; ts=plat['control_div']/plat['pwm_hz']
+        choices=[('left',False),('right',True)] if a.motor=='both' else [(a.motor,a.motor=='right')]
+        originals={r:link.get_tuning(r) for _,r in choices}; best={}
+        for name,right in choices:
+            mm=model['motors'].get(name)
+            if not mm or not mm.get('pass') or not mm.get('force_dq_equal'): raise RuntimeError(f'TUNING_REFUSED invalid {name} model')
+            r=mm['r_ohm']['median']; l=mm['l_h']['median']; rows_out=[]
+            for tc in tcs:
+                cand=tuning_from_model(originals[right],r,l,tc)
+                applied=link.set_tuning(cand,right,store=False)
+                if _gain_key(applied)!=_gain_key(cand): raise RuntimeError(f'{name}: candidate readback mismatch tc={tc}')
+                time.sleep(.05)
+                p0=link.isr_profile(reset=True); seq=link.arm_current_step(a.pre_a,a.step_a,a.pre_samples,a.post_samples,right)
+                deadline=time.monotonic()+2.0; st=None
+                while time.monotonic()<deadline:
+                    st=link.step_status(right)
+                    if st['sequence']==seq and st['done']: break
+                    time.sleep(.01)
+                else: raise RuntimeError(f'{name} step timeout tc={tc}')
+                if not st or not st['step_fired']: raise RuntimeError(f'{name} step aborted before t0 tc={tc}: {st}')
+                actual_pre=st['pre_q4']/Q4_PER_A; actual_step=st['step_q4']/Q4_PER_A
+                trace=link.download_trace(); prof=link.isr_profile(False); m=metrics(trace,right,actual_pre,actual_step,ts)
+                dma_delta=d32(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
+                m.update(tc_us=tc,tuning=cand.physical,trace_count=len(trace),requested_pre_a=a.pre_a,requested_step_a=a.step_a,
+                         actual_pre_a=actual_pre,actual_step_a=actual_step,deadline_miss=prof['deadline_miss'],dma_tc_pending_exit_delta=dma_delta,
+                         slot_sequence_errors=prof['slot_sequence_errors'],isr_max_cycles=prof['total_max'])
+                if prof['deadline_miss'] or dma_delta or prof['slot_sequence_errors'] or prof['total_max']>=3000:
+                    m['pass']=False; m['reason']='ISR gate failed'
+                rows_out.append(m); print('FOC_TRACE_CANDIDATE',name,json.dumps(m,sort_keys=True),flush=True)
+                link.shutdown_safe(right); time.sleep(.08)
+            good=[x for x in rows_out if x['pass']]; out['candidates'][name]=rows_out
+            if not good: raise RuntimeError(f'{name}: no candidate passed trace+ISR gates')
+            win=min(good,key=lambda x:x['score']); best[name]=win; print('FOC_TRACE_WINNER',name,json.dumps(win,sort_keys=True),flush=True)
+            winners[right]=tuning_from_model(originals[right],r,l,win['tc_us'])
+
+        if a.apply_best_ram or a.store_best:
+            for _,right in choices:
+                got=link.set_tuning(winners[right],right,store=False)
+                if _gain_key(got)!=_gain_key(winners[right]): raise RuntimeError('winner RAM readback mismatch')
+        else:
+            for _,right in choices: link.set_tuning(originals[right],right,store=False)
+
+        if a.store_best:
+            persistence_started=True
+            try:
+                for _,right in choices:
+                    got=link.set_tuning(winners[right],right,store=True)
+                    if _gain_key(got)!=_gain_key(winners[right]): raise RuntimeError('winner persistent readback mismatch')
+            except Exception:
+                for _,right in choices:
+                    try: link.set_tuning(originals[right],right,store=True)
+                    except Exception: pass
+                persistence_started=False
+                raise
+
+        expected=winners if (a.apply_best_ram or a.store_best) else originals
+        for _,right in choices:
+            got=link.get_tuning(right)
+            if _gain_key(got)!=_gain_key(expected[right]): raise RuntimeError('final tuning verification mismatch')
+        out['best']=best; out['pass']=True; out['persistent_commit']=bool(a.store_best); success=True
+        dst=Path(a.output); dst.parent.mkdir(parents=True,exist_ok=True); dst.write_text(json.dumps(out,indent=2,sort_keys=True)+'\n'); print('FOC_TRACE_TUNING_PASS',dst,flush=True)
     finally:
-        for r in (False,True): stop(v,r)
-        v.close()
+        if not success and originals:
+            for _,right in choices:
+                try: link.set_tuning(originals[right],right,store=persistence_started)
+                except Exception: pass
+        try:
+            for _,right in choices: link.shutdown_safe(right)
+        except Exception: pass
+        link.close()
 if __name__=='__main__': main()

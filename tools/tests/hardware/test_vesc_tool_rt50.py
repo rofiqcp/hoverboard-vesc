@@ -71,7 +71,7 @@ def parse_values(payload:bytes, selective=True)->RtValues:
     return v
 
 class Link:
-    def __init__(self,port,baud=1000000,timeout=.06):
+    def __init__(self,port,baud=115200,timeout=.06):
         self.ser=open_transport(port,baud,timeout=.001); self.timeout=timeout; self.dec=PacketDecoder()
         self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
     def close(self): self.ser.close()

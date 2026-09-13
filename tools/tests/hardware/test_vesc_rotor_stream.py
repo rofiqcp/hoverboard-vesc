@@ -15,7 +15,7 @@ def wrapped_diff(a,b): return ((a-b+180.0)%360.0)-180.0
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--seconds',type=float,default=1.2)
-    a=ap.parse_args(); s=open_transport(a.port,1000000,timeout=.001); dec=PacketDecoder(); s.reset_input_buffer()
+    a=ap.parse_args(); s=open_transport(a.port,115200,timeout=.001); dec=PacketDecoder(); s.reset_input_buffer()
     def send(p): s.write(frame(bytes(p))); s.flush()
     ok=True
     try:

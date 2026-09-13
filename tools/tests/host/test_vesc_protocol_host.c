@@ -222,6 +222,11 @@ void mcpwm_foc_rl_capture_get(bool second,mcpwm_foc_rl_capture_t *o){
     o->sum_div=(int64_t)llround(b*(double)o->sum_di2);
 }
 void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
+void mcpwm_foc_release_motor(bool second) { (void)second; }
+void mcpwm_foc_force_bridges_off(void) {
+    diag_motors[0].m_control_mode=CONTROL_MODE_NONE;
+    diag_motors[1].m_control_mode=CONTROL_MODE_NONE;
+}
 float mcpwm_foc_get_phase_motor(bool second) { return (float)diag_motors[second?1:0].m_phase * (360.0f / 65536.0f); }
 bool mcpwm_foc_observer_valid(bool second) { (void)second; return true; }
 float mcpwm_foc_get_phase_observer_motor(bool second) { return second?210.0f:100.0f; }
@@ -246,7 +251,7 @@ bool mcpwm_foc_encoder_detect(float current,bool second,float *offset,float *rat
 }
 uint32_t mcpwm_foc_get_isr_cycles(void) { return 1234u; }
 uint32_t mcpwm_foc_get_isr_cycles_max(void) { return 2345u; }
-void mcpwm_foc_reset_isr_profile(void) {}
+bool mcpwm_foc_reset_isr_profile(void) { return true; }
 void platform_watchdog_get_status(platform_watchdog_status_t *out) { if(out) memset(out,0,sizeof(*out)); }
 bool platform_watchdog_boot_was_iwdg(void) { return false; }
 void mcpwm_foc_get_irq_epoch(uint32_t *entry,uint32_t *exit){if(entry)*entry=0u;if(exit)*exit=0u;}
@@ -262,13 +267,18 @@ void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out) {
     out->steady_isr_count=186u;
     out->slot_sequence_error_count=0u;
     out->fast_hold_svpwm_max_cycles=77u;
-    out->profile_revision=0x00020002u;
+    out->profile_revision=0x00030000u;
+    out->active_slot_count=6u; out->reset_epoch=7u;
     out->dma_tc_pending_exit_count=9u;
 }
-void mcpwm_foc_trace_clear(void) {}
-void mcpwm_foc_trace_freeze(void) {}
+bool mcpwm_foc_trace_clear(void) {return true;}
+bool mcpwm_foc_trace_freeze(void) {return true;}
 void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out){if(out){memset(out,0,sizeof(*out));out->capacity=MCPWM_FOC_TRACE_CAPACITY;out->sample_size=sizeof(mcpwm_foc_trace_sample_t);}}
 bool mcpwm_foc_trace_read(uint8_t index,mcpwm_foc_trace_sample_t *out){if(!out||index!=0u)return false;memset(out,0,sizeof(*out));out->pwm_tick=123u;return true;}
+void mcpwm_foc_get_adc_sample_diag(bool second,mcpwm_foc_adc_sample_diag_t *out){if(!out)return;memset(out,0,sizeof(*out));out->ccr_a=1000u;out->ccr_b=1200u;out->ccr_c=800u;out->zero_window_counts=800u;out->min_window_counts=700u;out->guard_counts=184u;out->adc_phase_counts=2000u;out->invalid_count=second?2u:1u;out->sector=second?4u:2u;out->window_valid=1u;out->offset_valid=1u;out->driven_offset_valid=1u;out->bridge_settled=1u;}
+static mcpwm_foc_step_test_status_t step_mock;
+bool mcpwm_foc_step_test_arm(float pre,float step,uint8_t pre_n,uint8_t post_n,bool second){step_mock.sequence++;step_mock.pre_q4=(int16_t)(pre*800.0f);step_mock.step_q4=(int16_t)(step*800.0f);step_mock.active=1u;step_mock.second=second?1u:0u;step_mock.pre_remaining=pre_n;step_mock.post_remaining=post_n;step_mock.step_fired=0u;step_mock.done=0u;return true;}
+void mcpwm_foc_step_test_get(mcpwm_foc_step_test_status_t *out){if(out)*out=step_mock;}
 float mcpwm_foc_get_erpm_motor(bool second) { return (float)diag_motors[second?1:0].m_rpm; }
 void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(p0)*p0=second?2003:1998;if(p1)*p1=second?1997:2001;if(dc)*dc=second?2002:1999;}
 uint16_t mcpwm_foc_get_pole_pairs(bool second){return (uint16_t)((confs[second?1:0].si_motor_poles>=2?confs[second?1:0].si_motor_poles:30u)/2u);}
@@ -419,23 +429,51 @@ int main(void){
     if(strcmp((const char *)&r[3],"motor_left")!=0)return fail("local hardware name");
     uint8_t ping[]={COMM_PING_CAN}; if(!transact(ping,sizeof(ping),r,&rn)||rn!=2u||r[0]!=COMM_PING_CAN||r[1]!=2u)return fail("ping id2");
     {
-        const uint8_t magic0=0x48u, magic1=0x42u, ver=1u, op=17u;
+        const uint8_t magic0=0x48u, magic1=0x42u, ver=2u, op=17u;
         uint8_t gp[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,op,0u};
-        if(!transact(gp,sizeof(gp),r,&rn)||rn!=286u||tx_capture[0]!=3u||r[0]!=COMM_CUSTOM_APP_DATA||r[4]!=op||r[5]!=0u)
+        if(!transact(gp,sizeof(gp),r,&rn)||rn!=294u||tx_capture[0]!=3u||r[0]!=COMM_CUSTOM_APP_DATA||r[4]!=op||r[5]!=0u)
             return fail("stage1 ISR profile long-frame");
-        int32_t pi=6; uint32_t vals[70];
-        for(uint8_t z=0u;z<70u;++z)vals[z]=buffer_get_uint32(r,&pi);
+        int32_t pi=6; uint32_t vals[72];
+        for(uint8_t z=0u;z<72u;++z)vals[z]=buffer_get_uint32(r,&pi);
         if(vals[0]!=2345u||vals[45]!=31u||vals[46]!=1u||vals[51]!=6u||vals[52]!=186u||
-           vals[53]!=0u||vals[54]!=77u||vals[55]!=0x00020002u||vals[69]!=9u)
+           vals[53]!=0u||vals[54]!=77u||vals[55]!=0x00030000u||vals[56]!=6u||vals[57]!=7u||vals[71]!=9u)
             return fail("stage1 ISR profile ABI values");
     }
     {
-        const uint8_t magic0=0x48u, magic1=0x42u, ver=1u, op=24u;
+        const uint8_t magic0=0x48u, magic1=0x42u, ver=2u, op=24u;
         uint8_t gh[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,op};
         if(!transact(gh,sizeof(gh),r,&rn)||rn!=86u||r[0]!=COMM_CUSTOM_APP_DATA||r[4]!=op||r[5]!=0u)
             return fail("stage2 comms health packet");
         int32_t hi=6; uint32_t hv[20]; for(uint8_t z=0u;z<20u;++z)hv[z]=buffer_get_uint32(r,&hi);
         if(hv[14]!=0u||hv[15]!=0u||hv[16]!=0u) return fail("stage2 host comms health hardware placeholders");
+    }
+    {
+        const uint8_t magic0=0x48u, magic1=0x42u, ver=2u, op=25u;
+        uint8_t gp[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,op};
+        if(!transact(gp,sizeof(gp),r,&rn)||rn!=46u||r[0]!=COMM_CUSTOM_APP_DATA||r[4]!=op||r[5]!=0u)
+            return fail("platform info packet");
+        int32_t pi=6;
+        if(buffer_get_uint16(r,&pi)!=2u||buffer_get_uint16(r,&pi)!=4u||buffer_get_uint16(r,&pi)!=3u||buffer_get_uint16(r,&pi)!=3u)
+            return fail("platform schema values");
+    }
+    {
+        const uint8_t magic0=0x48u,magic1=0x42u,ver=2u;
+        uint8_t qa[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,26u};
+        if(!transact(qa,sizeof(qa),r,&rn)||rn!=29u||r[4]!=26u||r[5]!=0u)return fail("adc validity packet");
+        int32_t ai=6; if(buffer_get_uint16(r,&ai)!=1000u||buffer_get_uint16(r,&ai)!=1200u||buffer_get_uint16(r,&ai)!=800u)return fail("adc ccr values");
+        if(buffer_get_uint16(r,&ai)!=800u||buffer_get_uint16(r,&ai)!=700u||buffer_get_uint16(r,&ai)!=184u||buffer_get_uint16(r,&ai)!=2000u)return fail("adc window values");
+        if(buffer_get_uint32(r,&ai)!=1u||r[ai++]!=2u||r[ai++]!=1u)return fail("adc validity state");
+        uint8_t st[16]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,27u};int32_t si=5;buffer_append_int32(st,500,&si);buffer_append_int32(st,1500,&si);st[si++]=6u;st[si++]=20u;
+        if(!transact(st,(uint16_t)si,r,&rn)||rn!=10u||r[4]!=27u||r[5]!=0u)return fail("step arm packet");
+        uint8_t ss[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,28u};
+        if(!transact(ss,sizeof(ss),r,&rn)||rn!=20u||r[4]!=28u||r[5]!=0u)return fail("step status packet");
+        pos_user[0]=1234;pos_target_user[0]=2345;diag_motors[0].m_position_d_proc_filter_q15=-321;
+        diag_motors[0].m_control_mode=CONTROL_MODE_POS;diag_motors[0].m_pos_pid_phase_mode=0u;
+        confs[0].foc_encoder_inverted=true;confs[0].m_invert_direction=false;diag_motors[0].m_conf=confs[0];
+        uint8_t pd[]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,30u};
+        if(!transact(pd,sizeof(pd),r,&rn)||rn!=22u||r[4]!=30u||r[5]!=0u)return fail("position D state packet");
+        int32_t pdi=6;if(buffer_get_int32(r,&pdi)!=1234||buffer_get_int32(r,&pdi)!=2345||buffer_get_int32(r,&pdi)!=-321)return fail("position D state values");
+        if(r[pdi++]!=(uint8_t)CONTROL_MODE_POS||r[pdi++]!=0u||r[pdi++]!=1u||r[pdi++]!=0u)return fail("position D state flags");
     }
     uint8_t fwr[]={COMM_FORWARD_CAN,2u,COMM_FW_VERSION}; if(!transact(fwr,sizeof(fwr),r,&rn)||rn<4u||r[0]!=COMM_FW_VERSION)return fail("right fw");
     if(strcmp((const char *)&r[3],"motor_right")!=0)return fail("right hardware name");
@@ -723,7 +761,7 @@ int main(void){
         /* Full signed-int32 long-range position is project-specific and rides
          * inside standard COMM_CUSTOM_APP_DATA. Standard COMM_SET_POS remains
          * VESC single-turn degrees. */
-        const uint8_t magic0=0x48u, magic1=0x42u, ver=1u;
+        const uint8_t magic0=0x48u, magic1=0x42u, ver=2u;
         uint8_t cp[16]={COMM_CUSTOM_APP_DATA,magic0,magic1,ver,3u};
         k=5; buffer_append_int32(cp,-1000000,&k); buffer_append_int32(cp,1000000,&k);
         if(!transact(cp,(uint16_t)k,r,&rn)||rn!=22u||r[0]!=COMM_CUSTOM_APP_DATA||r[5]!=0u) return fail("custom set limits");

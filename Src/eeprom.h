@@ -226,6 +226,7 @@ _Static_assert((NB_OF_VAR * 4u + 4u) <= FLASH_PAGE_SIZE, "EEPROM live-variable s
 /* Exported macro ------------------------------------------------------------*/
 /* Exported functions ------------------------------------------------------- */
 uint16_t EE_Init(void);
+uint8_t EE_IsHealthy(void);
 uint16_t EE_ReadVariable(uint16_t VirtAddress, uint16_t* Data);
 uint16_t EE_WriteVariable(uint16_t VirtAddress, uint16_t Data);
 

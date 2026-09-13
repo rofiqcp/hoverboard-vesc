@@ -170,7 +170,12 @@
 #define MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT    500u
 /* Upstream VESC default: 3 extra samples => 7 instantaneous GPIO reads with majority vote. */
 #define MCCONF_M_HALL_EXTRA_SAMPLES_DEFAULT       3u
+#ifndef MCCONF_FOC_CONTROL_DIV
 #define MCCONF_FOC_CONTROL_DIV                  6u
+#endif
+#if (MCCONF_FOC_CONTROL_DIV < 1u) || (MCCONF_FOC_CONTROL_DIV > 6u)
+#error "MCCONF_FOC_CONTROL_DIV must be 1..6"
+#endif
 #define MCCONF_OUTER_PID_HZ                  1000u /* VESC FOC speed/position PID thread equivalent */
 #define MCCONF_TELEMETRY_HZ                   200u /* housekeeping/telemetry slow path */
 /* Hall timeout must be longer than one Hall sector at low VESC ERPM.

@@ -9,7 +9,8 @@ from vesc_dual import VescDual, COMM_SET_DUTY
 from vesc_debug import send_one, release_one
 
 def run(port='/dev/ttyUSB0'):
-    link = VescDual(port, 1000000, timeout=0.30)
+    link = VescDual(port,115200, timeout=0.30)
+    link.require_platform_compatible(True)
     try:
         for duty in (0.05, 0.10, 0.20):
             before = link.diag(False)

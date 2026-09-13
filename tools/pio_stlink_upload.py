@@ -65,11 +65,9 @@ def validate_project_image(image: bytes, address: int, max_size: int, meta_addre
         if meta_address != META_BASE or meta_address + 36 > EEPROM_BASE:
             raise RuntimeError('metadata location would overlap EEPROM or is not canonical')
 
-def openocd_program_cmd(openocd, scripts, transport, image, address, speed, under_reset, meta_path=None, meta_address=None):
+def openocd_program_cmd(openocd, scripts, transport, image, address, speed, meta_path=None, meta_address=None):
     cmd = [str(openocd), '-s', str(scripts), '-f', 'interface/stlink.cfg',
            '-c', f'transport select {transport}']
-    if under_reset:
-        cmd += ['-c', 'reset_config srst_only srst_nogate connect_assert_srst']
     cmd += ['-f', 'target/stm32f1x.cfg', '-c', f'adapter speed {speed}']
     actions = [
         'init', 'reset halt',
@@ -108,8 +106,6 @@ def main() -> None:
     ap.add_argument("--adapter-khz", type=int, default=1000)
     ap.add_argument("--confirmed-meta-address", type=parse_int, default=None,
                     help="also write v2 CONFIRMED metadata for this application image")
-    ap.add_argument("--rescue-under-reset", action="store_true",
-                    help="one-time recovery mode for an already-broken image; normal uploads must not use this")
     args = ap.parse_args()
 
     image = Path(args.image).resolve()
@@ -140,17 +136,14 @@ def main() -> None:
 
     transport = resolve_stlink_transport(scripts)
 
-    # Steady-state uploads are deliberately NORMAL-SWD only. Under-reset is an
-    # explicit one-time rescue mode, never an automatic fallback; otherwise a
-    # regression that disables SWD after boot could be hidden by the uploader.
-    under_reset = bool(args.rescue_under_reset)
+    # Production uploader is deliberately NORMAL-SWD only. The repository has
+    # no connect-under-reset code path: a firmware image that strands SWD fails
+    # here instead of being hidden by tooling.
     try:
-        verify_f103_target(openocd, scripts, 100, under_reset=under_reset)
+        verify_f103_target(openocd, scripts, 100)
     except RuntimeError as exc:
-        mode = 'under-reset rescue' if under_reset else 'normal SWD'
-        raise SystemExit(f'STLINK_{mode.upper().replace(" ", "_")}_ATTACH_FAIL: {exc}')
-    print('[STLINK] rescue attach under reset PASS' if under_reset else '[STLINK] normal SWD attach PASS',
-          flush=True)
+        raise SystemExit(f'STLINK_NORMAL_SWD_ATTACH_FAIL: {exc}')
+    print('[STLINK] normal SWD attach PASS', flush=True)
 
     meta_tmp = None
     meta_path = None
@@ -166,8 +159,8 @@ def main() -> None:
         speeds = unique_speeds(args.adapter_khz)
         for attempt, speed in enumerate(speeds, start=1):
             cmd = openocd_program_cmd(openocd, scripts, transport, image, args.address, speed,
-                                      under_reset, meta_path, args.confirmed_meta_address)
-            mode = 'under-reset' if under_reset else 'normal'
+                                      meta_path, args.confirmed_meta_address)
+            mode = 'normal'
             print(f'[STLINK] attempt={attempt}/{len(speeds)} image={image.name} size={size} '
                   f'address=0x{args.address:08X} swd={speed}kHz mode={mode}', flush=True)
             last_rc = subprocess.run(cmd, check=False).returncode
@@ -183,7 +176,7 @@ def main() -> None:
                     time.sleep(delay_s)
                     try:
                         verify_f103_target(
-                            openocd, scripts, 100, under_reset=False,
+                            openocd, scripts, 100,
                             resume_before_shutdown=True,
                             expected_vtor=APP_BASE if app_runtime else None,
                             pc_min=APP_BASE if app_runtime else None,

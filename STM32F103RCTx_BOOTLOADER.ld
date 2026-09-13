@@ -36,7 +36,7 @@ ENTRY(Reset_Handler)
 _estack = 0x2000BFF0;    /* top 16 bytes reserved for boot request */
 /* Generate a link error if heap and stack don't fit into RAM */
 _Min_Heap_Size = 0x200;      /* required amount of heap  */
-_Min_Stack_Size = 0x400; /* required amount of stack */
+_Min_Stack_Size = 0x1000; /* 4 KiB minimum stack; link fails before runtime stack can approach static RAM */
 
 /* Specify the memory areas */
 MEMORY

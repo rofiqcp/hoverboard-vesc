@@ -2,7 +2,7 @@
 import argparse, time
 from vesc_dual import VescDual, parse_fw
 
-PROFILE_REV=0x00020002
+PROFILE_REV=0x00030000
 
 def d32(a,b): return (b-a)&0xffffffff
 

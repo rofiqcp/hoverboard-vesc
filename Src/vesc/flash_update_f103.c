@@ -8,6 +8,24 @@
 static bool stage_session_active = false;
 static uint32_t stage_session_total = 0u;
 
+static uint16_t image_crc16(const uint8_t *data, uint32_t len) {
+    uint16_t crc=0u;
+    for(uint32_t i=0u;i<len;++i){
+        crc^=(uint16_t)data[i]<<8;
+        for(uint8_t b=0u;b<8u;++b) crc=(crc&0x8000u)?(uint16_t)((crc<<1)^0x1021u):(uint16_t)(crc<<1);
+    }
+    return crc;
+}
+
+static bool running_vector_valid(void) {
+    const uint32_t sp=*(const uint32_t *)F103_APP_BASE_ADDR;
+    const uint32_t rv=*(const uint32_t *)(F103_APP_BASE_ADDR+4u);
+    if(sp<0x20000000u || sp>F103_BOOT_REQUEST_ADDR || (sp&3u)) return false;
+    if((rv&1u)==0u) return false;
+    const uint32_t pc=rv&~1u;
+    return pc>=F103_APP_BASE_ADDR && pc<(F103_APP_BASE_ADDR+F103_APP_REGION_SIZE);
+}
+
 static bool program_halfwords(uint32_t base, const uint8_t *data, uint32_t len) {
     if (!data || (base & 1u)) return false;
     HAL_FLASH_Unlock();
@@ -47,7 +65,7 @@ static bool erase_pages(uint32_t base, uint32_t bytes) {
 bool f103_fw_erase_staging(uint32_t fw_size) {
     /* The 120-KiB internal staging slot no longer exists. Field upload must
      * enter the resident bootloader first; the candidate is retained by the
-     * NUC/F411 host and streamed into the 240-KiB active region. Never erase
+     * PC/NUC host and streamed into the 240-KiB active region. Never erase
      * application flash while the motor-control application is executing. */
     (void)fw_size;
     stage_session_active = false;
@@ -75,6 +93,8 @@ bool f103_fw_confirm_running_image(void) {
     if (!f103_fw_test_pending()) return true;
     release_both();
     const f103_update_meta_t *cur = (const f103_update_meta_t *)F103_META_BASE_ADDR;
+    if (!running_vector_valid() || image_crc16((const uint8_t *)F103_APP_BASE_ADDR, cur->size) != cur->crc16)
+        return false;
     f103_update_meta_t m = *cur;
     m.state = F103_UPDATE_STATE_CONFIRMED;
     m.test_attempt = 0xFFFFu;

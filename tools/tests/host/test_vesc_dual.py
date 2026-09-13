@@ -65,30 +65,39 @@ assert abs(off-17.25)<1e-9 and abs(ratio-15.0)<1e-9 and inv
 # Stage-2 communication health parser ABI.
 health_link=vd.VescDual.__new__(vd.VescDual); health_link.timeout=0.1
 health_vals=tuple(range(100,120))
-health_payload=bytes([vd.COMM_CUSTOM_APP_DATA,0x48,0x42,1,vd.HB_GET_COMMS_HEALTH,0])+struct.pack(">20I",*health_vals)
+health_payload=bytes([vd.COMM_CUSTOM_APP_DATA,0x48,0x42,vd.HB_VERSION,vd.HB_GET_COMMS_HEALTH,0])+struct.pack(">20I",*health_vals)
 health_link.custom_transact=lambda *a,**k: health_payload
 h=health_link.comms_health()
 assert h["rx_ok"]==100 and h["tx_queue_highwater"]==108 and h["uart_forced_recovery"]==116 and h["main_tail_max_cycles"]==119
 
-# Auto transport contract: TCP 65101 has priority; direct F411 is only fallback.
-orig_tcp,orig_direct=vd.TcpSerialTransport,vd.F411DirectTransport
-old_wait=vd.os.environ.get("VESC_TCP_WAIT_SEC")
-vd.os.environ["VESC_TCP_WAIT_SEC"]="0"
+# Auto transport contract: direct USB-UART candidates are positively probed.
+orig_candidates,orig_probe=vd._direct_serial_candidates,vd._probe_f103_uart
 try:
-    class FakeTcpOk:
-        def __init__(self,endpoint,timeout=0.01): self.endpoint="tcp://127.0.0.1:65101"
-    class FakeDirect:
-        calls=[]
-        def __init__(self,path,timeout=0.01,reclaim=False): self.path=path; self.reclaim=reclaim; FakeDirect.calls.append((path,reclaim))
-    vd.TcpSerialTransport=FakeTcpOk; vd.F411DirectTransport=FakeDirect
-    tr=vd.open_transport("auto"); assert isinstance(tr,FakeTcpOk) and not FakeDirect.calls
-    class FakeTcpFail:
-        def __init__(self,*a,**k): raise OSError("mock tcp down")
-    vd.TcpSerialTransport=FakeTcpFail
-    tr=vd.open_transport("auto"); assert isinstance(tr,FakeDirect) and FakeDirect.calls[-1][1] is True
+    vd._direct_serial_candidates=lambda:[('/dev/mock0','other USB'),('/dev/mock1','F103 USB-UART')]
+    calls=[]
+    class FakeSerial:
+        pass
+    chosen=FakeSerial()
+    def fake_probe(dev,baud,timeout):
+        calls.append(dev)
+        if dev=='/dev/mock0': raise TimeoutError('not F103')
+        return chosen,'motor_left'
+    vd._probe_f103_uart=fake_probe
+    tr=vd.open_transport('auto'); assert tr is chosen and calls==['/dev/mock0','/dev/mock1']
 finally:
-    vd.TcpSerialTransport,vd.F411DirectTransport=orig_tcp,orig_direct
-    if old_wait is None: vd.os.environ.pop("VESC_TCP_WAIT_SEC",None)
-    else: vd.os.environ["VESC_TCP_WAIT_SEC"]=old_wait
+    vd._direct_serial_candidates,vd._probe_f103_uart=orig_candidates,orig_probe
 
-print(f'PY_VESC_DUAL_PACKET_PASS crc=0x{vd.crc16(pl):04x} forward_can_id={fw[1]} values_id={v.vesc_id} pos={v.position:.1f} tool_builders=exact auto_route=1')
+# Explicit device paths are also positively probed; merely naming /dev/ttyUSBx is not trust.
+orig_probe=vd._probe_f103_uart
+try:
+    calls=[]
+    chosen=FakeSerial()
+    def explicit_probe(dev,baud,timeout):
+        calls.append((dev,baud)); return chosen,'motor_left'
+    vd._probe_f103_uart=explicit_probe
+    tr=vd.open_transport('/dev/mock-explicit',vd.DEFAULT_BAUD); assert tr is chosen
+    assert calls==[('/dev/mock-explicit',115200)]
+finally:
+    vd._probe_f103_uart=orig_probe
+
+print(f'PY_VESC_DUAL_PACKET_PASS crc=0x{vd.crc16(pl):04x} forward_can_id={fw[1]} values_id={v.vesc_id} pos={v.position:.1f} tool_builders=exact auto_direct_uart=1')

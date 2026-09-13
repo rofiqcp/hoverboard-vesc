@@ -79,7 +79,7 @@ def capture_step(link,right,loop,target,duration,hz,guard,position_target=None):
         elif loop=='position': link.set_position_counts(int(position_target),right)
 
     # SET_RPM/SET_CURRENT have no reply. Keep them refreshed independently from
-    # telemetry so a slow F411/USB GET_VALUES transaction can never exhaust the
+    # telemetry so a slow direct USB-UART GET_VALUES transaction can never exhaust the
     # 500-ms motor watchdog. Other loops use request/reply commands and stay
     # single-threaded to preserve response correlation.
     def writer():
@@ -186,7 +186,7 @@ def main():
     ap.add_argument('--speed-kp',type=float); ap.add_argument('--speed-ki',type=float); ap.add_argument('--speed-kd',type=float)
     ap.add_argument('--pos-kp',type=float); ap.add_argument('--pos-ki',type=float); ap.add_argument('--pos-kd',type=float); ap.add_argument('--filter',type=float)
     ap.add_argument('--out',default='tools/results/response_lab')
-    a=ap.parse_args(); right=a.motor=='right'; link=VescDual(a.port,1000000,timeout=.65); outdir=Path(a.out)
+    a=ap.parse_args(); right=a.motor=='right'; link=VescDual(a.port,115200,timeout=.65); link.require_platform_compatible(True); outdir=Path(a.out)
     try:
         base=link.get_tuning(right)
         if a.mode=='show': print(json.dumps(base.physical,indent=2)); return

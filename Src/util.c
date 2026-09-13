@@ -43,11 +43,9 @@ static uint32_t usart3LastValidFrameMs = 0u;
 static uint32_t usart3LastValidCount = 0u;
 static uint32_t usart3LastForcedRecoveryMs = 0u;
 static uint8_t usart3RecoveryStreak = 0u;
-static uint8_t usart3EverValid = 0u;
 #define USART3_VALID_PROGRESS_TIMEOUT_MS 1500u
 #define USART3_RAW_RECENT_MS 250u
 #define USART3_RECOVERY_COOLDOWN_MS 1500u
-#define USART3_RECOVERY_BEFORE_RESET 4u
 static uint32_t usart3RxOldPos = 0u;
 static uint16_t serialTimeoutCount = SERIAL_TIMEOUT;
 static SerialCommand serialCommand = {SERIAL_START_FRAME, 0, 0, 0};
@@ -96,10 +94,13 @@ uint32_t usart3_rx_error_count(void) { return usart3RxErrorCount; }
 uint32_t usart3_rx_restart_count(void) { return usart3RxRestartCount; }
 uint32_t usart3_forced_recovery_count(void) { return usart3ForcedRecoveryCount; }
 
-void Input_Init(void) {
-  UART3_Init();
+static volatile uint8_t s_eeprom_persistence_healthy = 0u;
+bool eeprom_persistence_healthy(void) { return s_eeprom_persistence_healthy != 0u; }
+
+bool Input_Init(void) {
+  if (!UART3_Init()) return false;
   vesc_protocol_init();
-  HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer));
+  if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) != HAL_OK) return false;
   UART_EnableRxErrorRecovery(&huart3);
   usart3LastByteMs = HAL_GetTick();
   usart3RxEpochMs = usart3LastByteMs;
@@ -107,15 +108,16 @@ void Input_Init(void) {
   usart3LastValidCount = 0u;
   usart3LastForcedRecoveryMs = 0u;
   usart3RecoveryStreak = 0u;
-  usart3EverValid = 0u;
 
-  HAL_FLASH_Unlock();
-  (void)EE_Init();
-  HAL_FLASH_Lock();
-  /* Load only fields that are actually implemented by this fixed-point port.
-   * Defaults remain active when EEPROM is blank or incompatible. */
-  (void)mc_interface_load_configuration_motor(false);
-  (void)mc_interface_load_configuration_motor(true);
+  s_eeprom_persistence_healthy = 0u;
+  if (HAL_FLASH_Unlock() == HAL_OK) {
+    s_eeprom_persistence_healthy = (EE_Init() == HAL_OK && EE_IsHealthy()) ? 1u : 0u;
+    HAL_FLASH_Lock();
+  }
+  if (s_eeprom_persistence_healthy) {
+    (void)mc_interface_load_configuration_motor(false);
+    (void)mc_interface_load_configuration_motor(true);
+  }
   /* Blank/incompatible EEPROM leaves the safe compiled LEFT config active,
    * but no set_configuration() call has necessarily initialized the shared
    * PB6/PB7 ABI peripheral. Always materialize the selected LEFT sensor mode
@@ -123,12 +125,12 @@ void Input_Init(void) {
   mcpwm_foc_refresh_encoder_configuration(false, true);
   /* Steering span is project calibration, intentionally independent from
    * standard VESC MC configuration signature. */
-  (void)mc_interface_load_steering_calibration();
-  /* App Config EEPROM must be loaded only after EE_Init(). vesc_protocol_init()
-   * runs earlier so USART3 can come up immediately, but it only installs safe
-   * defaults at that point. */
-  (void)app_vesc_load_configuration(false);
-  (void)app_vesc_load_configuration(true);
+  if (s_eeprom_persistence_healthy) (void)mc_interface_load_steering_calibration();
+  if (s_eeprom_persistence_healthy) {
+    (void)app_vesc_load_configuration(false);
+    (void)app_vesc_load_configuration(true);
+  }
+  return true;
 }
 
 void poweronMelody(void) {
@@ -289,7 +291,6 @@ void usart3_recovery_tick(uint32_t now_ms) {
     usart3LastValidCount = valid;
     usart3LastValidFrameMs = now_ms;
     usart3RecoveryStreak = 0u;
-    usart3EverValid = 1u;
     return;
   }
   if ((uint32_t)(now_ms - usart3LastByteMs) > USART3_RAW_RECENT_MS) return;
@@ -304,30 +305,25 @@ void usart3_recovery_tick(uint32_t now_ms) {
   vesc_protocol_transport_reset();
   (void)HAL_UART_DMAStop(&huart3);
   (void)HAL_UART_DeInit(&huart3);
-  UART3_Init();
+  const bool uart_reinit_ok = UART3_Init();
   usart3RxErrorPending = 0u;
   usart3RxOldPos = 0u;
   huart3.ErrorCode = HAL_UART_ERROR_NONE;
   huart3.RxState = HAL_UART_STATE_READY;
-  if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) == HAL_OK) {
+  if (uart_reinit_ok && HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) == HAL_OK) {
     ++usart3RxRestartCount;
     __HAL_UART_ENABLE_IT(&huart3, UART_IT_IDLE);
+    UART_EnableRxErrorRecovery(&huart3);
   }
-  UART_EnableRxErrorRecovery(&huart3);
   ++usart3ForcedRecoveryCount;
   if (usart3RecoveryStreak < 0xffu) ++usart3RecoveryStreak;
   usart3LastForcedRecoveryMs = now_ms;
   usart3RxEpochMs = now_ms;
   usart3LastValidFrameMs = now_ms; // fresh grace interval after UART restart
 
-  if (usart3EverValid && usart3RecoveryStreak >= USART3_RECOVERY_BEFORE_RESET) {
-    /* A once-healthy live link remained corrupt across several peripheral
-     * recoveries. Motors are already released; one MCU reset is the final tier.
-     * After reboot, reset-loop protection requires a valid frame before this
-     * tier can arm again. */
-    HAL_Delay(10u);
-    NVIC_SystemReset();
-  }
+  /* Transport corruption never escalates to an MCU reset. Motors are already
+   * released; keep retrying USART/DMA recovery so normal SWD attach remains
+   * stable even with a permanently noisy or disconnected UART. */
 }
 
 void readCommand(void) {
@@ -381,6 +377,7 @@ void poweroffPressCheck(void) {
   enable = 0;
   while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) {
     HAL_Delay(10);
+    platform_watchdog_service();
     if (pressedMs < 60000) pressedMs += 10;
   }
   if (pressedMs >= 80) poweroff();

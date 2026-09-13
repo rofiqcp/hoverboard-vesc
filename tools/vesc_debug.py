@@ -691,7 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("port", nargs="?", default="auto")
     p.add_argument("command", nargs="?", default="info",
                    choices=("selftest","info","diag","rt","hall","hall-phase","wiring-check","current","rpm","pos-vesc","pos-limits","pos-state","pos-reset","pos-count","all"))
-    p.add_argument("--baud", type=int, default=1000000)
+    p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--motor", default="both", choices=("left","right","both"))
     p.add_argument("--hz", type=float, default=50.0)
     p.add_argument("--seconds", type=float, default=5.0)
@@ -718,6 +718,9 @@ def main() -> int:
     if args.command == "rpm" and args.erpm is None and args.mech_rpm is None:
         raise SystemExit("rpm memerlukan --erpm N atau --mech-rpm N")
     link = VescDual(args.port, args.baud, timeout=0.25)
+    active_commands={"hall","hall-phase","wiring-check","current","rpm","pos-vesc","pos-limits","pos-reset","pos-count","all"}
+    if args.command in active_commands:
+        link.require_platform_compatible(True)
     try:
         if args.command == "info": return cmd_info(args, link)
         if args.command == "diag": return cmd_diag(args, link)

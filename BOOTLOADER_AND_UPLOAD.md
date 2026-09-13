@@ -1,54 +1,45 @@
 # STM32F103RCT6 VESC Bootloader and Upload Paths
 
-The F103 uses USART3 on PB10/PB11 at 115200 baud for both normal VESC traffic and firmware updates. No BOOT0 or NRST wire is required after the resident bootloader has been installed once with ST-Link.
+Production communication is direct: **PC/NUC USB-UART <-> STM32F103 USART3 PB10/PB11 at 115200 baud**. There is no intermediate MCU gateway, maintenance proxy, or TCP firmware route.
 
 ## Flash layout
 
-- `0x08000000..0x080027FF`: immutable recovery bootloader, 10 KiB
-- `0x08002800..0x080207FF`: active application, 120 KiB
-- `0x08020800..0x0803E7FF`: staged firmware image, 120 KiB
-- `0x0803E800..0x0803EFFF`: update metadata, 2 KiB
-- `0x0803F000..0x0803FFFF`: existing emulated EEPROM, 4 KiB
+- `0x08000000..0x080027FF`: resident recovery bootloader, 10 KiB
+- `0x08002800..0x0803E7FF`: active application, 240 KiB
+- `0x0803E800..0x0803EFFF`: update metadata/journal, 2 KiB
+- `0x0803F000..0x0803FFFF`: emulated EEPROM, 4 KiB
 
-The updater follows the VESC `COMM_ERASE_NEW_APP`, `COMM_WRITE_NEW_APP_DATA`, and `COMM_JUMP_TO_BOOTLOADER` flow. A size+CRC16 header is staged before the image. The active app is not erased until the staged image validates.
-## PlatformIO environments
+The candidate image is staged on the PC/NUC and streamed directly to the resident bootloader. The F103 does not reserve a second 120-KiB application slot.
 
-Build/update the application with one of these environments:
+## Normal application upload
 
-```bash
-pio run -e APP_STLINK
-pio run -e APP_USART_PC
-pio run -e APP_F411
-```
+Wire the USB-UART directly to F103 USART3:
 
-Initial bootloader installation/recovery remains ST-Link only:
+- USB-UART RX <- `PB10` F103 TX
+- USB-UART TX -> `PB11` F103 RX
+- GND <-> GND
 
-```bash
-pio run -e BOOTLOADER_STLINK
-```
-
-For the first installation, use `tools/install_bootloader_stlink.sh`. It refuses to write until a complete 256-KiB backup succeeds, programs and verifies the relocated app first, then programs the immutable bootloader last and resets. Keep an ST-Link header available as the final recovery path.
-### Direct USB-UART to F103
-
-Connect TX/RX crossed to F103 USART3 (`PB10=TX`, `PB11=RX`) and common GND. Then run:
+Then use:
 
 ```bash
 pio run -e APP_USART_PC -t upload --upload-port /dev/ttyUSBX
 ```
 
-### Through the STM32F411 gateway
+`APP_USART_PC` is the default PlatformIO environment. The uploader positively identifies the F103 with `COMM_FW_VERSION`, asks the running application for an ACKed boot handoff, waits for its UART TX to drain, follows the automatic MCU reset into the resident bootloader, streams the image, verifies TEST/CONFIRMED metadata, and reconnects the same USB-UART automatically when needed. **No manual RESET press is part of the normal flow.**
 
-The F411 exposes F103 VESC packets through the highest-priority Python maintenance proxy on port `65101`. With ROS/F411 bridge running:
+## ST-Link
+
+`APP_STLINK` and `BOOTLOADER_STLINK` are direct recovery/development paths. Production ST-Link tooling is normal-SWD only; it has no automatic connect-under-reset fallback.
 
 ```bash
-pio run -e APP_F411 -t upload
+pio run -e APP_STLINK -t upload
+pio run -e BOOTLOADER_STLINK -t upload
 ```
 
-VESC Tool remains on the separate lower-priority TCP endpoint `65102`; firmware upload must use `65101`. The web operator console remains on `http://localhost:5000`.
-## Recovery and safety guarantees
+The resident bootloader is intentionally not self-updatable. Keep an ST-Link header available for exceptional recovery, but normal application updates should use the direct USART3 USB-UART path above.
 
-During update the application releases both motors and clears both advanced-timer MOE bits before touching flash. The bootloader holds all six high-side gates low and all six active-low low-side gates high.
+## Safety guarantees
 
-If power is lost while the bootloader is copying a valid staged image, the `PENDING` metadata is preserved. The next boot retries the copy from the still-intact staging region. If no valid application exists, the bootloader stays in recovery and accepts the same VESC firmware commands over USART3.
+Before an application-to-bootloader handoff, both bridges are forced off. The ACK is transmitted first; reset is allowed only after the UART queue, DMA state, and USART transmission-complete state are drained. UART corruption recovery never escalates to an MCU reset.
 
-The bootloader itself is intentionally not self-updatable. Updating or recovering the bootloader requires ST-Link so a malformed network/serial firmware package cannot overwrite the last recovery path.
+Firmware streaming is resumable and idempotent. A candidate boots in TEST state and must confirm itself before it becomes the accepted image. If a candidate fails and a host last-known-good image exists, the uploader restores it through the same direct USART3 path.

@@ -2,6 +2,7 @@
 #define UTIL_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "stm32f1xx_hal.h"
 
 typedef struct {
@@ -24,7 +25,8 @@ typedef struct {
 
 void BLDC_Init(void);
 void Input_Lim_Init(void);
-void Input_Init(void);
+bool Input_Init(void);
+bool eeprom_persistence_healthy(void);
 void UART_EnableRxErrorRecovery(UART_HandleTypeDef *huart);
 uint32_t usart3_rx_error_count(void);
 uint32_t usart3_rx_restart_count(void);

@@ -7,7 +7,7 @@ mh=(R/'Src/motor/mcpwm_foc.h').read_text()
 vp=(R/'Src/vesc/vesc_protocol.c').read_text()
 dual=(R/'tools/vesc_dual.py').read_text()
 assert '#define FOC_PROF_SAMPLE_PERIOD 31u' in mc and math.gcd(31,6)==1
-assert '#define FOC_ISR_PROFILE_REVISION 0x00020002u' in mc
+assert '#define MCPWM_FOC_ISR_PROFILE_REVISION  0x00030000u' in mh
 assert 'const uint32_t focIsrStartCycles = DWT->CYCCNT;' in mc
 assert 'const uint32_t end = DWT->CYCCNT;' in mc
 assert 'elapsed > FOC_ISR_BUDGET_CYCLES' in mc and 'foc_isr_deadline_miss_count++' in mc
@@ -33,13 +33,15 @@ assert 'if(foc_prof_detail_sample)profStageStart=DWT->CYCCNT;' in mc
 assert 'if(foc_prof_detail_sample && control_update)profRegulatorStart=DWT->CYCCNT;' in mc
 assert 'uint32_t detail_sample_count, detail_slot_count[6];' in mh
 assert 'uint32_t steady_isr_count, slot_sequence_error_count;' in mh
+assert 'uint32_t active_slot_count, reset_epoch;' in mh
+assert 'foc_prof_reset_request' in mc and 'foc_prof_reset_ack' in mc and 'foc_isr_profile_clear_isr_owned' in mc
 assert 'uint32_t fast_hold_svpwm_max_cycles, profile_revision;' in mh
 assert 'uint8_t b[320]' in vp and 'APPP(p.fast_hold_svpwm_max_cycles)' in vp
 assert 'APPP(p.slot_sequence_error_count)' in vp and 'APPP(p.steady_isr_count)' in vp
 assert 'for(uint8_t si=0u;si<6u;++si)APPP(p.detail_slot_count[si]);' in vp
 s=dual.index('    def isr_profile'); e=dual.index('    def trace_meta',s); body=dual[s:e]
 m=re.search(r'names=\((.*?)\)\n\s*p=self',body,re.S); names=ast.literal_eval('('+m.group(1)+')')
-for n in ('fast_hold_svpwm','slot_sequence_errors','steady_isr_count','detail_slot0_count','profile_revision'):
+for n in ('fast_hold_svpwm','slot_sequence_errors','steady_isr_count','detail_slot0_count','profile_revision','active_slot_count','reset_epoch'):
     assert n in names
-assert len(names)==70 and 6+4*len(names)==286
-print('ISR_PROFILER_STAGE1_STATIC_PASS revision=0x00020002 continuous_authority=1 sampled_detail=1 sample_period=31 slots=6 fields=70 long_frame=286')
+assert len(names)==72 and 6+4*len(names)==294
+print('ISR_PROFILER_STAGE1_STATIC_PASS revision=0x00030000 continuous_authority=1 coherent_reset=1 dynamic_active_slots=1 sampled_detail=1 sample_period=31 slot_capacity=6 fields=72 long_frame=294')

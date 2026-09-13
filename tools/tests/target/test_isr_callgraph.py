@@ -6,8 +6,8 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[3]
 ELF_STLINK = ROOT / '.pio/build/APP_STLINK/firmware.elf'
-ELF_F411 = ROOT / '.pio/build/APP_F411/firmware.elf'
-ELF = ELF_STLINK if ELF_STLINK.exists() else ELF_F411
+ELF_USART = ROOT / '.pio/build/APP_USART_PC/firmware.elf'
+ELF = ELF_STLINK if ELF_STLINK.exists() else ELF_USART
 OBJDUMP = shutil.which('arm-none-eabi-objdump')
 NM = shutil.which('arm-none-eabi-nm')
 if not OBJDUMP:
@@ -21,7 +21,7 @@ if not OBJDUMP:
 if not OBJDUMP or not NM:
     raise SystemExit('FAIL arm-none-eabi-objdump/nm not found')
 if not ELF.exists():
-    raise SystemExit('FAIL firmware.elf missing; run pio run for APP_STLINK/APP_F411 first')
+    raise SystemExit('FAIL firmware.elf missing; run pio run for APP_STLINK/APP_USART_PC first')
 
 text = subprocess.check_output([OBJDUMP, '-d', '-C', str(ELF)], text=True)
 graph = {}

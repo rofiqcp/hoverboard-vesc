@@ -69,7 +69,8 @@ def main() -> int:
     if not 0 <= a.tolerance <= 10:
         raise SystemExit("tolerance must be 0..10")
 
-    link = VescDual(a.port, 1000000, timeout=25.0)
+    link = VescDual(a.port,115200, timeout=25.0)
+    link.require_platform_compatible(True)
     try:
         rc = 0
         if a.motor in ("left", "both"):

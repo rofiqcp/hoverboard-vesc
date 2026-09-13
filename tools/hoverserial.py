@@ -713,10 +713,10 @@ def interactive(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Interactive Left/Right hoverboard USART3 terminal"
+        description="DEPRECATED legacy hoverboard serial tool (USART3 is VESC-only)"
     )
     parser.add_argument("--port", default="/dev/ttyUSB0", help="e.g. COM3 or /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=1000000)
+    parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--list-ports", action="store_true")
     parser.add_argument("--rate", type=float, default=20.0, help="binary command TX rate Hz")
     parser.add_argument("--print-rate", type=float, default=10.0, help="telemetry display rate Hz")
@@ -737,6 +737,11 @@ def main() -> None:
         help="telemetry/debug monitor only; do not transmit motor commands",
     )
     args = parser.parse_args()
+
+    raise SystemExit(
+        "DEPRECATED: legacy HoverSerial frames are not accepted by the VESC-exclusive "
+        "F103 USART3 transport. Use tools/vesc_debug.py or tools/vesc_dual.py @ 115200."
+    )
 
     if args.list_ports:
         print_ports()

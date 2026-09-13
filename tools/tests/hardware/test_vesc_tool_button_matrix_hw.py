@@ -79,8 +79,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("port", nargs="?", default="auto")
     ap.add_argument("--reboot-check", action="store_true")
+    ap.add_argument("--arm", action="store_true", help="required because this test writes persistent MC/App configuration")
     args = ap.parse_args()
+    if not args.arm:
+        ap.error("persistent configuration test requires --arm")
     link = VescDual(args.port, timeout=0.8)
+    link.require_platform_compatible(True)
     try:
         ids = link.ping_can()
         print("PING_CAN", ids)

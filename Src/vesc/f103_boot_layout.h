@@ -7,10 +7,9 @@
 #define F103_FLASH_TOTAL_SIZE     0x00040000u /* 256 KiB */
 #define F103_FLASH_PAGE_SIZE      0x00000800u /* 2 KiB for STM32F103xE */
 
-/* Native VESC transport: F103 USART3 PB10/PB11 <-> F411 USART1 PB6/PB7.
- * This hardware link is validated and fixed at the standard 115200 baud.
- * The separate Mini-PC <-> F411 USB CDC host link remains 1 Mbaud. Do not
- * conflate the two links when tuning buffering, timeouts, or diagnostics. */
+/* Native VESC transport: F103 USART3 PB10/PB11 <-> external USB-UART <-> PC/NUC.
+ * The motor-controller UART remains 115200 baud for VESC traffic and firmware
+ * streaming. No intermediate MCU gateway is part of the production path. */
 #define F103_VESC_UART_BAUD       115200u
 
 /* Top 16 bytes of SRAM are reserved in BOTH linker scripts. A two-word magic
@@ -39,7 +38,7 @@
 #define F103_VESC_IMAGE_HEADER_SIZE 6u
 #define F103_MAX_FW_IMAGE_SIZE      F103_APP_REGION_SIZE
 
-/* Host/F411-backed external staging. The candidate and last-known-good image
+/* Host-backed external staging. The candidate and last-known-good image
  * live outside F103; internal flash only contains bootloader + active app. */
 #define F103_UPDATE_META_MAGIC        0x56455343u /* 'VESC' */
 #define F103_UPDATE_STATE_STREAM      0x5354524Du /* 'STRM' */

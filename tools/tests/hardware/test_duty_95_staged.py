@@ -18,7 +18,7 @@ def main():
  if any(x<=0 or x>0.95 for x in stages): raise SystemExit('stages must be 0 < duty <= 0.95')
  if not a.arm:
   print('DRY RUN: add --arm only on a mechanically safe rig/dyno'); print('stages=',stages,'max_erpm=',a.max_erpm,'max_current=',a.max_current); return 0
- right=a.motor=='right'; link=VescDual(a.port,1000000,timeout=max(.15,2/a.hz)); rows=[]; reason=''
+ right=a.motor=='right'; link=VescDual(a.port,115200,timeout=max(.15,2/a.hz)); link.require_platform_compatible(True); rows=[]; reason=''
  try:
   b=link.diag(right); base=(b.hall_invalid,b.hall_sequence_rejects or 0,b.current_trips,b.phase_trip_count or 0,b.dc_trip_count or 0,b.rx_queue_drops or 0)
   last_alive=0.0

@@ -21,7 +21,7 @@ def main():
  a=ap.parse_args()
  if not a.arm: ap.error('motor actuation requires --arm')
  stamp=time.strftime('%Y%m%d_%H%M%S');out=TOOLS_DIR/'results'/'speed_pid'/stamp;out.mkdir(parents=True,exist_ok=True);fpath=out/'brake_handbrake.csv'
- L=VescDual(a.port,1000000,timeout=.7);rows=[]
+ L=VescDual(a.port,115200,timeout=.7);L.require_platform_compatible(True);rows=[]
  try:
   # Audit memakai konfigurasi motor aktif apa adanya; test harness tidak boleh
   # menulis MC config karena gain eksperimental dapat membuat hasil brake palsu.

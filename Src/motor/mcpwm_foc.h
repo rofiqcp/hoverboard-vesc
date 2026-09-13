@@ -362,6 +362,16 @@ typedef struct {
     volatile uint16_t m_ccr_a;
     volatile uint16_t m_ccr_b;
     volatile uint16_t m_ccr_c;
+    /* Current-sampling observability. With fixed TIM8-TRGO sampling the
+     * centered-SVPWM low-side zero-vector half-window is ARR-max(CCR).
+     * This is diagnostic evidence only; Stage-2 never shifts ADC timing. */
+    volatile uint16_t m_sample_zero_window_counts;
+    volatile uint16_t m_sample_window_min_counts;
+    volatile uint16_t m_sample_guard_counts;
+    volatile uint16_t m_sample_adc_phase_counts;
+    volatile uint32_t m_sample_invalid_count;
+    volatile uint8_t m_sample_sector;
+    volatile uint8_t m_sample_window_valid;
     volatile uint32_t m_isr_count;
     volatile uint32_t m_overrun_count;
     volatile uint32_t m_current_trip_count;
@@ -430,6 +440,7 @@ bool mcpwm_foc_encoder_startup_align(bool is_second_motor);
 bool mcpwm_foc_encoder_is_synced(bool is_second_motor);
 bool mcpwm_foc_encoder_detect(float current, bool is_second_motor, float *offset, float *ratio, bool *inverted);
 void mcpwm_foc_release_motor(bool is_second_motor);
+void mcpwm_foc_force_bridges_off(void);
 /* VESC COMM_MOTOR_ESTOP: hentikan kedua bridge dan abaikan perintah motor
  * selama duration_ms. Nilai 0 berarti release sekali tanpa hold tambahan. */
 void mcpwm_foc_estop_both(uint16_t duration_ms);
@@ -504,6 +515,8 @@ typedef struct {
     uint8_t control_slot, event_bits;
     int16_t left_id_q4, left_iq_q4, left_id_set_q4, left_iq_set_q4, left_vd, left_vq, left_erpm;
     int16_t right_id_q4, right_iq_q4, right_id_set_q4, right_iq_set_q4, right_vd, right_vq, right_erpm;
+    int32_t left_id_integrator, left_iq_integrator, right_id_integrator, right_iq_integrator;
+    uint16_t left_sample_window, right_sample_window;
     uint16_t vin_adc;
     uint8_t left_fault, right_fault, left_quality, right_quality;
 } mcpwm_foc_trace_sample_t;
@@ -514,10 +527,29 @@ typedef struct {
     uint16_t sample_size;
 } mcpwm_foc_trace_meta_t;
 
-void mcpwm_foc_trace_clear(void);
-void mcpwm_foc_trace_freeze(void);
+bool mcpwm_foc_trace_clear(void);
+bool mcpwm_foc_trace_freeze(void);
 void mcpwm_foc_trace_get_meta(mcpwm_foc_trace_meta_t *out);
 bool mcpwm_foc_trace_read(uint8_t chronological_index, mcpwm_foc_trace_sample_t *out);
+
+typedef struct {
+    uint16_t ccr_a, ccr_b, ccr_c;
+    uint16_t zero_window_counts, min_window_counts, guard_counts, adc_phase_counts;
+    uint32_t invalid_count;
+    uint8_t sector, window_valid, offset_valid, driven_offset_valid, bridge_settled;
+} mcpwm_foc_adc_sample_diag_t;
+void mcpwm_foc_get_adc_sample_diag(bool is_second_motor, mcpwm_foc_adc_sample_diag_t *out);
+
+typedef struct {
+    uint32_t sequence;
+    int16_t pre_q4, step_q4;
+    uint8_t active, second, pre_remaining, post_remaining, step_fired, done;
+} mcpwm_foc_step_test_status_t;
+bool mcpwm_foc_step_test_arm(float pre_current_a, float step_current_a, uint8_t pre_samples, uint8_t post_samples, bool is_second_motor);
+void mcpwm_foc_step_test_get(mcpwm_foc_step_test_status_t *out);
+
+#define MCPWM_FOC_PROFILE_SLOT_CAPACITY 6u
+#define MCPWM_FOC_ISR_PROFILE_REVISION  0x00030000u
 
 typedef struct {
     uint32_t total_max_cycles, deadline_miss_count;
@@ -527,13 +559,14 @@ typedef struct {
     uint32_t sensor_max_cycles, pll_max_cycles, current_max_cycles, regulator_max_cycles;
     uint32_t position_pid_max_cycles, speed_pid_max_cycles, current_circle_max_cycles;
     uint32_t id_pi_max_cycles, iq_pi_max_cycles, decouple_limit_max_cycles;
-    uint32_t svpwm_max_cycles, duty_mag_max_cycles, overrun_total;
+    uint32_t svpwm_max_cycles, duty_mag_max_cycles, reentry_guard_total;
     /* Profiler acceptance minimal: worst-case dan miss per scheduler slot 0..5.
      * Tidak menambah DWT read baru; memakai elapsed ISR yang sudah tersedia. */
     uint32_t slot_max_cycles[6], slot_miss_count[6], slot_count[6];
     uint32_t detail_sample_count, detail_slot_count[6];
     uint32_t steady_isr_count, slot_sequence_error_count;
     uint32_t fast_hold_svpwm_max_cycles, profile_revision;
+    uint32_t active_slot_count, reset_epoch;
     /* Main-context 1-kHz SPEED/POS scheduler. Kept in the same diagnostic
      * transaction so timing can be verified without attaching SWD to F103. */
     uint32_t outer_max_cycles, outer_miss_count, outer_jitter_max_cycles;
@@ -548,7 +581,7 @@ typedef struct {
 } mcpwm_foc_isr_profile_t;
 void mcpwm_foc_get_isr_profile(mcpwm_foc_isr_profile_t *out);
 void mcpwm_foc_get_irq_epoch(uint32_t *entry, uint32_t *exit);
-void mcpwm_foc_reset_isr_profile(void);
+bool mcpwm_foc_reset_isr_profile(void);
 
 /* Hardware calibration / ISR diagnostics. */
 bool mcpwm_foc_dc_cal_done(void);

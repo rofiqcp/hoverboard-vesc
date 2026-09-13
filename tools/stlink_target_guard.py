@@ -10,25 +10,33 @@ EXPECTED_DEV_ID = 0x414  # STM32F103 high-density (xC/xD/xE)
 
 
 def resolve_stlink_transport(scripts: Path) -> str:
-    """Select the transport supported by the installed OpenOCD ST-Link driver."""
+    """Select the transport for the *active* OpenOCD ST-Link driver.
+
+    Modern OpenOCD ``interface/stlink.cfg`` contains comments and Tcl branches
+    mentioning deprecated HLA even though it actually selects ``adapter driver
+    st-link``. Do not substring-match comments: that made a normal-SWD probe use
+    invalid ``hla_swd`` and falsely look like a target that needed reset.
+    """
     cfg = scripts / "interface" / "stlink.cfg"
     try:
-        text = cfg.read_text(encoding="utf-8", errors="ignore").lower()
+        lines = cfg.read_text(encoding="utf-8", errors="ignore").splitlines()
     except OSError:
-        text = ""
-    if "adapter driver hla" in text or "hla_layout stlink" in text:
+        lines = []
+    active = [ln.split('#', 1)[0].strip().lower() for ln in lines]
+    active = [ln for ln in active if ln]
+    if any(ln == "adapter driver st-link" for ln in active):
+        return "swd"
+    if any(ln == "adapter driver hla" or ln.startswith("hla_layout stlink") for ln in active):
         return "hla_swd"
     return "swd"
 
 
-def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100, under_reset: bool = False,
+def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100,
                        resume_before_shutdown: bool = False, expected_vtor: int | None = None,
                        pc_min: int | None = None, pc_max: int | None = None) -> str:
     transport = resolve_stlink_transport(scripts)
     cmd = [str(openocd), "-s", str(scripts), "-f", "interface/stlink.cfg",
            "-c", f"transport select {transport}"]
-    if under_reset:
-        cmd += ["-c", "reset_config srst_only srst_nogate connect_assert_srst"]
     actions = ["init", "halt", "flash info 0"]
     if expected_vtor is not None or pc_min is not None or pc_max is not None:
         actions += ["mdw 0xE000ED08 1", "reg pc"]
@@ -79,11 +87,10 @@ def main() -> None:
     ap.add_argument("--openocd", required=True)
     ap.add_argument("--scripts", required=True)
     ap.add_argument("--speed", type=int, default=100)
-    ap.add_argument("--under-reset", action="store_true")
     ap.add_argument("--resume", action="store_true", help="resume core before shutdown after a read-only probe")
     args = ap.parse_args()
     try:
-        verify_f103_target(Path(args.openocd), Path(args.scripts), args.speed, args.under_reset, args.resume)
+        verify_f103_target(Path(args.openocd), Path(args.scripts), args.speed, args.resume)
     except RuntimeError as exc:
         raise SystemExit(str(exc))
 

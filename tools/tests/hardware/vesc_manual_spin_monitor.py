@@ -21,7 +21,7 @@ def main():
     ap.add_argument('--seconds',type=float,default=10.0)
     ap.add_argument('--hz',type=float,default=20.0)
     ap.add_argument('--csv',default='tools/results/response_lab/manual_spin.csv')
-    a=ap.parse_args(); link=VescDual(a.port,1000000,timeout=.65)
+    a=ap.parse_args(); link=VescDual(a.port,115200,timeout=.65)
     rows=[]; period=1.0/max(a.hz,1.0); end=time.monotonic()+a.seconds
     motors=[False,True] if a.motor=='both' else [a.motor=='right']
     try:

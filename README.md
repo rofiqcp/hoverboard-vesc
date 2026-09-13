@@ -3,7 +3,7 @@
 Firmware dual-motor FOC bare-metal untuk board hoverboard STM32F103RCT6 dengan
 protokol dan perilaku kontrol yang diarahkan kompatibel dengan VESC 6.00/VESC Tool.
 Jalur ADC dual-DMA, PWM TIM8/TIM1, dan ISR FOC 16 kHz tetap memakai basis EFeru
-yang sudah digunakan pada hardware ini. USART3 PB10/PB11 production = 115200 baud; baud legacy 2 Mbaud hanya dipertahankan sebagai jalur diagnostik/migrasi, bukan runtime default.
+yang sudah digunakan pada hardware ini. USART3 PB10/PB11 production = 115200 baud dan bersifat VESC-exclusive; legacy raw hoverboard serial sudah tidak didukung.
 
 Repository utama: `https://github.com/rofiqcp/hoverboard-vesc`.
 Di workspace AGV, repository ini dipasang sebagai Git submodule pada

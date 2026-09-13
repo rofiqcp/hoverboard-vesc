@@ -161,7 +161,7 @@ def check_static():
     serc=(ROOT/'Src/vesc/mcconf_serial.c').read_text()
     assert 'appconf6_append_balance_placeholder' in serc and 'appconf6_skip_balance_placeholder' in serc, 'VESC 6.00 balance wire block adapter missing'
     assert 'coast_brake_level' not in serc and 'coast_brake_ramp_time' not in serc, 'post-6.00 Chuk fields leaked into VESC 6.00 app wire format'
-    assert 'if (c.si_motor_poles < 2u || (c.si_motor_poles & 1u)) c.si_motor_poles = 30u;' in vp and 'c.si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
+    assert 'if (c->si_motor_poles < 2u || (c->si_motor_poles & 1u)) c->si_motor_poles = 30u;' in vp and 'c->si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
     assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and \
@@ -216,10 +216,11 @@ def check_static():
     util=(ROOT/'Src/util.c').read_text()
     for token in ('usart3_recovery_tick', 'USART3_VALID_PROGRESS_TIMEOUT_MS',
                   'USART3_RAW_RECENT_MS', 'USART3_RECOVERY_COOLDOWN_MS',
-                  'USART3_RECOVERY_BEFORE_RESET', 'usart3EverValid',
                   'mcpwm_foc_release_motor(false)', 'mcpwm_foc_release_motor(true)',
-                  'HAL_UART_DMAStop(&huart3)', 'vesc_protocol_transport_reset()', 'NVIC_SystemReset'):
+                  'HAL_UART_DMAStop(&huart3)', 'vesc_protocol_transport_reset()'):
         assert token in util, f'F103 USART3 robust recovery missing: {token}'
+    recovery=util[util.index('void usart3_recovery_tick'):util.index('void readCommand')]
+    assert 'NVIC_SystemReset' not in recovery and 'USART3_RECOVERY_BEFORE_RESET' not in recovery, 'UART corruption must never escalate to MCU reset'
     assert 'void vesc_protocol_transport_reset(void)' in vp and 's_rx_ok = 0u' not in vp[vp.index('void vesc_protocol_transport_reset(void)'):vp.index('bool vesc_protocol_rx_in_progress')], 'F103 recovery must preserve valid-frame progress counter'
     eeh=(ROOT/'Src/eeprom.h').read_text()
     lds=(ROOT/'STM32F103RCTx_APP.ld').read_text(); bootlds=(ROOT/'STM32F103RCTx_BOOTLOADER.ld').read_text()
@@ -283,11 +284,14 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_external_stream_resume.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_recovery.py'])
-    run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_f411_route.py'])
+    run([sys.executable,'tools/tests/host/test_boot_handoff_reconnect.py'])
     run([sys.executable,'tools/tests/host/test_v15_features.py'])
     run([sys.executable,'tools/tests/host/test_v16_features.py'])
     run([sys.executable,'tools/tests/host/test_isr_profiler_stage1.py'])
     run([sys.executable,'tools/tests/host/test_comms_isr_isolation_stage2.py'])
+    run([sys.executable,'tools/tests/host/test_stage2_production_gate.py'])
+    run([sys.executable,'tools/tests/host/test_stage1_audit_hardening.py'])
+    run([sys.executable,'tools/tests/host/test_measurement_authority_hardening.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])
     run([sys.executable,'tools/tests/host/test_hall_detect_algorithm.py'])
     run([sys.executable,'tools/tests/host/test_hall_3rev_runtime.py'])
