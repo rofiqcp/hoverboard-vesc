@@ -278,7 +278,12 @@ bool mcpwm_foc_trace_read(uint8_t index,mcpwm_foc_trace_sample_t *out){if(!out||
 void mcpwm_foc_get_adc_sample_diag(bool second,mcpwm_foc_adc_sample_diag_t *out){if(!out)return;memset(out,0,sizeof(*out));out->ccr_a=1000u;out->ccr_b=1200u;out->ccr_c=800u;out->zero_window_counts=800u;out->min_window_counts=700u;out->guard_counts=184u;out->adc_phase_counts=2000u;out->invalid_count=second?2u:1u;out->sector=second?4u:2u;out->window_valid=1u;out->offset_valid=1u;out->driven_offset_valid=1u;out->bridge_settled=1u;}
 static mcpwm_foc_step_test_status_t step_mock;
 bool mcpwm_foc_step_test_arm(float pre,float step,uint8_t pre_n,uint8_t post_n,bool second){step_mock.sequence++;step_mock.pre_q4=(int16_t)(pre*800.0f);step_mock.step_q4=(int16_t)(step*800.0f);step_mock.active=1u;step_mock.second=second?1u:0u;step_mock.pre_remaining=pre_n;step_mock.post_remaining=post_n;step_mock.step_fired=0u;step_mock.done=0u;return true;}
+bool mcpwm_foc_step_test_arm_axis(float pre,float step,uint8_t pre_n,uint8_t post_n,bool second,mcpwm_foc_step_axis_t axis){(void)axis;return mcpwm_foc_step_test_arm(pre,step,pre_n,post_n,second);}
 void mcpwm_foc_step_test_get(mcpwm_foc_step_test_status_t *out){if(out)*out=step_mock;}
+static mcpwm_foc_relay_status_t relay_mock;
+bool mcpwm_foc_relay_start(mcpwm_foc_relay_mode_t mode,bool second,int32_t target,int32_t hyst,uint16_t relay_ma,uint8_t crossings,uint32_t timeout_ms){(void)timeout_ms;memset(&relay_mock,0,sizeof(relay_mock));relay_mock.sequence++;relay_mock.mode=(uint8_t)mode;relay_mock.second=second?1u:0u;relay_mock.target=target;relay_mock.hysteresis=hyst;relay_mock.relay_current_ma=relay_ma;relay_mock.required_crossings=crossings;relay_mock.active=1u;return true;}
+void mcpwm_foc_relay_abort(void){relay_mock.active=0u;relay_mock.done=1u;relay_mock.failed=9u;}
+void mcpwm_foc_relay_get(mcpwm_foc_relay_status_t *out){if(out)*out=relay_mock;}
 float mcpwm_foc_get_erpm_motor(bool second) { return (float)diag_motors[second?1:0].m_rpm; }
 void mcpwm_foc_get_current_offsets(int16_t *p0,int16_t *p1,int16_t *dc,bool second){if(p0)*p0=second?2003:1998;if(p1)*p1=second?1997:2001;if(dc)*dc=second?2002:1999;}
 uint16_t mcpwm_foc_get_pole_pairs(bool second){return (uint16_t)((confs[second?1:0].si_motor_poles>=2?confs[second?1:0].si_motor_poles:30u)/2u);}

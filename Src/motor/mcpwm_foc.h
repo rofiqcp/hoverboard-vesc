@@ -540,13 +540,39 @@ typedef struct {
 } mcpwm_foc_adc_sample_diag_t;
 void mcpwm_foc_get_adc_sample_diag(bool is_second_motor, mcpwm_foc_adc_sample_diag_t *out);
 
+typedef enum {
+    MCPWM_FOC_STEP_AXIS_Q = 0u,
+    MCPWM_FOC_STEP_AXIS_D = 1u
+} mcpwm_foc_step_axis_t;
+
 typedef struct {
     uint32_t sequence;
     int16_t pre_q4, step_q4;
     uint8_t active, second, pre_remaining, post_remaining, step_fired, done;
 } mcpwm_foc_step_test_status_t;
+bool mcpwm_foc_step_test_arm_axis(float pre_current_a, float step_current_a, uint8_t pre_samples, uint8_t post_samples,
+                                  bool is_second_motor, mcpwm_foc_step_axis_t axis);
 bool mcpwm_foc_step_test_arm(float pre_current_a, float step_current_a, uint8_t pre_samples, uint8_t post_samples, bool is_second_motor);
 void mcpwm_foc_step_test_get(mcpwm_foc_step_test_status_t *out);
+
+typedef enum {
+    MCPWM_FOC_RELAY_NONE = 0u,
+    MCPWM_FOC_RELAY_SPEED = 1u,
+    MCPWM_FOC_RELAY_POSITION = 2u
+} mcpwm_foc_relay_mode_t;
+
+typedef struct {
+    uint32_t sequence, elapsed_ms, period_sum_ms;
+    int32_t target, hysteresis, measurement, minimum, maximum;
+    uint16_t relay_current_ma, period_count;
+    uint8_t active, done, failed, mode, second, relay_positive, crossings, required_crossings;
+} mcpwm_foc_relay_status_t;
+
+bool mcpwm_foc_relay_start(mcpwm_foc_relay_mode_t mode, bool is_second_motor, int32_t target,
+                           int32_t hysteresis, uint16_t relay_current_ma, uint8_t required_crossings,
+                           uint32_t timeout_ms);
+void mcpwm_foc_relay_abort(void);
+void mcpwm_foc_relay_get(mcpwm_foc_relay_status_t *out);
 
 #define MCPWM_FOC_PROFILE_SLOT_CAPACITY 6u
 #define MCPWM_FOC_ISR_PROFILE_REVISION  0x00030000u

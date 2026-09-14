@@ -69,6 +69,9 @@
 #define HB_CUSTOM_GET_STEP_STATUS                   28u
 #define HB_CUSTOM_BOOT_HANDOFF                      29u /* ACK first, reset only after UART drains */
 #define HB_CUSTOM_GET_POSITION_D_STATE              30u /* read-only process-D sign observability */
+#define HB_CUSTOM_START_RELAY_AUTOTUNE              31u /* stage-2 firmware-clocked speed/position relay */
+#define HB_CUSTOM_GET_RELAY_AUTOTUNE                32u
+#define HB_CUSTOM_ABORT_RELAY_AUTOTUNE              33u
 #define HB_PLATFORM_SCHEMA 2u
 #define HB_DIAG_SCHEMA 4u
 #define HB_ISR_SCHEMA 3u
@@ -2563,9 +2566,15 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     }
     if (op == HB_CUSTOM_ARM_CURRENT_STEP) {
         uint8_t status=1u;uint32_t seq=0u;
-        if(n>=10u){int32_t si=0;const int32_t pre_ma=buffer_get_int32(d,&si);const int32_t step_ma=buffer_get_int32(d,&si);const uint8_t pre_n=d[si++],post_n=d[si++];
-            status=mcpwm_foc_step_test_arm((float)pre_ma*0.001f,(float)step_ma*0.001f,pre_n,post_n,second)?0u:2u;
-            mcpwm_foc_step_test_status_t st;mcpwm_foc_step_test_get(&st);seq=st.sequence;}
+        if(n>=10u){
+            int32_t si=0;const int32_t pre_ma=buffer_get_int32(d,&si);const int32_t step_ma=buffer_get_int32(d,&si);
+            const uint8_t pre_n=d[si++],post_n=d[si++];
+            const uint8_t axis_raw=(n>=11u)?d[si++]:0u;
+            const mcpwm_foc_step_axis_t axis=(axis_raw==1u)?MCPWM_FOC_STEP_AXIS_D:MCPWM_FOC_STEP_AXIS_Q;
+            if(axis_raw>1u)status=3u;
+            else status=mcpwm_foc_step_test_arm_axis((float)pre_ma*0.001f,(float)step_ma*0.001f,pre_n,post_n,second,axis)?0u:2u;
+            mcpwm_foc_step_test_status_t st;mcpwm_foc_step_test_get(&st);seq=st.sequence;
+        }
         uint8_t b[10]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,status,0,0,0,0};int32_t j=6;buffer_append_uint32(b,seq,&j);uart_send_payload(b,(uint16_t)j);return;
     }
     if (op == HB_CUSTOM_GET_STEP_STATUS) {
@@ -2584,6 +2593,35 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         b[j++]=pm?(uint8_t)pm->m_control_mode:0u;b[j++]=pm?pm->m_pos_pid_phase_mode:0u;
         b[j++]=pm?(pm->m_conf.foc_encoder_inverted?1u:0u):0u;b[j++]=pm?(pm->m_conf.m_invert_direction?1u:0u):0u;
         uart_send_payload(b,(uint16_t)j);return;
+    }
+
+    if (op == HB_CUSTOM_START_RELAY_AUTOTUNE) {
+        uint8_t status=1u;uint32_t seq=0u;
+        if(n>=16u){
+            int32_t si=0;const uint8_t mode=d[si++];
+            const int32_t target=buffer_get_int32(d,&si);const int32_t hyst=buffer_get_int32(d,&si);
+            const uint16_t relay_ma=buffer_get_uint16(d,&si);const uint8_t crossings=d[si++];
+            const uint32_t timeout_ms=buffer_get_uint32(d,&si);
+            if(mode<1u || mode>2u)status=3u;
+            else status=mcpwm_foc_relay_start((mcpwm_foc_relay_mode_t)mode,second,target,hyst,relay_ma,crossings,timeout_ms)?0u:2u;
+            mcpwm_foc_relay_status_t st;mcpwm_foc_relay_get(&st);seq=st.sequence;
+        }
+        uint8_t b[10]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,status,0,0,0,0};
+        int32_t j=6;buffer_append_uint32(b,seq,&j);uart_send_payload(b,(uint16_t)j);return;
+    }
+    if (op == HB_CUSTOM_GET_RELAY_AUTOTUNE) {
+        mcpwm_foc_relay_status_t st;mcpwm_foc_relay_get(&st);uint8_t b[56];int32_t j=0;
+        b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=0u;
+        buffer_append_uint32(b,st.sequence,&j);buffer_append_uint32(b,st.elapsed_ms,&j);buffer_append_uint32(b,st.period_sum_ms,&j);
+        buffer_append_int32(b,st.target,&j);buffer_append_int32(b,st.hysteresis,&j);buffer_append_int32(b,st.measurement,&j);
+        buffer_append_int32(b,st.minimum,&j);buffer_append_int32(b,st.maximum,&j);
+        buffer_append_uint16(b,st.relay_current_ma,&j);buffer_append_uint16(b,st.period_count,&j);
+        b[j++]=st.active;b[j++]=st.done;b[j++]=st.failed;b[j++]=st.mode;b[j++]=st.second;b[j++]=st.relay_positive;
+        b[j++]=st.crossings;b[j++]=st.required_crossings;uart_send_payload(b,(uint16_t)j);return;
+    }
+    if (op == HB_CUSTOM_ABORT_RELAY_AUTOTUNE) {
+        mcpwm_foc_relay_abort();uint8_t b[6]={COMM_CUSTOM_APP_DATA,HB_CUSTOM_MAGIC0,HB_CUSTOM_MAGIC1,HB_CUSTOM_VERSION,op,0u};
+        uart_send_payload(b,6u);return;
     }
 
     if (op == HB_CUSTOM_BOOT_HANDOFF) {

@@ -199,6 +199,9 @@ HB_GET_ADC_VALIDITY = 26
 HB_ARM_CURRENT_STEP = 27
 HB_GET_STEP_STATUS = 28
 HB_GET_POSITION_D_STATE = 30
+HB_START_RELAY_AUTOTUNE = 31
+HB_GET_RELAY_AUTOTUNE = 32
+HB_ABORT_RELAY_AUTOTUNE = 33
 HB_BOOT_HANDOFF = 29
 HB_PLATFORM_SCHEMA = 2
 HB_DIAG_SCHEMA = 4
@@ -1103,6 +1106,22 @@ class VescDual:
     def reset_position(self, right: bool = False) -> PositionState:
         return parse_position_state(self.custom_transact(HB_RESET_POSITION, right=right), HB_RESET_POSITION)
 
+    def steering_calibration(self) -> dict[str, int | float | bool | str]:
+        """Read LEFT sensor role plus steering calibration state without moving the motor."""
+        p=self.custom_transact(HB_GET_STEERING_CAL,right=False,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_STEERING_CAL)
+        if status or len(p)<39:
+            raise RuntimeError(f"steering_calibration status={status} len={len(p)}")
+        flags=p[6]; span,pos,target,deg_mdeg=struct.unpack_from(">iiii",p,7)
+        q=23; sensor_port,foc_sensor,encoder_configured,fault=p[q:q+4];q+=4
+        raw=struct.unpack_from(">I",p,q)[0];q+=4
+        safe_span,pos360_mdeg=struct.unpack_from(">ii",p,q)
+        role='encoder' if sensor_port==1 and foc_sensor in (1,8) else ('hall' if sensor_port==0 and foc_sensor==2 else 'unsupported')
+        return dict(role=role,sensor_port=sensor_port,foc_sensor=foc_sensor,calibrated=bool(flags&1),homed=bool(flags&2),
+                    encoder_synced=bool(flags&4),logical_inverted=bool(flags&8),encoder_configured=bool(encoder_configured),
+                    fault=fault,span=span,safe_span=safe_span,position=pos,target=target,steering_deg=deg_mdeg/1000.0,
+                    pos360_deg=pos360_mdeg/1000.0,encoder_raw=raw)
+
     def home_steering(self):
         """Bounded LEFT ABI startup alignment + persisted-span homing."""
         p=self.custom_transact(HB_STEERING_HOME,right=False,timeout=20.0)
@@ -1256,13 +1275,19 @@ class VescDual:
                "sector","window_valid","offset_valid","driven_offset_valid","bridge_settled")
         return dict(zip(names,vals))
 
-    def arm_current_step(self, pre_a: float, step_a: float, pre_samples: int = 8, post_samples: int = 24, right: bool = False) -> int:
+    def arm_current_step(self, pre_a: float, step_a: float, pre_samples: int = 8, post_samples: int = 24,
+                         right: bool = False, axis: str = "q") -> int:
         self.require_platform_compatible(require_build=True)
         if not (2<=pre_samples<40 and 2<=post_samples<40 and pre_samples+post_samples<=40):
             raise ValueError("step samples must each be 2..39 and total <= trace capacity 40")
-        data=struct.pack(">iiBB",round(pre_a*1000.0),round(step_a*1000.0),pre_samples,post_samples)
+        axis_l=axis.lower().strip()
+        if axis_l not in ("q","d"): raise ValueError("axis must be 'q' or 'd'")
+        base=struct.pack(">iiBB",round(pre_a*1000.0),round(step_a*1000.0),pre_samples,post_samples)
+        # Keep the legacy 10-byte Q-axis packet exactly unchanged. D-axis adds
+        # one optional selector byte understood by Stage-1-capable firmware.
+        data=base if axis_l=="q" else base+b"\x01"
         p=self.custom_transact(HB_ARM_CURRENT_STEP,data,right=right,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_ARM_CURRENT_STEP)
-        if status or len(p)!=10: raise RuntimeError(f"arm_current_step status={status} len={len(p)}")
+        if status or len(p)!=10: raise RuntimeError(f"arm_current_step axis={axis_l} status={status} len={len(p)}")
         return struct.unpack_from(">I",p,6)[0]
 
     def step_status(self, right: bool = False) -> dict[str, int]:
@@ -1278,6 +1303,33 @@ class VescDual:
         mode,phase_mode,enc_inv,motor_inv=struct.unpack_from(">4B",p,18)
         return dict(position=pos,target=target,dproc_q15=dproc,control_mode=mode,phase_mode=phase_mode,encoder_inverted=enc_inv,motor_inverted=motor_inv)
 
+    def start_relay_autotune(self, mode: str | int, target: int, hysteresis: int, relay_current_a: float,
+                             crossings: int = 10, timeout_s: float = 12.0, right: bool = False) -> int:
+        if isinstance(mode,str):
+            mode={"speed":1,"position":2}.get(mode.lower(),0)
+        if mode not in (1,2): raise ValueError("relay mode must be speed/position")
+        relay_ma=round(float(relay_current_a)*1000.0); timeout_ms=round(float(timeout_s)*1000.0)
+        if not 0<relay_ma<=65535 or not 0<timeout_ms<=0xffffffff: raise ValueError("relay current/timeout out of range")
+        data=struct.pack(">BiiHBI",mode,int(target),int(hysteresis),relay_ma,int(crossings),timeout_ms)
+        p=self.custom_transact(HB_START_RELAY_AUTOTUNE,data,right=right,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_START_RELAY_AUTOTUNE)
+        if status or len(p)!=10: raise RuntimeError(f"start_relay_autotune status={status} len={len(p)}")
+        return struct.unpack_from(">I",p,6)[0]
+
+    def relay_autotune_status(self, right: bool = False) -> dict[str,int]:
+        p=self.custom_transact(HB_GET_RELAY_AUTOTUNE,right=right,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_RELAY_AUTOTUNE)
+        if status or len(p)!=50: raise RuntimeError(f"relay_autotune_status status={status} len={len(p)}")
+        v=struct.unpack_from(">IIIiiiiiHH8B",p,6)
+        names=("sequence","elapsed_ms","period_sum_ms","target","hysteresis","measurement","minimum","maximum",
+               "relay_current_ma","period_count","active","done","failed","mode","second","relay_positive","crossings","required_crossings")
+        return dict(zip(names,v))
+
+    def abort_relay_autotune(self, right: bool = False) -> None:
+        p=self.custom_transact(HB_ABORT_RELAY_AUTOTUNE,right=right,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_ABORT_RELAY_AUTOTUNE)
+        if status: raise RuntimeError(f"abort_relay_autotune status={status}")
+
     def boot_handoff(self) -> None:
         p=self.custom_transact(HB_BOOT_HANDOFF,right=False,timeout=max(self.timeout,1.2));status=parse_custom_header(p,HB_BOOT_HANDOFF)
         if status: raise RuntimeError(f"boot_handoff status={status}")
@@ -1287,10 +1339,10 @@ class VescDual:
         return [self.trace_sample(i) for i in range(meta["count"])]
 
     def run_current_step(self, pre_a: float, step_a: float, pre_samples: int = 8,
-                         post_samples: int = 24, right: bool = False,
+                         post_samples: int = 24, right: bool = False, axis: str = "q",
                          timeout: float = 1.0) -> list[dict[str, int]]:
-        """Run one firmware-synchronized step and return the frozen raw trace."""
-        seq=self.arm_current_step(pre_a,step_a,pre_samples,post_samples,right)
+        """Run one firmware-synchronized D/Q current step and return the frozen raw trace."""
+        seq=self.arm_current_step(pre_a,step_a,pre_samples,post_samples,right,axis=axis)
         deadline=time.monotonic()+timeout
         st=None
         while time.monotonic()<deadline:

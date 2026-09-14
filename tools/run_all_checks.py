@@ -293,6 +293,7 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_comms_isr_isolation_stage2.py'])
     run([sys.executable,'tools/tests/host/test_stage2_production_gate.py'])
     run([sys.executable,'tools/tests/host/test_stage1_audit_hardening.py'])
+    run([sys.executable,'tools/tests/host/test_stage2_autotune.py'])
     run([sys.executable,'tools/tests/host/test_measurement_authority_hardening.py'])
     run([sys.executable,'tools/vesc_debug.py','selftest'])
     run([sys.executable,'tools/tests/host/test_hall_detect_algorithm.py'])

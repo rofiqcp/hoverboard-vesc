@@ -73,7 +73,7 @@ typedef struct {
     volatile uint32_t sequence;
     volatile int16_t pre_q4, step_q4;
     volatile uint8_t active, second, pre_remaining, post_remaining, step_fired, done;
-    volatile uint8_t settling;
+    volatile uint8_t settling, axis;
     volatile uint16_t settle_remaining;
 } foc_step_test_state_t;
 static foc_step_test_state_t s_foc_step_test={0};
@@ -254,6 +254,15 @@ static uint32_t s_outer_tick_remainder = 0u;
  * Jika main terlambat, dt aktual dipakai sekali; tidak ada virtual stale catch-up. */
 static uint32_t s_outer_pid_last_ms = 0u;
 static uint32_t s_outer_pid_last_cycle = 0u;
+typedef struct {
+    volatile uint32_t sequence;
+    volatile uint32_t start_ms, timeout_ms, period_sum_ms, last_upper_ms, last_lower_ms;
+    volatile int32_t target, hysteresis, measurement, minimum, maximum;
+    volatile int16_t relay_q4;
+    volatile uint16_t relay_current_ma, period_count;
+    volatile uint8_t active, done, failed, mode, second, relay_positive, crossings, required_crossings;
+} foc_relay_state_t;
+static foc_relay_state_t s_foc_relay={0};
 volatile uint32_t outer_control_max_cycles = 0u;
 volatile uint32_t outer_control_miss_count = 0u;
 volatile uint32_t outer_control_jitter_max_cycles = 0u;
@@ -4483,6 +4492,195 @@ static void motor_telemetry_non_isr(mcpwm_foc_motor_t *m, bool second, uint32_t 
     }
 }
 
+static int32_t relay_speed_erpm_now(const mcpwm_foc_motor_t *m, bool second) {
+    int64_t e=(int64_t)measured_mech_rpm_q16(m,second)*(int64_t)motor_pole_pairs(second);
+    e>>=16;
+    if(e>INT32_MAX)e=INT32_MAX;
+    if(e<INT32_MIN)e=INT32_MIN;
+    return (int32_t)e;
+}
+
+static int32_t relay_steering_mdeg_now(const mcpwm_foc_motor_t *m) {
+    const int32_t span=steering_safe_span_from_measured(m->m_steering_span_counts);
+    if(span==0)return 0;
+    int64_t x=(int64_t)m->m_position_counts*60000LL;
+    x/=span;
+    if(x>30000)x=30000;
+    if(x<-30000)x=-30000;
+    return (int32_t)x;
+}
+
+static int32_t relay_steering_iq_sign(const mcpwm_foc_motor_t *m) {
+    int32_t sign=steering_safe_span_from_measured(m->m_steering_span_counts)<0?-1:1;
+    if(position_error_sign(m,false)<0)sign=-sign;
+    if(m->m_conf.m_invert_direction)sign=-sign;
+    return sign;
+}
+
+static bool relay_hall_position_active(const mcpwm_foc_motor_t *m) {
+    return m && m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_HALL &&
+           m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_HALL;
+}
+
+static int32_t relay_hall_position_mdeg_now(const mcpwm_foc_motor_t *m, bool second) {
+    const uint16_t ph=position_feedback_phase_u16(m,second);
+    return (int32_t)(((uint32_t)ph*360000u+32768u)>>16);
+}
+
+static int32_t relay_angle_delta_mdeg(int32_t value,int32_t target) {
+    int32_t d=value-target;
+    while(d>180000)d-=360000;
+    while(d<=-180000)d+=360000;
+    return d;
+}
+
+static void relay_finish(uint8_t failed) {
+    if(!s_foc_relay.active)return;
+    const bool second=s_foc_relay.second!=0u;
+    s_foc_relay.active=0u;
+    s_foc_relay.done=1u;
+    s_foc_relay.failed=failed;
+    mcpwm_foc_release_motor(second);
+    mcpwm_foc_vesc_override_clear(second);
+}
+
+static void relay_apply_current(mcpwm_foc_motor_t *m, bool second) {
+    int32_t q=s_foc_relay.relay_positive?(int32_t)s_foc_relay.relay_q4:-(int32_t)s_foc_relay.relay_q4;
+    if(s_foc_relay.mode==MCPWM_FOC_RELAY_POSITION && !relay_hall_position_active(m))q*=relay_steering_iq_sign(m);
+    q=CLAMP(q,-MCCONF_MOTOR_CURRENT_MAX_Q4,MCCONF_MOTOR_CURRENT_MAX_Q4);
+    m->m_iq_target_q4=(int16_t)q;
+    m->m_iq_set_q4=(int16_t)q;
+    m->m_iq_set_ramp_q16=q*65536;
+    m->m_id_set_q4=0;
+    mcpwm_foc_vesc_override_touch(second);
+}
+
+static void relay_crossing(uint32_t now_ms, bool upper) {
+    const uint32_t last=upper?s_foc_relay.last_upper_ms:s_foc_relay.last_lower_ms;
+    s_foc_relay.crossings++;
+    if(last!=0u && s_foc_relay.crossings>=5u){
+        const uint32_t period=now_ms-last;
+        if(period>=20u && period<=5000u && s_foc_relay.period_count<UINT16_MAX){
+            s_foc_relay.period_sum_ms+=period;
+            s_foc_relay.period_count++;
+        }
+    }
+    if(upper)s_foc_relay.last_upper_ms=now_ms;else s_foc_relay.last_lower_ms=now_ms;
+    if(s_foc_relay.crossings==2u){
+        s_foc_relay.minimum=s_foc_relay.measurement;
+        s_foc_relay.maximum=s_foc_relay.measurement;
+    }
+}
+
+static void relay_process(uint32_t now_ms) {
+    if(!s_foc_relay.active)return;
+    const bool second=s_foc_relay.second!=0u;
+    mcpwm_foc_motor_t *m=second?&m_motor_2:&m_motor_1;
+    if(m->m_fault!=FAULT_CODE_NONE){relay_finish(1u);return;}
+    const uint32_t elapsed=now_ms-s_foc_relay.start_ms;
+    if(elapsed>=s_foc_relay.timeout_ms){relay_finish(2u);return;}
+
+    int32_t y;
+    if(s_foc_relay.mode==MCPWM_FOC_RELAY_SPEED){
+        y=relay_speed_erpm_now(m,second);
+        int64_t guard=(int64_t)(s_foc_relay.target<0?-s_foc_relay.target:s_foc_relay.target)+2000LL;
+        const int64_t h4=(int64_t)s_foc_relay.hysteresis*4LL;
+        if(h4>guard)guard=h4;
+        if(guard>(int64_t)MCCONF_L_MAX_ERPM)guard=(int64_t)MCCONF_L_MAX_ERPM;
+        if((int64_t)y>guard || (int64_t)y<-guard){relay_finish(3u);return;}
+    }else if(relay_hall_position_active(m)){
+        const int32_t raw=relay_hall_position_mdeg_now(m,second);
+        const int32_t d=relay_angle_delta_mdeg(raw,s_foc_relay.target);
+        y=s_foc_relay.target+d; /* continuous local coordinate around captured center */
+        int32_t ad=d<0?-d:d;
+        int32_t guard=s_foc_relay.hysteresis*6;if(guard<30000)guard=30000;
+        if(guard>120000)guard=120000;
+        if(ad>guard){relay_finish(4u);return;}
+    }else{
+        y=relay_steering_mdeg_now(m);
+        int32_t d=y-s_foc_relay.target;if(d<0)d=-d;
+        int32_t guard=s_foc_relay.hysteresis*6;if(guard<10000)guard=10000;
+        if(d>guard || y<-30000 || y>30000){relay_finish(4u);return;}
+    }
+    s_foc_relay.measurement=y;
+    if(s_foc_relay.crossings>=2u){
+        if(y<s_foc_relay.minimum)s_foc_relay.minimum=y;
+        if(y>s_foc_relay.maximum)s_foc_relay.maximum=y;
+    }
+
+    if(s_foc_relay.relay_positive){
+        if(y>=s_foc_relay.target+s_foc_relay.hysteresis){
+            s_foc_relay.relay_positive=0u;
+            relay_crossing(now_ms,true);
+        }
+    }else if(y<=s_foc_relay.target-s_foc_relay.hysteresis){
+        s_foc_relay.relay_positive=1u;
+        relay_crossing(now_ms,false);
+    }
+    if(s_foc_relay.crossings>=s_foc_relay.required_crossings && s_foc_relay.period_count>=4u){
+        relay_finish(0u);return;
+    }
+    relay_apply_current(m,second);
+}
+
+bool mcpwm_foc_relay_start(mcpwm_foc_relay_mode_t mode,bool second,int32_t target,
+                           int32_t hysteresis,uint16_t relay_current_ma,uint8_t required_crossings,
+                           uint32_t timeout_ms){
+    if(s_foc_relay.active || (mode!=MCPWM_FOC_RELAY_SPEED && mode!=MCPWM_FOC_RELAY_POSITION))return false;
+    if(hysteresis<=0 || relay_current_ma<100u || relay_current_ma>3000u ||
+       required_crossings<6u || required_crossings>14u || timeout_ms<2000u || timeout_ms>20000u)return false;
+    mcpwm_foc_motor_t *m=second?&m_motor_2:&m_motor_1;
+    if(m->m_fault!=FAULT_CODE_NONE)return false;
+    if(mode==MCPWM_FOC_RELAY_POSITION){
+        if(relay_hall_position_active(m)){
+            if(!hall_feedback_valid(m) || hysteresis>30000)return false;
+            /* Hall motors are free-rotating. Tune position around the current
+             * single-turn electrical angle; no steering span/home is relevant. */
+            target=relay_hall_position_mdeg_now(m,second);
+        }else{
+            if(second || !m->m_steering_calibrated || !m->m_steering_homed || !m->m_encoder_synced)return false;
+            if(target<-20000 || target>20000 || hysteresis>5000)return false;
+        }
+    }else if(target<=hysteresis || target>(int32_t)MCCONF_L_MAX_ERPM-1000 || hysteresis>2000)return false;
+
+    const uint32_t next_sequence=s_foc_relay.sequence+1u;
+    memset(&s_foc_relay,0,sizeof(s_foc_relay));
+    s_foc_relay.sequence=next_sequence;
+    s_foc_relay.mode=(uint8_t)mode;s_foc_relay.second=second?1u:0u;
+    s_foc_relay.target=target;s_foc_relay.hysteresis=hysteresis;
+    s_foc_relay.relay_current_ma=relay_current_ma;
+    s_foc_relay.relay_q4=amp_to_q4(m,(float)relay_current_ma*0.001f);
+    if(s_foc_relay.relay_q4<0)s_foc_relay.relay_q4=(int16_t)-s_foc_relay.relay_q4;
+    s_foc_relay.required_crossings=required_crossings;s_foc_relay.timeout_ms=timeout_ms;
+    s_foc_relay.start_ms=HAL_GetTick();s_foc_relay.relay_positive=1u;
+    s_foc_relay.measurement=(mode==MCPWM_FOC_RELAY_SPEED)?relay_speed_erpm_now(m,second):
+        (relay_hall_position_active(m)?relay_hall_position_mdeg_now(m,second):relay_steering_mdeg_now(m));
+    s_foc_relay.minimum=s_foc_relay.measurement;s_foc_relay.maximum=s_foc_relay.measurement;
+    set_control_mode(m,CONTROL_MODE_CURRENT);
+    relay_apply_current(m,second);
+    s_foc_relay.active=1u;
+    return true;
+}
+
+void mcpwm_foc_relay_abort(void){
+    if(s_foc_relay.active)relay_finish(9u);
+}
+
+void mcpwm_foc_relay_get(mcpwm_foc_relay_status_t *out){
+    if(!out)return;
+    FOC_MEMORY_BARRIER();
+    out->sequence=s_foc_relay.sequence;
+    out->elapsed_ms=HAL_GetTick()-s_foc_relay.start_ms;
+    out->period_sum_ms=s_foc_relay.period_sum_ms;
+    out->target=s_foc_relay.target;out->hysteresis=s_foc_relay.hysteresis;
+    out->measurement=s_foc_relay.measurement;out->minimum=s_foc_relay.minimum;out->maximum=s_foc_relay.maximum;
+    out->relay_current_ma=s_foc_relay.relay_current_ma;out->period_count=s_foc_relay.period_count;
+    out->active=s_foc_relay.active;out->done=s_foc_relay.done;out->failed=s_foc_relay.failed;
+    out->mode=s_foc_relay.mode;out->second=s_foc_relay.second;out->relay_positive=s_foc_relay.relay_positive;
+    out->crossings=s_foc_relay.crossings;out->required_crossings=s_foc_relay.required_crossings;
+    FOC_MEMORY_BARRIER();
+}
+
 void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
     const uint32_t cycle_start=DWT->CYCCNT;
     /* Finalisasi powered current-zero sesegera mungkin setelah jendela 80 ADC
@@ -4523,6 +4721,11 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
     if(m_motor_2.m_control_mode==CONTROL_MODE_POS ||
        m_motor_2.m_pos_pid_ang_div_inv_q16<64251u || m_motor_2.m_pos_pid_ang_div_inv_q16>66873u)
         position_feedback_update(&m_motor_2,m_motor_2.m_phase);
+
+    /* Stage-2 relay identification is clocked by this same fresh-feedback 1-kHz
+     * scheduler. UART only starts/observes the test; it never defines switching
+     * instants, so Ku/Pu are not contaminated by serial latency. */
+    relay_process(now_ms);
 
     mcpwm_foc_motor_t *motors[2]={&m_motor_1,&m_motor_2};
     for(uint8_t i=0u;i<2u;++i){
@@ -4701,7 +4904,9 @@ void mcpwm_foc_adc_int_handler(void) {
     bool step_capture=false,step_failed=false;
     if(step_slot){
         mcpwm_foc_motor_t *sm=s_foc_step_test.second?&m_motor_2:&m_motor_1;
-        if(sm->m_fault!=FAULT_CODE_NONE || sm->m_control_mode!=CONTROL_MODE_CURRENT){
+        const mc_control_mode step_mode=(s_foc_step_test.axis==MCPWM_FOC_STEP_AXIS_D)?
+            CONTROL_MODE_OPENLOOP_PHASE:CONTROL_MODE_CURRENT;
+        if(sm->m_fault!=FAULT_CODE_NONE || sm->m_control_mode!=step_mode){
             step_failed=true;
         }else if(s_foc_step_test.settling){
             const bool ready=sm->m_current_offset_valid && sm->m_driven_offset_valid &&
@@ -4726,8 +4931,15 @@ void mcpwm_foc_adc_int_handler(void) {
             if(s_foc_step_test.pre_remaining>0u){
                 s_foc_step_test.pre_remaining--;
             }else if(!s_foc_step_test.step_fired){
-                sm->m_iq_target_q4=s_foc_step_test.step_q4;sm->m_iq_set_q4=s_foc_step_test.step_q4;
-                sm->m_iq_set_ramp_q16=(int32_t)s_foc_step_test.step_q4*65536;
+                if(s_foc_step_test.axis==MCPWM_FOC_STEP_AXIS_D){
+                    sm->m_openloop_id_target_q4=s_foc_step_test.step_q4;
+                    sm->m_openloop_id_ramp_q16=(int32_t)s_foc_step_test.step_q4*65536;
+                    sm->m_id_set_q4=s_foc_step_test.step_q4;
+                    sm->m_iq_target_q4=0;sm->m_iq_set_q4=0;sm->m_iq_set_ramp_q16=0;
+                }else{
+                    sm->m_iq_target_q4=s_foc_step_test.step_q4;sm->m_iq_set_q4=s_foc_step_test.step_q4;
+                    sm->m_iq_set_ramp_q16=(int32_t)s_foc_step_test.step_q4*65536;
+                }
                 s_foc_step_test.step_fired=1u;s_foc_trace_event_latch|=1u<<3;
             }
         }
@@ -5416,20 +5628,34 @@ void mcpwm_foc_get_adc_sample_diag(bool second,mcpwm_foc_adc_sample_diag_t *out)
     if(!snapshot_ok){ memset(out,0,sizeof(*out)); out->window_valid=0u; }
 }
 
-bool mcpwm_foc_step_test_arm(float pre_a,float step_a,uint8_t pre_samples,uint8_t post_samples,bool second){
+bool mcpwm_foc_step_test_arm_axis(float pre_a,float step_a,uint8_t pre_samples,uint8_t post_samples,
+                                  bool second,mcpwm_foc_step_axis_t axis){
     mcpwm_foc_motor_t *m=second?&m_motor_2:&m_motor_1;
     const uint16_t requested=(uint16_t)pre_samples+(uint16_t)post_samples;
     if(s_foc_step_test.active || m->m_fault!=FAULT_CODE_NONE || pre_samples<2u || post_samples<2u ||
-       requested>MCPWM_FOC_TRACE_CAPACITY)return false;
+       requested>MCPWM_FOC_TRACE_CAPACITY || (axis!=MCPWM_FOC_STEP_AXIS_Q && axis!=MCPWM_FOC_STEP_AXIS_D))return false;
     const int16_t pre=amp_to_q4(m,pre_a), step=amp_to_q4(m,step_a);
     if(!mcpwm_foc_trace_clear())return false;
-    /* Command exactly the clamped value that is reported back in step_status. */
-    mcpwm_foc_set_current((float)pre/(float)FOC_CURRENT_Q4_PER_A,second);
+    /* Q-axis uses the normal VESC current command. D-axis commissioning locks
+     * the present electrical phase and steps Id with Iq=0, so the two PI axes
+     * can be validated independently without changing the runtime control law. */
+    if(axis==MCPWM_FOC_STEP_AXIS_D){
+        set_control_mode(m,CONTROL_MODE_OPENLOOP_PHASE);
+        m->m_phase_openloop=m->m_phase;m->m_phase_override=1u;
+        m->m_openloop_id_target_q4=pre;m->m_openloop_id_ramp_q16=(int32_t)pre*65536;m->m_id_set_q4=pre;
+        m->m_iq_target_q4=0;m->m_iq_set_q4=0;m->m_iq_set_ramp_q16=0;
+    }else{
+        mcpwm_foc_set_current((float)pre/(float)FOC_CURRENT_Q4_PER_A,second);
+    }
     mcpwm_foc_vesc_override_touch(second);
     s_foc_step_test.sequence++;s_foc_step_test.pre_q4=pre;s_foc_step_test.step_q4=step;s_foc_step_test.second=second?1u:0u;
-    s_foc_step_test.pre_remaining=pre_samples;s_foc_step_test.post_remaining=post_samples;s_foc_step_test.step_fired=0u;s_foc_step_test.done=0u;
-    s_foc_step_test.settling=1u;s_foc_step_test.settle_remaining=255u;
+    s_foc_step_test.axis=(uint8_t)axis;s_foc_step_test.pre_remaining=pre_samples;s_foc_step_test.post_remaining=post_samples;
+    s_foc_step_test.step_fired=0u;s_foc_step_test.done=0u;s_foc_step_test.settling=1u;s_foc_step_test.settle_remaining=255u;
     FOC_MEMORY_BARRIER();s_foc_step_test.active=1u;return true;
+}
+
+bool mcpwm_foc_step_test_arm(float pre_a,float step_a,uint8_t pre_samples,uint8_t post_samples,bool second){
+    return mcpwm_foc_step_test_arm_axis(pre_a,step_a,pre_samples,post_samples,second,MCPWM_FOC_STEP_AXIS_Q);
 }
 void mcpwm_foc_step_test_get(mcpwm_foc_step_test_status_t *out){
     if(!out)return;
