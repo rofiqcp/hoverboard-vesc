@@ -183,7 +183,6 @@ static uint8_t s_tx_frame[VESC_TX_QUEUE_DEPTH][VESC_MAX_FRAME];
 static uint16_t s_tx_len[VESC_TX_QUEUE_DEPTH];
 static uint8_t s_tx_head = 0u;
 static uint8_t s_tx_tail = 0u;
-static uint8_t s_tx_count = 0u;
 static uint8_t s_tx_active = 0u;
 static uint32_t s_tx_queue_drop = 0u;
 static uint32_t s_tx_queue_highwater = 0u;
@@ -343,7 +342,7 @@ void vesc_protocol_init(void) {
     s_fw_version_count = 0u;
     memset((void *)s_rt_cmd, 0, sizeof(s_rt_cmd));
     s_rt_cmd_coalesced = 0u;
-    s_tx_head = s_tx_tail = s_tx_count = s_tx_active = 0u;
+    s_tx_head = s_tx_tail = s_tx_active = 0u;
     memset(s_tx_len, 0, sizeof(s_tx_len));
     s_tx_queue_drop = 0u;
     s_tx_queue_highwater = 0u;
@@ -365,7 +364,7 @@ void vesc_protocol_transport_reset(void) {
     s_pending_head = s_pending_tail = s_pending_count = 0u;
     memset((void *)s_pending_len, 0, sizeof(s_pending_len));
     memset((void *)s_rt_cmd, 0, sizeof(s_rt_cmd));
-    s_tx_head = s_tx_tail = s_tx_count = s_tx_active = 0u;
+    s_tx_head = s_tx_tail = s_tx_active = 0u;
     memset(s_tx_len, 0, sizeof(s_tx_len));
     s_link_last_ms = 0u;
     s_openloop_test_active = 0u;
@@ -537,38 +536,51 @@ bool vesc_protocol_link_active(void) {
 uint32_t vesc_protocol_rx_ok_count(void) { return s_rx_ok; }
 uint32_t vesc_protocol_rx_crc_error_count(void) { return s_rx_crc_err; }
 
+static uint8_t vesc_tx_queue_count(void) {
+    const uint8_t head=s_tx_head, tail=s_tx_tail;
+    return head>=tail ? (uint8_t)(head-tail) :
+        (uint8_t)(VESC_TX_QUEUE_DEPTH-(uint8_t)(tail-head));
+}
+
 static void vesc_tx_service(void) {
-    /* Retire the slot only after DMA + UART shift register are fully done. */
+    /* Single-producer (main) / single-consumer (UART-TC ISR) ring. The slot at
+     * s_tx_tail remains owned by DMA until gState returns READY. Advancing the
+     * consumer from HAL_UART_TxCpltCallback starts the next queued VESC reply
+     * immediately instead of waiting up to one main-loop period. */
     if (s_tx_active) {
         if (huart3.gState != HAL_UART_STATE_READY) return;
         s_tx_active = 0u;
-        if (s_tx_count != 0u) {
+        if (s_tx_head != s_tx_tail) {
             s_tx_len[s_tx_tail] = 0u;
             s_tx_tail = (uint8_t)((s_tx_tail + 1u) % VESC_TX_QUEUE_DEPTH);
-            s_tx_count--;
         }
     }
-    if (s_tx_count == 0u || huart3.gState != HAL_UART_STATE_READY) return;
-    const uint8_t slot = s_tx_tail;
-    const uint16_t n = s_tx_len[slot];
-    if (n == 0u || n > VESC_MAX_FRAME) {
-        s_tx_tail = (uint8_t)((s_tx_tail + 1u) % VESC_TX_QUEUE_DEPTH);
-        s_tx_count--;
+    while (s_tx_head != s_tx_tail && huart3.gState == HAL_UART_STATE_READY) {
+        const uint8_t slot = s_tx_tail;
+        const uint16_t n = s_tx_len[slot];
+        if (n == 0u || n > VESC_MAX_FRAME) {
+            s_tx_len[slot]=0u;
+            s_tx_tail = (uint8_t)((s_tx_tail + 1u) % VESC_TX_QUEUE_DEPTH);
+            continue;
+        }
+        if (HAL_UART_Transmit_DMA(&huart3, s_tx_frame[slot], n) == HAL_OK) {
+            s_tx_active = 1u;
+        } else {
+            s_tx_start_fail++;
+        }
         return;
     }
-    if (HAL_UART_Transmit_DMA(&huart3, s_tx_frame[slot], n) == HAL_OK) {
-        s_tx_active = 1u;
-    } else {
-        /* Never block the control/main loop. Retry the same queued frame on the
-         * next service pass; a transient DMA busy state cannot starve RX. */
-        s_tx_start_fail++;
-    }
+}
+
+void vesc_protocol_tx_complete_isr(void) {
+    vesc_tx_service();
 }
 
 static void uart_send_payload(const uint8_t *payload, uint16_t len) {
     if (!payload || len == 0u || len > VESC_MAX_PAYLOAD) return;
     vesc_tx_service();
-    if (s_tx_count >= VESC_TX_QUEUE_DEPTH) {
+    const uint8_t next=(uint8_t)((s_tx_head+1u)%VESC_TX_QUEUE_DEPTH);
+    if (next == s_tx_tail) {
         s_tx_queue_drop++;
         return;
     }
@@ -590,9 +602,9 @@ static void uart_send_payload(const uint8_t *payload, uint16_t len) {
     tx[i++] = (uint8_t)crc;
     tx[i++] = 3u;
     s_tx_len[slot] = i;
-    s_tx_head = (uint8_t)((slot + 1u) % VESC_TX_QUEUE_DEPTH);
-    s_tx_count++;
-    if ((uint32_t)s_tx_count > s_tx_queue_highwater) s_tx_queue_highwater=s_tx_count;
+    s_tx_head = next;
+    const uint8_t queued=vesc_tx_queue_count();
+    if ((uint32_t)queued > s_tx_queue_highwater) s_tx_queue_highwater=queued;
     vesc_tx_service();
 }
 
@@ -619,15 +631,19 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
     const mcpwm_foc_motor_t *m = mcpwm_foc_get_motor_const(second);
     switch (mode) {
     case DISP_POS_MODE_OBSERVER:
-        /* Upstream VESC: mcpwm_foc_get_phase_observer(). This MUST be the
-         * independent flux observer, never the Encoder/Hall corrected m_phase. */
-        *out = mcpwm_foc_get_phase_observer_motor(second);
+        /* Observer and Hall share the same 0..360 electrical coordinate. At
+         * standstill the flux observer has no BEMF authority, so Hall axes fall
+         * back to the live Hall phase learned by Detect Hall. While observer
+         * state is valid, keep publishing the independent observer angle. */
+        if (mcpwm_foc_observer_valid(second)) *out=mcpwm_foc_get_phase_observer_motor(second);
+        else *out=(float)m->m_phase_hall*(360.0f/65536.0f);
         return true;
     case DISP_POS_MODE_ENCODER:
-        /* Upstream VESC: encoder_read_deg() = mechanical encoder angle. There
-         * is no phase/Hall fallback when an encoder is not configured. */
-        *out = (!second && m->m_encoder_configured) ?
-            mcpwm_foc_get_encoder_position_motor(false) : 0.0f;
+        /* Diagnostic convention for this dual controller: ABI shows mechanical
+         * encoder 0..360. A Hall-configured axis uses this same VESC Tool button
+         * to show m_phase_hall 0..360 from the detected/interpolated Hall table. */
+        if (!second && m->m_encoder_configured) *out=mcpwm_foc_get_encoder_position_motor(false);
+        else *out=(float)m->m_phase_hall*(360.0f/65536.0f);
         return true;
     case DISP_POS_MODE_PID_POS:
         /* Match COMM_GET_VALUES.position exactly. LEFT is a calibrated steering
@@ -685,7 +701,7 @@ void vesc_protocol_periodic(uint32_t now_ms) {
 #else
         const bool uart_tc=true;
 #endif
-        const bool tx_drained=(s_tx_count==0u)&&(s_tx_active==0u)&&(huart3.gState==HAL_UART_STATE_READY)&&uart_tc;
+        const bool tx_drained=(vesc_tx_queue_count()==0u)&&(s_tx_active==0u)&&(huart3.gState==HAL_UART_STATE_READY)&&uart_tc;
         if(tx_drained){s_boot_handoff_pending=0u;f103_fw_reset_to_bootloader();}
         if((int32_t)(now_ms-s_boot_handoff_deadline_ms)>=0){s_boot_handoff_pending=0u;}
     }
@@ -720,7 +736,7 @@ void vesc_protocol_periodic(uint32_t now_ms) {
      * saturated we simply retry the newest rotor sample on the next main-loop
      * pass instead of queueing stale positions. */
     vesc_tx_service();
-    if (s_tx_count >= (VESC_TX_QUEUE_DEPTH - 1u)) return;
+    if (vesc_tx_queue_count() >= (VESC_TX_QUEUE_DEPTH - 2u)) return;
     s_display_prev_ms = now_ms;
     const bool second = s_display_second != 0u;
     float pos = 0.0f;
@@ -2534,7 +2550,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         APPCH(s_rx_ok); APPCH(s_rx_crc_err); APPCH(s_rx_timeout_reset);
         APPCH(s_rx_queue_drop); APPCH(s_rx_queue_highwater); APPCH(s_rt_cmd_coalesced);
         APPCH(s_tx_queue_drop); APPCH(s_tx_start_fail); APPCH(s_tx_queue_highwater);
-        APPCH(s_process_gap_max_ms); APPCH(s_pending_count); APPCH(s_tx_count);
+        APPCH(s_process_gap_max_ms); APPCH(s_pending_count); APPCH(vesc_tx_queue_count());
         APPCH(s_tx_active); APPCH(s_rx_active);
 #ifdef STM32F103xE
         APPCH(usart3_rx_error_count()); APPCH(usart3_rx_restart_count()); APPCH(usart3_forced_recovery_count());
@@ -3068,7 +3084,7 @@ static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)
 
 static void terminal_help(void){
     terminal_send_text("Commands:\nREAD help fw status values encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all]\n");
-    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
+    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
     terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
 
@@ -3133,6 +3149,13 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
 
     if(!strcmp(a[0],"help")||!strcmp(a[0],"?")){terminal_help();return;}
     if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"%s FW6.00 id=%u role=%s sensor=%s\n",second?"motor_right":"motor_left",second?2u:1u,second?"drive":"steer",second?"Hall":(cc->m_sensor_port_mode==SENSOR_PORT_MODE_ABI?"ABI":"Hall"));terminal_send_text(o);return;}
+    if(!strcmp(a[0],"faults_clear")||!strcmp(a[0],"faults_reset")||!strcmp(a[0],"reset_faults")||
+       (!strcmp(a[0],"reset")&&ac>1&&!strcmp(a[1],"faults"))||
+       (!strcmp(a[0],"faults")&&ac>1&&(!strcmp(a[1],"clear")||!strcmp(a[1],"reset")))){
+        mcpwm_foc_clear_faults();
+        terminal_send_text("OK all motor faults reset; bridges remain released\n");
+        return;
+    }
     if(!strcmp(a[0],"status")||!strcmp(a[0],"values")||!strcmp(a[0],"faults")){terminal_values(second);return;}
     if(!strcmp(a[0],"encoder")||!strcmp(a[0],"enc")){
         if(second){terminal_send_text("RIGHT Hall-only\n");return;}int32_t sp=mcpwm_foc_steering_span_counts(),safe=mcpwm_foc_steering_safe_span_counts();

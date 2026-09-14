@@ -92,6 +92,7 @@ class LiveWorker:
         self.telemetry_enabled = self.telemetry_hz > 0
         self.active: dict[bool, tuple[str, float] | None] = {False: None, True: None}
         self.latest = {False: None, True: None}
+        self.status_text = "Telemetry waiting..."
         self.lock = threading.Lock()
         self.stop_evt = threading.Event()
         self.pause_evt = threading.Event()
@@ -101,6 +102,9 @@ class LiveWorker:
         # independent from motor activity, so idle/released motors remain live
         # on the realtime display without injecting a fake zero setpoint.
         self.alive_hz = 5.0
+        # Copyable telemetry log above the live toolbar. The toolbar refreshes
+        # independently; this slower burst keeps useful history without flooding.
+        self.burst_hz = 1.0
         self.thread = threading.Thread(target=self._run, daemon=True, name="vesc-tool-live")
         self.thread.start()
 
@@ -157,16 +161,10 @@ class LiveWorker:
             return None
         return float(item[1])
 
-    @staticmethod
-    def _fmt_setpoint(value: float | None, width: int, precision: int = 0) -> str:
-        if value is None:
-            return "-".rjust(width)
-        return f"{value:{width}.{precision}f}"
-
-    def telemetry_once(self, spec: str = "both") -> None:
+    def telemetry_once(self, spec: str = "both", emit: bool = True) -> None:
         selected = motors(spec)
         values = {}
-        for label, right in selected:
+        for _label, right in selected:
             v = self.link.values(right)
             self.latest[right] = v
             values[right] = v
@@ -176,47 +174,55 @@ class LiveWorker:
             right = values.get(True)
             if left is None or right is None:
                 return
-            set_pos = self._fmt_setpoint(self._commanded_value(False, "pos"), 7, 2)
-            set_erpm = self._fmt_setpoint(self._commanded_value(True, "rpm"), 7, 0)
+            set_pos = self._commanded_value(False, "pos")
+            set_erpm = self._commanded_value(True, "rpm")
+            lset = "-" if set_pos is None else f"{set_pos:.0f}"
+            rset = "-" if set_erpm is None else f"{set_erpm:.0f}"
             vin = (left.vin + right.vin) * 0.5
-            print(
-                f"[RT] "
-                f"L SETPOS={set_pos}deg GETPOS={left.position:7.2f}deg "
+            line = (
+                f"L={lset}/{left.position:.2f}deg "
                 f"Iq={left.iq:6.2f}A Id={left.id:6.2f}A "
                 f"Imot={left.current_motor:6.2f}A Ibat={left.current_in:6.2f}A || "
-                f"R SETERPM={set_erpm} GETERPM={right.rpm:7.0f} "
+                f"R={rset}/{right.rpm:.0f} "
                 f"Iq={right.iq:6.2f}A Id={right.id:6.2f}A "
                 f"Imot={right.current_motor:6.2f}A Ibat={right.current_in:6.2f}A || "
-                f"Vin={vin:5.1f}V",
-                flush=True,
-            )
-            return
-
-        label, right = selected[0]
-        v = values[right]
-        if right:
-            set_erpm = self._fmt_setpoint(self._commanded_value(True, "rpm"), 7, 0)
-            print(
-                f"[RT R] SETERPM={set_erpm} GETERPM={v.rpm:7.0f} "
-                f"Iq={v.iq:6.2f}A Id={v.id:6.2f}A "
-                f"Imot={v.current_motor:6.2f}A Ibat={v.current_in:6.2f}A || Vin={v.vin:5.1f}V",
-                flush=True,
+                f"Vin={vin:.1f}V"
             )
         else:
-            set_pos = self._fmt_setpoint(self._commanded_value(False, "pos"), 7, 2)
-            print(
-                f"[RT L] SETPOS={set_pos}deg GETPOS={v.position:7.2f}deg "
-                f"Iq={v.iq:6.2f}A Id={v.id:6.2f}A "
-                f"Imot={v.current_motor:6.2f}A Ibat={v.current_in:6.2f}A || Vin={v.vin:5.1f}V",
-                flush=True,
-            )
+            _label, right = selected[0]
+            v = values[right]
+            if right:
+                set_erpm = self._commanded_value(True, "rpm")
+                rset = "-" if set_erpm is None else f"{set_erpm:.0f}"
+                line = (
+                    f"R={rset}/{v.rpm:.0f} "
+                    f"Iq={v.iq:6.2f}A Id={v.id:6.2f}A "
+                    f"Imot={v.current_motor:6.2f}A Ibat={v.current_in:6.2f}A || Vin={v.vin:.1f}V"
+                )
+            else:
+                set_pos = self._commanded_value(False, "pos")
+                lset = "-" if set_pos is None else f"{set_pos:.0f}"
+                line = (
+                    f"L={lset}/{v.position:.2f}deg "
+                    f"Iq={v.iq:6.2f}A Id={v.id:6.2f}A "
+                    f"Imot={v.current_motor:6.2f}A Ibat={v.current_in:6.2f}A || Vin={v.vin:.1f}V"
+                )
+
+        with self.lock:
+            self.status_text = line
+        if emit:
+            print(line, flush=True)
+
+    def status_line(self) -> str:
+        with self.lock:
+            return self.status_text
 
     def _run(self) -> None:
-        next_cmd = next_tel = next_alive = time.monotonic()
+        next_cmd = next_tel = next_alive = next_burst = time.monotonic()
         while not self.stop_evt.is_set():
             if self.pause_evt.is_set():
                 self.stop_evt.wait(0.01)
-                next_cmd = next_tel = next_alive = time.monotonic()
+                next_cmd = next_tel = next_alive = next_burst = time.monotonic()
                 continue
             now = time.monotonic()
             try:
@@ -227,7 +233,13 @@ class LiveWorker:
                     self._send_active(); next_cmd = now + 1.0 / self.command_hz
                 with self.lock: tel_on, tel_hz = self.telemetry_enabled, self.telemetry_hz
                 if tel_on and tel_hz > 0 and now >= next_tel:
-                    self.telemetry_once("both"); next_tel = time.monotonic() + 1.0 / tel_hz
+                    self.telemetry_once("both", emit=False)
+                    next_tel = time.monotonic() + 1.0 / tel_hz
+                if tel_on and self.burst_hz > 0 and now >= next_burst:
+                    # Print the latest already-polled snapshot above prompt_toolkit.
+                    # Do not re-poll here: one UART telemetry transaction cadence stays authoritative.
+                    print(self.status_line(), flush=True)
+                    next_burst = now + 1.0 / self.burst_hz
             except Exception as exc:
                 if time.monotonic() - self.last_error > 1.0:
                     print(f"[RT WARN] {type(exc).__name__}: {exc}", flush=True); self.last_error = time.monotonic()
@@ -682,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--baud",type=int,default=DEFAULT_BAUD)
     ap.add_argument("--command-hz",type=float,default=50.0)
     ap.add_argument("--telemetry-hz",type=float,default=5.0)
+    ap.add_argument("--burst-hz",type=float,default=1.0, help="copyable telemetry lines above prompt (default: 1 Hz, 0=off)")
     ap.add_argument("--no-telemetry",action="store_true")
     ap.add_argument("--exec",dest="one_command",help="jalankan satu command lalu keluar")
     ap.add_argument("--selftest",action="store_true")
@@ -689,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest: return selftest()
     link=VescDual(args.port,args.baud,timeout=0.35)
     worker=LiveWorker(link,args.command_hz,0.0 if args.no_telemetry or args.one_command else args.telemetry_hz)
+    worker.burst_hz = 0.0 if args.no_telemetry or args.one_command else max(0.0, min(50.0, args.burst_hz))
     console=Console(link,worker)
     try:
         print("LEFT :",parse_fw(link.fw(False)))
@@ -697,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc: print("RIGHT: unavailable:",exc)
         if args.one_command:
             return 0 if console.execute(args.one_command) else 0
-        print("Interactive VESC CLI ready. Telemetry scrolls without destroying typed input. Type 'help'.")
+        print("Interactive VESC CLI ready. Live status stays fixed; copyable telemetry logs at 1 Hz above it. Type 'help'.")
         command_words = [
             "help","target","use","fw","scan","info","telemetry","values","diag","setup",
             "set","current","current_rel","rpm","duty","pos","brake","handbrake","stop","alive",
@@ -712,7 +726,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         with patch_stdout(raw=True):
             while True:
-                try: line=session.prompt(lambda: f"vesc[{console.target}]> ").strip()
+                try:
+                    line=session.prompt(
+                        lambda: f"vesc[{console.target}]> ",
+                        bottom_toolbar=worker.status_line,
+                        refresh_interval=0.2,
+                        wrap_lines=False,
+                    ).strip()
                 except (EOFError,KeyboardInterrupt): break
                 if not line: continue
                 try:

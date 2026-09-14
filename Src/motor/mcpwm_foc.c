@@ -2605,6 +2605,26 @@ void mcpwm_foc_release_motor(bool second) {
     m->m_state=MC_STATE_OFF;
 }
 
+void mcpwm_foc_clear_fault(bool second) {
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    /* A manual reset must never re-arm a bridge. Release first, then clear the
+     * transient fault latch and its qualification state. If the underlying
+     * condition still exists, the normal safety checks will fault again. */
+    mcpwm_foc_release_motor(second);
+    m->m_fault_recovery_ticks=0u;
+    m->m_wrong_voltage_integrator=0u;
+    m->m_overspeed_streak=0u;
+    m->m_phase_overcurrent_streak=0u;
+    FOC_MEMORY_BARRIER();
+    m->m_fault=FAULT_CODE_NONE;
+    m->m_state=MC_STATE_OFF;
+}
+
+void mcpwm_foc_clear_faults(void) {
+    mcpwm_foc_clear_fault(false);
+    mcpwm_foc_clear_fault(true);
+}
+
 bool mcpwm_foc_estop_active(void) {
     return s_estop_ticks != 0u;
 }
@@ -4213,18 +4233,10 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         (encoder_feedback_selected(m,second) ? m->m_encoder_synced : hall_feedback_valid(m));
     const bool inactive = !source_enabled || !feedback_ready ||
         m->m_fault!=FAULT_CODE_NONE || m->m_control_mode==CONTROL_MODE_NONE;
-    /* A released motor keeps Hall/encoder and passive-current telemetry live,
-     * but no closed-loop state needs to be reset on every 16-kHz frame. Release
-     * setters already reset PI/PID once on the mode transition. */
-    if (inactive && m->m_control_mode==CONTROL_MODE_NONE) {
-        m->m_state=MC_STATE_OFF;
-        m->m_current_in_counts=idc_counts; m->m_dq_sample_fresh=0u;
-        m->m_i_alpha_q4=0; m->m_i_beta_q4=0; m->m_id_q4=0; m->m_iq_q4=0;
-        m->m_vd=0; m->m_vq=0; m->m_duty_now_permille=0;
-        m->m_ccr_a=pwm_res/2u; m->m_ccr_b=pwm_res/2u; m->m_ccr_c=pwm_res/2u;
-        m->m_isr_count++;
-        return;
-    }
+    /* Released motors still need one Clarke/Park measurement on their normal
+     * regulator slot. i0/i1/idc already come from the separately calibrated
+     * high-impedance OFF baseline, so continue below until telemetry has been
+     * measured. The inactive branch after the transform keeps PWM/control off. */
     /* On the two non-regulator slots an inactive non-NONE mode has no current
      * transform or control state to update. */
     if (inactive && !control_update) {
@@ -4295,15 +4307,10 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
         m->m_speed_sat_hold=0; reset_position_pid(m);
         m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
         m->m_id_set_q4=0; m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0;
-        /* Saat bridge OFF, state kontrol harus benar-benar nol agar noise ADC
-         * tidak pernah masuk ke PI, current-circle, proteksi, atau integrator
-         * energi. Namun jalur telemetry tetap hidup: sebelum cabang ini, ADC
-         * sudah diproses memakai baseline high-impedance khusus OFF lalu masuk
-         * ke m_*_telem dan averaging window. Jangan hapus nilai telemetry itu.
-         * Dengan demikian VESC Tool tetap melihat Id/Iq/Imotor/Iin sensor nyata
-         * saat idle/coast, sementara aktuator tetap high-impedance dan aman. */
-        m->m_i_alpha_q4=0; m->m_i_beta_q4=0;
-        m->m_id_q4=0; m->m_iq_q4=0; m->m_current_in_counts=0;
+        /* Keep the just-measured OFF-state alpha/beta, Id/Iq and DC-link
+         * current available to telemetry. They are measurement-only because
+         * CONTROL_MODE_NONE, MOE=0, all current targets/integrators are zero,
+         * and protection explicitly requires a powered valid sample. */
         m->m_dq_sample_fresh=0u;
         m->m_vd=0; m->m_vq=0;
         m->m_pwm_a=0; m->m_pwm_b=0; m->m_pwm_c=0; m->m_duty_now_permille=0;
@@ -4508,12 +4515,10 @@ static void motor_telemetry_non_isr(mcpwm_foc_motor_t *m, bool second, uint32_t 
        (!bridge_on || m->m_driven_offset_calibrating || !m->m_driven_offset_valid || m->m_bridge_settle_ticks!=0u)){
         td=0; tq=0; ti=0;
     }else if(m->m_control_mode==CONTROL_MODE_NONE){
-        /* Released bridge: publish zero current. The low-side shunt amplifiers
-         * move to a different high-Z common-mode point when MOE=0; treating
-         * that level as motor current creates false 10..25 A spikes after
-         * release. Powered control/protection always uses the separately
-         * qualified driven-offset path above. */
-        td=0; tq=0; ti=0;
+        /* Bridge-OFF current is a real ADC measurement using m_off_offset*.
+         * Publish it only after the OFF baseline has settled; otherwise return
+         * zero during calibration. This telemetry path never feeds protection. */
+        if(!m->m_off_offset_valid || bridge_on){td=0; tq=0; ti=0;}
     }
     const uint16_t a=m->m_telem_current_filter_q16?m->m_telem_current_filter_q16:6553u;
     /* Jalankan virtual sample sebanyak cadence regulator yang berlalu agar
@@ -5867,12 +5872,8 @@ void mcpwm_foc_get_values_scaled(mcpwm_foc_values_scaled_t *v,bool second){
          * important across OFF<->RUN current-offset transitions. */
         id_q4=0; iq_q4=0; ibus_counts=0;
     }
-    {
-        const bool bridge_on_i=second ? ((RIGHT_TIM->BDTR&TIM_BDTR_MOE)!=0u) : ((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u);
-        const bool qualified=(is.control_mode!=CONTROL_MODE_NONE) && bridge_on_i &&
-            is.driven_offset_valid && !is.driven_offset_calibrating && is.bridge_settle_ticks==0u;
-        if(!qualified){id_q4=0; iq_q4=0; ibus_counts=0;}
-    }
+    /* Acquisition already qualifies powered and OFF-state current separately.
+     * Do not erase a valid bridge-OFF sample here. */
     const int32_t q4pa=(int32_t)FOC_CURRENT_Q4_PER_A;
     v->id_x100=((int32_t)id_q4*100)/q4pa;
     v->iq_x100=((int32_t)iq_q4*100)/q4pa;
@@ -5918,15 +5919,8 @@ void mcpwm_foc_get_values(mc_values *v,bool second){
     }else{
         id_q4=0; iq_q4=0; ibus_counts=0;
     }
-    {
-        const bool bridge_on_i=second ? ((RIGHT_TIM->BDTR&TIM_BDTR_MOE)!=0u) : ((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u);
-        /* Standard motor-current telemetry is meaningful only while the bridge
-         * is actively driven with a qualified powered offset. When released,
-         * report zero rather than a decaying/stale low-side-shunt snapshot. */
-        const bool qualified=(is.control_mode!=CONTROL_MODE_NONE) && bridge_on_i &&
-            is.driven_offset_valid && !is.driven_offset_calibrating && is.bridge_settle_ticks==0u;
-        if(!qualified){id_q4=0; iq_q4=0; ibus_counts=0;}
-    }
+    /* Same acquisition-qualified current as the fixed-point GET_VALUES path.
+     * OFF telemetry uses its own high-impedance baseline and is safe to expose. */
 
     const float vin=bus_voltage_now();
     v->v_in=vin;

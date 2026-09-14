@@ -38,6 +38,7 @@ static float set_duty[2];
 static float set_pos[2];
 static unsigned touch_count[2];
 static unsigned store_count[2];
+static unsigned clear_faults_count=0u;
 static bool store_ok=true, load_ok=true;
 static mc_configuration confs[2];
 static mcpwm_foc_motor_t diag_motors[2];
@@ -222,7 +223,8 @@ void mcpwm_foc_rl_capture_get(bool second,mcpwm_foc_rl_capture_t *o){
     o->sum_div=(int64_t)llround(b*(double)o->sum_di2);
 }
 void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
-void mcpwm_foc_release_motor(bool second) { (void)second; }
+void mcpwm_foc_release_motor(bool second) { diag_motors[second?1:0].m_control_mode=CONTROL_MODE_NONE; }
+void mcpwm_foc_clear_faults(void) { clear_faults_count++; diag_motors[0].m_fault=FAULT_CODE_NONE; diag_motors[1].m_fault=FAULT_CODE_NONE; diag_motors[0].m_control_mode=CONTROL_MODE_NONE; diag_motors[1].m_control_mode=CONTROL_MODE_NONE; }
 void mcpwm_foc_force_bridges_off(void) {
     diag_motors[0].m_control_mode=CONTROL_MODE_NONE;
     diag_motors[1].m_control_mode=CONTROL_MODE_NONE;
@@ -988,6 +990,16 @@ int main(void){
         uint8_t tf[]={COMM_FORWARD_CAN,2u,COMM_TERMINAL_CMD_SYNC,'f','w'};
         if(!transact(tf,sizeof(tf),r,&rn)||r[0]!=COMM_PRINT||rn<12u||memcmp(r+1,"motor_right",11u)!=0)
             return fail("terminal sync/right framing");
+        diag_motors[0].m_fault=FAULT_CODE_ABS_OVER_CURRENT;
+        diag_motors[1].m_fault=FAULT_CODE_UNDER_VOLTAGE;
+        diag_motors[0].m_control_mode=CONTROL_MODE_CURRENT;
+        diag_motors[1].m_control_mode=CONTROL_MODE_SPEED;
+        const unsigned cf0=clear_faults_count;
+        uint8_t tc[]={COMM_TERMINAL_CMD,'f','a','u','l','t','s','_','c','l','e','a','r'};
+        if(!transact(tc,sizeof(tc),r,&rn)||r[0]!=COMM_PRINT||clear_faults_count!=cf0+1u||
+           diag_motors[0].m_fault!=FAULT_CODE_NONE||diag_motors[1].m_fault!=FAULT_CODE_NONE||
+           diag_motors[0].m_control_mode!=CONTROL_MODE_NONE||diag_motors[1].m_control_mode!=CONTROL_MODE_NONE)
+            return fail("terminal all-fault reset/release contract");
     }
     {
         diag_motors[0].m_control_mode=CONTROL_MODE_CURRENT;

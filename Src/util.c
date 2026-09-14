@@ -80,6 +80,11 @@ void UART_EnableRxErrorRecovery(UART_HandleTypeDef *huart) {
   SET_BIT(huart->Instance->CR3, USART_CR3_EIE);
 }
 
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+  if (!huart || huart->Instance != USART3) return;
+  vesc_protocol_tx_complete_isr();
+}
+
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
   if (!huart || huart->Instance != USART3) return;
   ++usart3RxErrorCount;

@@ -65,18 +65,21 @@ assert (R/'tools/tests/hardware/test_hall_detect_repeat.py').exists()
 assert 'mcpwm_foc_vesc_override_clear(second)' in mc
 assert 'COMM_DETECT_HALL_FOC, 90.0)' in dual
 
-# Upstream VESC reports zero public motor-current telemetry while released.
-# Keep the separately calibrated high-Z/raw ADC path diagnostic-only.
+# Released bridge remains torque-free, but the separately calibrated high-Z
+# ADC path is intentionally published as measurement-only current telemetry.
 assert 'leftOffTelemValid' in mc and 'rightOffTelemValid' in mc and 'off_telem_deadband_counts' in mc
 assert 'm_id_telem_q4' in mc and 'm_current_in_telem_counts' in mc
 assert 'const bool inactive = !source_enabled || !feedback_ready ||' in mc
 assert 'if (inactive && !control_update)' in mc
+assert 'Released motors still need one Clarke/Park measurement' in mc
+assert 'if(!m->m_off_offset_valid || bridge_on){td=0; tq=0; ti=0;}' in mc
 idx=mc.index('if (inactive) {')
 off=mc[idx:mc.index('return;',idx)]
-for token in ('m->m_vd=0','m->m_vq=0','m->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=0'):
+for token in ('m->m_vd=0','m->m_vq=0','m->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=0',
+              'm->m_iq_set_q4=0','m->m_iq_target_q4=0','m->m_id_set_q4=0'):
     assert token in off, token
-for token in ('m->m_id_q4=0','m->m_iq_q4=0','m->m_current_in_counts=0'):
-    assert token in off, token
+for forbidden in ('m->m_id_q4=0','m->m_iq_q4=0','m->m_current_in_counts=0'):
+    assert forbidden not in off, forbidden
 
 # RX burst handling remains bounded and 16-deep. GET_VALUES stays strict request/reply;
 # the only standard unsolicited stream is COMM_ROTOR_POSITION after SET_DETECT,
@@ -159,12 +162,12 @@ assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_handbrake(current)
 dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
-assert 'Released bridge: publish zero current' in mc, 'standard OFF telemetry zero contract missing'
+assert 'Bridge-OFF current is a real ADC measurement' in mc, 'OFF current telemetry contract missing'
 assert 'steering_center_after_span_calibration' in mci, 'steering detect must have bounded midpoint finalizer'
 assert 'ok=mc_interface_store_configuration_motor(false);' in vp, 'Detect Encoder must persist detected ABI electrical config before success'
 assert 'MCCONF_STEERING_CENTER_TOL_COUNTS' in mci and 'steering_stage_set(0xE8u)' in mci, 'detect must fail closed when midpoint centering fails'
 assert 'mcpwm_foc_steering_rebase_center()' in mci, 'successful detect must rebase measured midpoint to logical zero'
-print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_zero=1 rx_fifo16=1 vesc_request_reply=1 hidden_brake_removed=1 std_pos=1 custom_count_cap=1 std_openloop=1')
+print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_live=1 rx_fifo16=1 vesc_request_reply=1 hidden_brake_removed=1 std_pos=1 custom_count_cap=1 std_openloop=1')
 
 assert 'MCCONF_STEERING_POS_MIN_DEG' in (R/'Src/motor/mcconf_default.h').read_text()
 assert '0 -> -30, 180 -> 0, 360 -> +30' in vp

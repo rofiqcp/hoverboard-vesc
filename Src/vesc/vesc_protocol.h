@@ -8,6 +8,7 @@ bool vesc_protocol_rx_byte(uint8_t byte);
 bool vesc_protocol_rx_in_progress(void);
 void vesc_protocol_process_pending(void);
 void vesc_protocol_periodic(uint32_t now_ms);
+void vesc_protocol_tx_complete_isr(void);
 bool vesc_protocol_link_active(void);
 uint32_t vesc_protocol_rx_ok_count(void);
 void vesc_protocol_set_probation(bool enabled);

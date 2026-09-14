@@ -440,6 +440,11 @@ bool mcpwm_foc_encoder_startup_align(bool is_second_motor);
 bool mcpwm_foc_encoder_is_synced(bool is_second_motor);
 bool mcpwm_foc_encoder_detect(float current, bool is_second_motor, float *offset, float *ratio, bool *inverted);
 void mcpwm_foc_release_motor(bool is_second_motor);
+/* Manual VESC-style fault reset. Outputs are released before the current
+ * per-motor fault latch is cleared. Persistent unsafe conditions are allowed
+ * to qualify and fault again normally. */
+void mcpwm_foc_clear_fault(bool is_second_motor);
+void mcpwm_foc_clear_faults(void);
 void mcpwm_foc_force_bridges_off(void);
 /* VESC COMM_MOTOR_ESTOP: hentikan kedua bridge dan abaikan perintah motor
  * selama duration_ms. Nilai 0 berarti release sekali tanpa hold tambahan. */
