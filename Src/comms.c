@@ -69,7 +69,7 @@ const parameter_entry params[] = {
     {PARAMETER,"CTRL_MOD",ADD_PARAM(ctrlModReqRaw),NULL,0,CTRL_MOD_REQ,0,1,5,0,0,0,NULL,"1 VLT 2 SPD 3 TRQ 4 sensorless Id 5 POS"},
     {PARAMETER,"MOT_RUN",ADD_PARAM(motorRunReq),NULL,0,1,0,0,1,0,0,0,NULL,"1 run, 0 stop request: VLT/TRQ release; SPD ramp-to-zero then release"},
     {PARAMETER,"SVPWM_RPM",ADD_PARAM(svpwmOpenloopRpm),NULL,0,SVPWM_OPENLOOP_RPM_DEFAULT,0,1,SVPWM_OPENLOOP_RPM_MAX,0,0,0,NULL,"Mode4 mechanical open-loop RPM"},
-    {PARAMETER,"L_CURRENT_MAX",ADD_PARAM(vescCurrentMaxA),NULL,1,I_MOT_MAX,1,1,I_MOT_MAX,0,0,0,applyVescCurrentMax,"VESC l_current_max ampere; hardware fixed-point ceiling 15 A"},
+    {PARAMETER,"L_CURRENT_MAX",ADD_PARAM(vescCurrentMaxA),NULL,1,I_MOT_MAX,1,1,I_MOT_MAX,0,0,0,applyVescCurrentMax,"VESC l_current_max ampere; hardware fixed-point ceiling 30 A"},
     {PARAMETER,"KPQ",UINT16_T,&m_motor_1.m_kpq_q11,&m_motor_2.m_kpq_q11,0,MCCONF_FOC_CURRENT_KP_Q11,0,0,65535,0,0,0,applyTuning,"FOC q Kp Q11"},
     {PARAMETER,"KIQ",UINT16_T,&m_motor_1.m_kiq_q16,&m_motor_2.m_kiq_q16,0,MCCONF_FOC_CURRENT_KI_Q16,0,0,65535,0,0,0,applyTuning,"FOC q Ki Q16"},
     {PARAMETER,"KPD",UINT16_T,&m_motor_1.m_kpd_q11,&m_motor_2.m_kpd_q11,0,MCCONF_FOC_ID_KP_Q11,0,0,65535,0,0,0,applyTuning,"FOC d Kp Q11"},

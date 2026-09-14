@@ -72,8 +72,8 @@ int main(void){
     ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
     legacy_sync();
     sim_isr_step(); sim_isr_step();
-    if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 left current target");
-    if(m_motor_2.m_iq_target_q4!=-MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 right current target");
+    if(m_motor_1.m_iq_target_q4!=m_motor_1.m_current_limit_q4)return fail("mode1 left current target");
+    if(m_motor_2.m_iq_target_q4!=-m_motor_2.m_current_limit_q4)return fail("mode1 right current target");
     if(abs(m_motor_1.m_vq)>1440 || abs(m_motor_2.m_vq)>1440)return fail("mode1 duty voltage ceiling");
     if(m_motor_1.m_vd!=0 || m_motor_2.m_vd!=0)return fail("mode1 Vd must be zero");
     mcpwm_foc_set_mode_command(VLT_MODE,0,false,SVPWM_OPENLOOP_RPM_DEFAULT,false);
@@ -313,7 +313,7 @@ int main(void){
     for(int i=0;i<32000;i++)sim_isr_step();
     if(m_motor_1.m_duty_set_permille!=1000)return fail("duty +1.0 command scaling");
     if(m_motor_1.m_duty_now_permille!=1000)return fail("duty +1.0 telemetry scaling");
-    if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("duty target must stay current-limited");
+    if(m_motor_1.m_iq_target_q4!=m_motor_1.m_current_limit_q4)return fail("duty target must stay current-limited");
     if(m_motor_1.m_ccr_a<110 || m_motor_1.m_ccr_a>1890 ||
        m_motor_1.m_ccr_b<110 || m_motor_1.m_ccr_b>1890 ||
        m_motor_1.m_ccr_c<110 || m_motor_1.m_ccr_c>1890)
@@ -347,13 +347,13 @@ int main(void){
         DMA1_Channel1_IRQHandler();
     }
     legacy_sync();
-    adc_buffer.rlA=950; /* raw reconstructed phase >20 A; intentionally ignored as direct ABS source */
+    adc_buffer.rlA=400; /* raw reconstructed phase >30 A; intentionally ignored as direct ABS source */
     m_motor_1.m_id_q4=0; m_motor_1.m_iq_q4=0; m_motor_1.m_dq_sample_fresh=1u; DMA1_Channel1_IRQHandler();
     if(m_motor_1.m_fault!=FAULT_CODE_NONE || m_motor_1.m_phase_overcurrent_streak!=0u)
         return fail("raw two-shunt phase glitch must not trip ABS");
     adc_buffer.rlA=adc_buffer.rlB=2000;
     for(int k=1;k<=3;k++){
-        m_motor_1.m_id_q4=(int16_t)(21*FOC_CURRENT_Q4_PER_A); m_motor_1.m_iq_q4=0; m_motor_1.m_dq_sample_fresh=1u;
+        m_motor_1.m_id_q4=(int16_t)((MCCONF_L_ABS_CURRENT_MAX+1.0f)*FOC_CURRENT_Q4_PER_A); m_motor_1.m_iq_q4=0; m_motor_1.m_dq_sample_fresh=1u;
         DMA1_Channel1_IRQHandler();
         if(k<3 && m_motor_1.m_fault!=FAULT_CODE_NONE)return fail("DQ ABS faulted before qualifier");
     }

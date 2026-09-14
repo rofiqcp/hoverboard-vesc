@@ -16,12 +16,12 @@ bool enc_abi_init(ABI_config_t *cfg) {
     __HAL_RCC_TIM4_CLK_ENABLE();
 
     GPIO_InitTypeDef io = {0};
-    /* Match the proven pre-VESC steering firmware electrical interface.
-     * The board already has external 2.2 kOhm pull-ups on ENC_A/ENC_B, so
-     * adding the STM32 weak pull-up is unnecessary and changes the exact
-     * input bias that was validated on hardware. */
+    /* Keep the ABI inputs biased high even if one external pull-up or connector
+     * contact is marginal. The STM32 weak pull-up is harmless in parallel with
+     * the board 2.2 kOhm pull-ups and prevents a floating channel from looking
+     * permanently low during startup alignment. */
     io.Mode = GPIO_MODE_INPUT;
-    io.Pull = GPIO_NOPULL;
+    io.Pull = GPIO_PULLUP;
     io.Speed = GPIO_SPEED_FREQ_LOW;
     io.Pin = cfg->A_pin;
     HAL_GPIO_Init(cfg->A_gpio, &io);

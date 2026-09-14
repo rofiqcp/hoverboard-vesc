@@ -101,12 +101,12 @@
 #define SVPWM_DC_LIMIT_A                  8u   /* DC-link chop threshold during mode 4 */
 
 /* Torque/current mode uses direct centiampere command semantics:
- *   cmd 50 = 0.50 A, cmd 100 = 1.00 A, cmd 1500 = 15.00 A.
+ *   cmd 50 = 0.50 A, cmd 100 = 1.00 A, cmd 3000 = 30.00 A.
  * STOP braking is therefore also specified in centiamperes.
  * 10 mechanical RPM prevents Hall-boundary brake hunting near zero speed. */
 #define TRQ_STOP_RPM_DEADBAND            10
 #define DIAG_ENA                 1
-#define I_MOT_MAX                15
+#define I_MOT_MAX                30
 #define I_DC_MAX                 17
 #define N_MOT_MAX                1000  /* legacy mechanical display range; bukan authority COMM_SET_RPM */
 #define FIELD_WEAK_ENA           0
@@ -120,11 +120,11 @@
 #define RATE                     480
 #define FILTER                   6553
 
-/* Independent signed motor commands over USART3. Mode 3 needs +/-1500 cA
- * to represent the full +/-15 A range; modes 1/2 are still saturated by their
+/* Independent signed motor commands over USART3. Mode 3 supports +/-3000 cA
+ * to represent the full +/-30 A hard motor-current range; modes 1/2 are still saturated by their
  * own generated-controller limits, while mode 4 clamps to +/-I_MOT_MAX A. */
-#define PRI_INPUT1               2, -1500, 0, 1500, 0
-#define PRI_INPUT2               2, -1500, 0, 1500, 0
+#define PRI_INPUT1               2, -3000, 0, 3000, 0
+#define PRI_INPUT2               2, -3000, 0, 3000, 0
 #define INPUTS_NR                1
 #define FLASH_WRITE_KEY          0x1002
 

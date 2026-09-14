@@ -78,8 +78,8 @@ int main(void){
     ctrlModReq=VLT_MODE; pwml=100; pwmr=-100;
     legacy_sync();
     sim_isr_step(); sim_isr_step();
-    if(m_motor_1.m_iq_target_q4!=MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 left current-limit target");
-    if(m_motor_2.m_iq_target_q4!=-MCCONF_MOTOR_CURRENT_MAX_Q4)return fail("mode1 right current-limit target");
+    if(m_motor_1.m_iq_target_q4!=m_motor_1.m_current_limit_q4)return fail("mode1 left current-limit target");
+    if(m_motor_2.m_iq_target_q4!=-m_motor_2.m_current_limit_q4)return fail("mode1 right current-limit target");
     if(abs(m_motor_1.m_vq)>1440 || abs(m_motor_2.m_vq)>1440)return fail("mode1 10pct modulation ceiling");
     if(m_motor_1.m_vd!=0 || m_motor_2.m_vd!=0)return fail("mode1 Id target must stay zero");
     mc_configuration duty_conf=m_motor_1.m_conf; duty_conf.l_current_max=2.0f; duty_conf.l_current_min=-2.0f;

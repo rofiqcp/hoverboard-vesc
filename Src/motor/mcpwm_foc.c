@@ -2198,6 +2198,17 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     if(!m->m_encoder_configured) encoder_runtime_configure(m,false,true);
     if(!m->m_encoder_configured){encoder_align_stage=0xE2u;return false;}
     encoder_align_stage=2u;
+#ifdef STM32F103xE
+    /* Every alignment attempt gets fresh A/B evidence. If one quadrature line
+     * is dead or disconnected, fail fast instead of escalating steering current
+     * for several seconds and starving the USART main-context parser. */
+    {
+        const uint32_t idr=GPIOB->IDR;
+        encoder_gpio_edge_a=0u; encoder_gpio_edge_b=0u; encoder_gpio_edge_pb5=0u; encoder_gpio_samples=0u;
+        encoder_gpio_last_ab=(uint8_t)(((idr & GPIO_PIN_6)?1u:0u) | ((idr & GPIO_PIN_7)?2u:0u));
+        encoder_gpio_last_pb5=(idr & GPIO_PIN_5)?1u:0u;
+    }
+#endif
 
     /* Incremental ABI has no absolute index. Lock the rotor to a known
      * electrical phase with D-axis current, but do not assume a fixed current
@@ -2279,6 +2290,16 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
         int32_t dp=(int32_t)probe-(int32_t)before;
         if(dp>half)dp-=(int32_t)counts; else if(dp<-half)dp+=(int32_t)counts;
         encoder_align_jog_delta=dp;
+#ifdef STM32F103xE
+        /* A valid quadrature move must exercise both A and B. Seeing repeated
+         * edges on only one input means the position/direction feedback is not
+         * trustworthy; never increase Id in that condition. */
+        if((encoder_gpio_edge_a>=4u && encoder_gpio_edge_b==0u) ||
+           (encoder_gpio_edge_b>=4u && encoder_gpio_edge_a==0u)){
+            encoder_align_stage=0xA2u;
+            goto align_fail;
+        }
+#endif
         for(int32_t t=59;t>=0;--t){
             mcpwm_foc_set_openloop_phase(current,60.0f*(float)t/60.0f,false);
             mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);

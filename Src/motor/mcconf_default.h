@@ -120,12 +120,13 @@
 #define MCCONF_POSITION_CURRENT_MAX_MA          600u /* custom count-position ceiling */
 #define MCCONF_POSITION_DAMP_CURRENT_MA         400u /* kinetic brake; below measured 0.6 A static breakaway */
 /* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps
- * mechanical RPM fixed-point, so 1500 ERPM/s / 15 pole-pairs = 100 RPM/s. */
-#define MCCONF_SPEED_RAMP_ERPMS_S             1500u
+ * mechanical RPM fixed-point. 20000 ERPM/s was selected from repeated 8000-ERPM
+ * hardware steps as the best response/stability compromise; still configurable. */
+#define MCCONF_SPEED_RAMP_ERPMS_S            20000u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
-#define MCCONF_L_ABS_CURRENT_MAX               20.0f /* hard phase fault, above 15A control limit */
+#define MCCONF_L_ABS_CURRENT_MAX               30.0f /* absolute hard phase-current ceiling; VESC Tool motor limit <=30A */
 #define MCCONF_PWM_MARGIN_COUNTS          FOC_PWM_MARGIN_COUNTS
 #define MCCONF_ABS_CURRENT_QUAL_SAMPLES           3u /* ~0.19 ms @16 kHz: reject transient D/Q spikes */
 /* Safety tambahan yang tetap ringan untuk Cortex-M3. Overspeed memakai Hall

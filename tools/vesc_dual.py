@@ -851,7 +851,7 @@ class VescDual:
                               resistance_ohm: float, inductance_h: float,
                               right: bool = False) -> float:
         """Non-persistent VESC open-loop flux measurement using an already qualified R/L model."""
-        if not (0.0<abs(current_a)<=15.0 and 50.0<=abs(erpm_per_sec)<=20000.0 and
+        if not (0.0<abs(current_a)<=30.0 and 50.0<=abs(erpm_per_sec)<=20000.0 and
                 0.0<abs(duty)<=1.0 and 0.0<resistance_ohm<=2.0 and 0.0<inductance_h<=0.1):
             raise ValueError("invalid flux measurement arguments")
         req=bytearray((COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,))
