@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Qualification-only 10x5 system campaign. Never changes or stores PID/FOC gains."""
 from __future__ import annotations
-import argparse,csv,json,math,statistics,time
+import sys
 from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import argparse,json,statistics,time
+from vesc_common import u32_delta
 from vesc_dual import VescDual
-def d32(a,b): return (b-a)&0xffffffff
 CASES=[(180.0,1000),(180.0,-1000),(120.0,2000),(240.0,-2000),(60.0,4000),(300.0,-4000),(0.0,6000),(360.0,-6000),(90.0,8000),(270.0,-8000)]
 
 def stop(link):
@@ -21,7 +26,7 @@ def run_case(link,idx,rep,pos,rpm,hold,dt):
     while time.monotonic()-start<hold:
         link.set_pos_one(pos,False); link.set_rpm_one(rpm,True)
         vl=link.values(False); vr=link.values(True); pl=link.isr_profile(False)
-        dma_delta=d32(p0['dma_tc_pending_exit'],pl['dma_tc_pending_exit'])
+        dma_delta=u32_delta(p0['dma_tc_pending_exit'],pl['dma_tc_pending_exit'])
         rows.append(dict(t=time.monotonic()-t0,pos=vl.position,pos_target=pos,rpm=vr.rpm,rpm_target=rpm,left_i=vl.current_motor,right_i=vr.current_motor,left_iq=vl.iq,right_iq=vr.iq,left_fault=vl.fault,right_fault=vr.fault,isr_max=pl['total_max'],deadline_miss=pl['deadline_miss'],dma_pending=dma_delta))
         if vl.fault or vr.fault or pl['deadline_miss'] or dma_delta: break
         time.sleep(dt)
@@ -34,7 +39,7 @@ def run_case(link,idx,rep,pos,rpm,hold,dt):
     return {"case":idx,"repeat":rep,"pos_target":pos,"rpm_target":rpm,"pass":ok,"steady_pos_abs_error":pe,"steady_rpm_abs_error":re,"peak_motor_current":peak,"samples":rows}
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--arm',action='store_true'); ap.add_argument('--repeat',type=int,default=5); ap.add_argument('--hold',type=float,default=2.0); ap.add_argument('--dt',type=float,default=.04); ap.add_argument('--output',default='/home/otomasi/agv/data/esc/qualification_10x5_latest.json'); a=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--arm',action='store_true'); ap.add_argument('--repeat',type=int,default=5); ap.add_argument('--hold',type=float,default=2.0); ap.add_argument('--dt',type=float,default=.04); ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/qualification_10x5_latest.json')); a=ap.parse_args()
     if not a.arm: raise SystemExit('ARM_REQUIRED: 10x5 moves both motors')
     if a.repeat!=5: raise SystemExit('--repeat must remain 5 for the production 10x5 gate')
     link=VescDual(a.port,115200,timeout=1.0); result={"runs":[]}

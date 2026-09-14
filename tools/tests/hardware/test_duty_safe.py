@@ -4,6 +4,7 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+
 import argparse, time, statistics
 from vesc_dual import VescDual, COMM_SET_DUTY
 from vesc_debug import send_one, release_one

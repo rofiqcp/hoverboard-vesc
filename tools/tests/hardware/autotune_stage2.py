@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """Sensor-aware Stage-2 autotune: Hall=>SPEED+POSITION, LEFT ABI=>steering POSITION."""
 from __future__ import annotations
+import sys
+from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
 import argparse,json,math,statistics,time
 from dataclasses import replace
-from pathlib import Path
+from vesc_common import u32_delta, quantize_u16, tuning_key
 from vesc_dual import VescDual,Tuning
 
 Q4_PER_A=800.0; SPEED_SCALE=100000; POS_SCALE=1000
 
-def q(v,s): return max(0,min(65535,round(float(v)*s)))
-def d32(a,b): return (int(b)-int(a))&0xffffffff
 def wrap_deg(x): return float(x)%360.0
 def angle_error(target,actual): return (float(target)-float(actual)+180.0)%360.0-180.0
-def gain_key(t): return (t.kpq,t.kiq,t.kpd,t.kid,t.kps,t.kis,t.kds,t.kpp,t.kip,t.kdp,t.telem_filter_q16)
 
 def apply_stage1_foc(orig:Tuning,best:dict)->Tuning:
     t=best.get('tuning',{}); req=('foc_q_kp','foc_q_ki','foc_d_kp','foc_d_ki')
     if any(k not in t for k in req): raise RuntimeError('stage1 winner missing physical FOC gains')
-    return replace(orig,kpq=q(t['foc_q_kp'],1536),kiq=q(t['foc_q_ki'],4.608),kpd=q(t['foc_d_kp'],1536),kid=q(t['foc_d_ki'],4.608))
+    return replace(orig,kpq=quantize_u16(t['foc_q_kp'],1536),kiq=quantize_u16(t['foc_q_ki'],4.608),kpd=quantize_u16(t['foc_d_kp'],1536),kid=quantize_u16(t['foc_d_ki'],4.608))
 
 def tune_speed(base:Tuning,kp,ki,kd=0.0)->Tuning:
-    return replace(base,kps=q(kp,SPEED_SCALE),kis=q(ki,SPEED_SCALE),kds=q(kd,SPEED_SCALE))
+    return replace(base,kps=quantize_u16(kp,SPEED_SCALE),kis=quantize_u16(ki,SPEED_SCALE),kds=quantize_u16(kd,SPEED_SCALE))
 def tune_pos(base:Tuning,kp,ki,kd)->Tuning:
-    return replace(base,kpp=q(kp,POS_SCALE),kip=q(ki,POS_SCALE),kdp=q(kd,POS_SCALE))
+    return replace(base,kpp=quantize_u16(kp,POS_SCALE),kip=quantize_u16(ki,POS_SCALE),kdp=quantize_u16(kd,POS_SCALE))
 
 def relay_identify(link,mode,right,target,hyst,current_a,crossings,timeout_s,max_isr):
     p0=link.isr_profile(reset=True); seq=link.start_relay_autotune(mode,target,hyst,current_a,crossings,timeout_s,right)
@@ -36,7 +39,7 @@ def relay_identify(link,mode,right,target,hyst,current_a,crossings,timeout_s,max
         try: link.abort_relay_autotune(right)
         except Exception: pass
         raise RuntimeError(f'{mode}: relay timeout status={st}')
-    prof=link.isr_profile(False); dma=d32(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
+    prof=link.isr_profile(False); dma=u32_delta(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
     if st['failed']: raise RuntimeError(f'{mode}: firmware fail={st["failed"]} status={st}')
     if st['period_count']<4 or st['maximum']<=st['minimum']: raise RuntimeError(f'{mode}: insufficient oscillation {st}')
     if prof['deadline_miss'] or dma or prof['slot_sequence_errors'] or prof['total_max']>=max_isr:
@@ -55,7 +58,7 @@ def position_seed(st,pu,current_limit_a):
 
 def sample_speed_candidate(link,tune,right,points,hold_s,dt=.05):
     got=link.set_tuning(tune,right,store=False)
-    if gain_key(got)!=gain_key(tune): raise RuntimeError('speed candidate readback mismatch')
+    if tuning_key(got)!=tuning_key(tune): raise RuntimeError('speed candidate readback mismatch')
     segs=[]; abort=''
     try:
         for target in points:
@@ -84,7 +87,7 @@ def sample_speed_candidate(link,tune,right,points,hold_s,dt=.05):
 
 def sample_encoder_position(link,tune,points,hold_s,dt=.05):
     got=link.set_tuning(tune,False,store=False)
-    if gain_key(got)!=gain_key(tune): raise RuntimeError('encoder position candidate readback mismatch')
+    if tuning_key(got)!=tuning_key(tune): raise RuntimeError('encoder position candidate readback mismatch')
     segs=[]; abort=''
     try:
         for target in points:
@@ -112,7 +115,7 @@ def sample_encoder_position(link,tune,points,hold_s,dt=.05):
 
 def sample_hall_position(link,tune,right,offsets,hold_s,dt=.05):
     got=link.set_tuning(tune,right,store=False)
-    if gain_key(got)!=gain_key(tune): raise RuntimeError('Hall position candidate readback mismatch')
+    if tuning_key(got)!=tuning_key(tune): raise RuntimeError('Hall position candidate readback mismatch')
     center=wrap_deg(link.values(right).position);segs=[];abort=''
     try:
         for off in offsets:
@@ -139,7 +142,7 @@ def sample_hall_position(link,tune,right,offsets,hold_s,dt=.05):
     return {'pass_':ok,'score':score,'center_deg':center,'segments':segs}
 
 def timing_gate(link,p0,max_isr):
-    prof=link.isr_profile(False);dma=d32(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
+    prof=link.isr_profile(False);dma=u32_delta(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
     ok=not(prof['deadline_miss'] or dma or prof['slot_sequence_errors'] or prof['total_max']>=max_isr)
     return ok,prof,dma
 
@@ -181,7 +184,7 @@ def combined_role_gate(link,left_role,final,max_isr,hold=.8):
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('port',nargs='?',default='auto');ap.add_argument('--arm',action='store_true')
-    ap.add_argument('--stage1',default='/home/otomasi/agv/data/esc/stage1/foc_tuning.json');ap.add_argument('--output',default='/home/otomasi/agv/data/esc/stage2/autotune.json')
+    ap.add_argument('--stage1',default=str(TOOLS_DIR.parent.parent / 'data/esc/stage1/foc_tuning.json'));ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/stage2/autotune.json'))
     ap.add_argument('--speed-target-erpm',type=int,default=1500);ap.add_argument('--speed-hysteresis-erpm',type=int,default=150);ap.add_argument('--speed-relay-a',type=float,default=.8)
     ap.add_argument('--position-hysteresis-deg',type=float,default=1.5);ap.add_argument('--position-relay-a',type=float,default=.6);ap.add_argument('--position-current-limit-a',type=float,default=5.0)
     ap.add_argument('--crossings',type=int,default=10);ap.add_argument('--relay-timeout-s',type=float,default=12.0);ap.add_argument('--candidate-hold-s',type=float,default=1.4)

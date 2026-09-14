@@ -4,6 +4,7 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+
 """Hardware RT-data audit matching VESC Tool COMM_GET_VALUES parser semantics."""
 import argparse, math, statistics, struct, sys, time
 from dataclasses import dataclass
@@ -74,7 +75,9 @@ class Link:
     def __init__(self,port,baud=115200,timeout=.06):
         self.ser=open_transport(port,baud,timeout=.001); self.timeout=timeout; self.dec=PacketDecoder()
         self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
-    def close(self): self.ser.close()
+    def close(self):
+        if self.ser.is_open:
+            self.ser.close()
     @staticmethod
     def fwd(p): return bytes((COMM_FORWARD_CAN,RIGHT_ID))+p
     def send(self,p,right=False):

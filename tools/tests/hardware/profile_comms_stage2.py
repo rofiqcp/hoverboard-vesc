@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+import sys
+from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
 import argparse, time
+from vesc_common import u32_delta
 from vesc_dual import VescDual, parse_fw
 
 PROFILE_REV=0x00030000
 
-def d32(a,b): return (b-a)&0xffffffff
 
 def main():
     ap=argparse.ArgumentParser(description='Read-only Stage-2 communications/ISR stress acceptance')
@@ -27,8 +33,8 @@ def main():
             if rem>0: time.sleep(rem)
         elapsed=time.monotonic()-start
         h1=link.comms_health(); p1=link.isr_profile(False)
-        dp={k:d32(p0[k],p1[k]) for k in ('deadline_miss','dma_tc_pending_exit','irq_entry','irq_exit')}
-        dh={k:d32(h0[k],h1[k]) for k in ('rx_queue_drop','tx_queue_drop','tx_start_fail','uart_rx_error','uart_rx_restart','uart_forced_recovery')}
+        dp={k:u32_delta(p0[k],p1[k]) for k in ('deadline_miss','dma_tc_pending_exit','irq_entry','irq_exit')}
+        dh={k:u32_delta(h0[k],h1[k]) for k in ('rx_queue_drop','tx_queue_drop','tx_start_fail','uart_rx_error','uart_rx_restart','uart_forced_recovery')}
         freq=(dp['irq_entry']/elapsed) if elapsed>0 else 0.0
         achieved=pairs/elapsed if elapsed>0 else 0.0
         checks={

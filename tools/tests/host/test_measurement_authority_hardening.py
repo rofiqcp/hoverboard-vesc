@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 from pathlib import Path
+from _test_utils import read_source
 R=Path(__file__).resolve().parents[3]
-def text(rel): return (R/rel).read_text(errors='ignore')
-mc=text('Src/motor/mcpwm_foc.c')
-vp=text('Src/vesc/vesc_protocol.c')
-dual=text('tools/vesc_dual.py')
-tuner=text('tools/tune_foc_staged.py')
-ctrl=text('tools/qualify_control_modes.py')
-posd=text('tools/qualify_position_process_d.py')
-campaign=text('tools/tuning_campaign_10x5.py')
-model=text('tools/qualify_motor_model.py')
-main=text('Src/main.c'); boot=text('Src/bootloader/main.c')
+mc=read_source(R, 'Src/motor/mcpwm_foc.c')
+vp=read_source(R, 'Src/vesc/vesc_protocol.c')
+dual=read_source(R, 'tools/vesc_dual.py')
+tuner=read_source(R, 'tools/tests/hardware/tune_foc_staged.py')
+ctrl=read_source(R, 'tools/tests/hardware/qualify_control_modes.py')
+posd=read_source(R, 'tools/tests/hardware/qualify_position_process_d.py')
+campaign=read_source(R, 'tools/tests/hardware/tuning_campaign_10x5.py')
+model=read_source(R, 'tools/tests/hardware/qualify_motor_model.py')
+main=read_source(R, 'Src/main.c'); boot=read_source(R, 'Src/bootloader/main.c')
 
 # Step trace is capacity-safe and begins only after powered-offset/current sampling settles.
 assert 'requested>MCPWM_FOC_TRACE_CAPACITY' in mc
@@ -31,8 +31,8 @@ assert 't->isr_cycles=0u' in capture and 's_foc_trace_cycle_pending=1u' in captu
 
 # Monotonic DMA evidence is always checked as a per-run delta.
 for name,src in [('tuner',tuner),('control',ctrl),('position_d',posd),('10x5',campaign)]:
-    assert 'def d32(' in src, name
-    assert "dma_tc_pending_exit" in src and 'd32(' in src, name
+    assert 'from vesc_common import' in src and 'u32_delta' in src, name
+    assert "dma_tc_pending_exit" in src and 'u32_delta(' in src, name
 assert 'dma_tc_pending_exit_delta' in tuner
 
 # Tuning is authority-safe: actual clamped step, signed-step metric, rollback, delayed persistence.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 R=next(p for p in Path(__file__).resolve().parents if (p/'platformio.ini').exists())
-mc=(R/'Src/motor/mcpwm_foc.c').read_text();mh=(R/'Src/motor/mcpwm_foc.h').read_text();vp=(R/'Src/vesc/vesc_protocol.c').read_text();dual=(R/'tools/vesc_dual.py').read_text();stage=(R/'tools/autotune_stage2.py').read_text()
+mc=(R/'Src/motor/mcpwm_foc.c').read_text();mh=(R/'Src/motor/mcpwm_foc.h').read_text();vp=(R/'Src/vesc/vesc_protocol.c').read_text();dual=(R/'tools/vesc_dual.py').read_text();stage=(R/'tools/tests/hardware/autotune_stage2.py').read_text()
 assert 'MCPWM_FOC_RELAY_SPEED = 1u' in mh and 'MCPWM_FOC_RELAY_POSITION = 2u' in mh
 outer=mc[mc.index('void mcpwm_foc_outer_control_non_isr'):mc.index('void mcpwm_foc_housekeeping_non_isr')]
 assert 'relay_process(now_ms);' in outer and outer.index('relay_process(now_ms);') < outer.index('mcpwm_foc_motor_t *motors[2]')

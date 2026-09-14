@@ -9,7 +9,7 @@ vp=(R/'Src/vesc/vesc_protocol.c').read_text()
 main=(R/'Src/main.c').read_text()
 com=(R/'Src/comms.c').read_text()
 dual=(R/'tools/vesc_dual.py').read_text()
-dbg=(R/'tools/vesc_debug.py').read_text()
+dbg=(R/'tools/vesc_tool.py').read_text()
 halltest=(R/'tools/tests/host/test_hall_detect_algorithm.c').read_text()
 
 # 50 ERPM must survive Hall timeout and retain fractional mechanical target.
@@ -75,9 +75,9 @@ assert 'Commands::setPos VESC Tool: signed degree value x1e6, tanpa client clamp
 assert 'def set_position_limits(' in dual and 'def set_position_counts(' in dual
 
 # Complete hardware diagnostic tool includes 3A, 50 ERPM, Hall, RT 50Hz and position tests.
-for token in ('0.2 A / 0.3 s','+750 ERPM / 2 s','rt --motor both --hz 50',
-              'hall --motor left --amps 1.0','pos-limits','pos-count','CURRENT_COMMAND_PATH_PASS',
-              'RESULT: PASS realtime polling'):
+for token in ('telemetry on [Hz]','detect hall A [target] [store]','poscount limits MIN MAX',
+              'set current A [A_R] [target]','set rpm ERPM [ERPM_R] [target]',
+              'COMM_SET_CURRENT','COMM_SET_RPM','HALL_PHASE_PASS'):
     assert token in dbg, token
-assert 'DEFAULT_HZ = 50.0' in dbg
+assert 'command_hz: float = 50.0' in dbg
 print('V15_FEATURE_STATIC_PASS safe_current=1 rpm750=1 speed_iq_cascade=1 rt50=1 hall_isr_sweep=1 pos_int32=1 live_toggle=removed fw600_exact=1')

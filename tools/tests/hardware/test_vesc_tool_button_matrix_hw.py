@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Hardware matrix for non-energizing VESC Tool 6.00 button/protocol behavior."""
-import argparse, hashlib, sys, time
+import sys
 from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import argparse, hashlib, sys, time
 TOOLS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TOOLS))
 from vesc_dual import COMM_FW_VERSION, VescDual, parse_fw

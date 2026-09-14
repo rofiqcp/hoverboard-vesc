@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 import importlib.util,os,struct,tempfile,types
 from pathlib import Path
+from _test_utils import unframe
 R=Path(__file__).resolve().parents[3]
 spec=importlib.util.spec_from_file_location('upl',R/'tools/pio_vesc_upload.py'); upl=importlib.util.module_from_spec(spec); spec.loader.exec_module(upl)
-def unframe(raw):
-    h=2 if raw[0]==2 else 3; n=raw[1] if h==2 else (raw[1]<<8)|raw[2]; return raw[h:h+n]
 class Fake:
     def __init__(self,old):
         self.args=types.SimpleNamespace(transport='serial',serial_port='/dev/mock',baud=115200,fault_stop_after=0)

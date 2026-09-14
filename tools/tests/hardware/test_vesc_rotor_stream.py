@@ -1,50 +1,89 @@
 #!/usr/bin/env python3
+"""Hardware check for VESC COMM_SET_DETECT -> 100 Hz COMM_ROTOR_POSITION."""
+from __future__ import annotations
+
+import argparse
+import statistics
 import sys
+import time
 from pathlib import Path
-TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == "tools")
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-"""Hardware check for VESC COMM_SET_DETECT -> 100 Hz COMM_ROTOR_POSITION."""
-import argparse, statistics, struct, time
-from vesc_dual import frame, PacketDecoder, open_transport
-from test_vesc_tool_rt50 import parse_values
-COMM_SET_DETECT=11; COMM_ROTOR_POSITION=22; COMM_GET_VALUES=4; COMM_FORWARD_CAN=34
-MODE_OBSERVER=2; MODE_PID_POS=4
 
-def wrapped_diff(a,b): return ((a-b+180.0)%360.0)-180.0
+from vesc_dual import VescDual
 
-def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--seconds',type=float,default=1.2)
-    a=ap.parse_args(); s=open_transport(a.port,115200,timeout=.001); dec=PacketDecoder(); s.reset_input_buffer()
-    def send(p): s.write(frame(bytes(p))); s.flush()
-    ok=True
+MODE_OBSERVER = 2
+MODE_PID_POS = 4
+
+
+def wrapped_diff(a: float, b: float) -> float:
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def sample_stream(link: VescDual, right: bool, mode: int, seconds: float):
+    link.set_detect(mode, right)
+    timestamps: list[float] = []
+    positions: list[float] = []
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            position = link.recv_rotor_position(timeout=min(0.05, max(0.005, deadline - time.monotonic())))
+        except TimeoutError:
+            continue
+        timestamps.append(time.monotonic())
+        positions.append(position)
+    values = link.values(right)
+    link.set_detect(0, right)
+    time.sleep(0.04)
+    return timestamps, positions, values
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("port", nargs="?", default="auto")
+    parser.add_argument("--seconds", type=float, default=1.2)
+    args = parser.parse_args()
+
+    link = VescDual(args.port, 115200, timeout=0.3)
+    ok = True
     try:
-        for right in (False,True):
-            prefix=[COMM_FORWARD_CAN,2] if right else []
-            name="RIGHT-ID2" if right else "LEFT-ID1"
-            for mode,label in ((MODE_OBSERVER,"OBSERVER"),(MODE_PID_POS,"PID_POS")):
-                send(prefix+[COMM_SET_DETECT,mode]); ts=[]; pos=[]; end=time.monotonic()+a.seconds
-                while time.monotonic()<end:
-                    for p in dec.feed(s.read(s.in_waiting or 1)):
-                        if p and p[0]==COMM_ROTOR_POSITION and len(p)==5:
-                            ts.append(time.monotonic()); pos.append(struct.unpack_from('>i',p,1)[0]/100000.0)
-                send(prefix+[COMM_GET_VALUES]); v=None; deadline=time.monotonic()+.3
-                while time.monotonic()<deadline and v is None:
-                    for p in dec.feed(s.read(s.in_waiting or 1)):
-                        if p and p[0]==COMM_GET_VALUES: v=parse_values(p,False); break
-                send(prefix+[COMM_SET_DETECT,0]); time.sleep(.04)
-                hz=(len(ts)-1)/(ts[-1]-ts[0]) if len(ts)>1 else 0.0
-                periods=[(b-c)*1000 for c,b in zip(ts,ts[1:])]
-                finite_range=bool(pos) and all(-0.01 <= x <= 360.01 for x in pos)
-                diff=wrapped_diff(pos[-1],v.position) if pos and v and mode==MODE_PID_POS else 0.0
-                good=len(pos)>=int(a.seconds*85) and 85<=hz<=115 and v is not None and v.fault==0 and finite_range
-                if mode==MODE_PID_POS: good = good and abs(diff)<1.0
-                print(f'{name} {label}: n={len(pos)} rate={hz:.2f}Hz avg_period={statistics.mean(periods) if periods else 0:.2f}ms stream={pos[-1] if pos else 0:.5f}deg values={v.position if v else 0:.5f}deg diff={diff:.5f} fault={v.fault if v else -1} RESULT={"PASS" if good else "FAIL"}')
+        for right in (False, True):
+            name = "RIGHT-ID2" if right else "LEFT-ID1"
+            for mode, label in ((MODE_OBSERVER, "OBSERVER"), (MODE_PID_POS, "PID_POS")):
+                timestamps, positions, values = sample_stream(link, right, mode, args.seconds)
+                hz = ((len(timestamps) - 1) / (timestamps[-1] - timestamps[0])) if len(timestamps) > 1 else 0.0
+                periods = [(b - a) * 1000.0 for a, b in zip(timestamps, timestamps[1:])]
+                finite_range = bool(positions) and all(-0.01 <= x <= 360.01 for x in positions)
+                diff = wrapped_diff(positions[-1], values.position) if positions and mode == MODE_PID_POS else 0.0
+                good = (
+                    len(positions) >= int(args.seconds * 85)
+                    and 85.0 <= hz <= 115.0
+                    and values.fault == 0
+                    and finite_range
+                    and (mode != MODE_PID_POS or abs(diff) < 1.0)
+                )
+                avg_period = statistics.mean(periods) if periods else 0.0
+                stream_pos = positions[-1] if positions else 0.0
+                print(
+                    f"{name} {label}: n={len(positions)} rate={hz:.2f}Hz "
+                    f"avg_period={avg_period:.2f}ms stream={stream_pos:.5f}deg "
+                    f"values={values.position:.5f}deg diff={diff:.5f} fault={values.fault} "
+                    f"RESULT={'PASS' if good else 'FAIL'}"
+                )
                 ok &= good
     finally:
-        try: send([COMM_SET_DETECT,0]); send([COMM_FORWARD_CAN,2,COMM_SET_DETECT,0])
-        except Exception: pass
-        s.close()
-    print('VESC_ROTOR_POSITION_PERIODIC_PASS' if ok else 'VESC_ROTOR_POSITION_PERIODIC_FAIL')
+        for right in (False, True):
+            try:
+                link.set_detect(0, right)
+            except Exception:
+                pass
+        link.close()
+
+    print("VESC_ROTOR_POSITION_PERIODIC_PASS" if ok else "VESC_ROTOR_POSITION_PERIODIC_FAIL")
     return 0 if ok else 1
-if __name__=='__main__': raise SystemExit(main())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

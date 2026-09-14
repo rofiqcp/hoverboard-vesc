@@ -2,6 +2,11 @@
 import argparse, fcntl, hashlib, os, struct, sys, time
 from pathlib import Path
 
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from vesc_common import crc16
+
 COMM_FW_VERSION=0; COMM_JUMP_TO_BOOTLOADER=1; COMM_ERASE_NEW_APP=2; COMM_WRITE_NEW_APP_DATA=3
 COMM_CUSTOM_APP_DATA=36
 MAX_FW=240*1024
@@ -10,11 +15,6 @@ STATE_STREAM=0x5354524D; STATE_TEST=0x54455354; STATE_RECOVERY=0x52454356; STATE
 HB_CUSTOM_GET_FW_UPDATE_STATE=23; HB_CUSTOM_BOOT_HANDOFF=29
 
 
-def _cmdline_local(pid):
-    try:
-        return Path(f'/proc/{pid}/cmdline').read_bytes().replace(b'\0',b' ').decode(errors='replace').strip()
-    except Exception:
-        return ''
 
 class RestartUploadSession(RuntimeError):
     pass
@@ -44,12 +44,6 @@ class UploadProcessLock:
             try: fcntl.flock(self.fd, fcntl.LOCK_UN)
             finally: os.close(self.fd); self.fd=None
 
-def crc16(data: bytes)->int:
-    crc=0
-    for x in data:
-        crc ^= x<<8
-        for _ in range(8): crc=((crc<<1)^0x1021)&0xffff if crc&0x8000 else (crc<<1)&0xffff
-    return crc
 
 def frame(payload: bytes)->bytes:
     n=len(payload)

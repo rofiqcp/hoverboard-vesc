@@ -62,7 +62,13 @@
  * from a legacy 0..360 UI is interpreted as -30 deg. */
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   5000u 
+/* Runtime steering deliberately avoids the high-friction end regions found in
+ * hardware tests. The measured/calibrated hard-stop span is preserved, then
+ * the old logical 20..340 physical window is normalized back to 0..360 for
+ * VESC Tool / ROS / Web commands and feedback. 320/360 = 8/9 runtime span. */
+#define MCCONF_STEERING_RUNTIME_SPAN_NUM             8u
+#define MCCONF_STEERING_RUNTIME_SPAN_DEN             9u
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   8000u
 #define MCCONF_STEERING_MOTION_PROGRESS_COUNTS       32u /* commissioning motion threshold; not a torque assist */
 #define MCCONF_STEERING_CENTER_CURRENT_A           2.00f /* commissioning return-to-midpoint */
 #define MCCONF_STEERING_CENTER_TOL_COUNTS           24u /* ~0.32 deg on measured ~4500-count span */
@@ -70,7 +76,7 @@
 #define MCCONF_STEERING_CENTER_TRIM_TIMEOUT_MS    2500u
 #define MCCONF_STEERING_CENTER_PULSE_MS             15u
 #define MCCONF_STEERING_CENTER_REST_MS              70u
-#define MCCONF_STEERING_HOME_CURRENT_A             3.00f
+#define MCCONF_STEERING_HOME_CURRENT_A             4.00f
 #define MCCONF_STEERING_CAL_CURRENT_MAX_A         15.00f /* commissioning only; runtime steering stays capped separately */
 #define MCCONF_STEERING_DETECT_CURRENT_START_A      3.00f
 #define MCCONF_STEERING_DETECT_CURRENT_STEP_A       1.00f

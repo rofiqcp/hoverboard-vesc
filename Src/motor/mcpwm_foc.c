@@ -2015,18 +2015,31 @@ static int32_t steering_safe_span_from_measured(int32_t measured_span){
     return measured_span<0?-(int32_t)safe:(int32_t)safe;
 }
 
+static int32_t steering_runtime_span_from_measured(int32_t measured_span){
+    const int32_t safe=steering_safe_span_from_measured(measured_span);
+    if(safe==0)return 0;
+    const bool neg=safe<0;
+    int64_t a=neg?-(int64_t)safe:(int64_t)safe;
+    int64_t runtime=(a*(int64_t)MCCONF_STEERING_RUNTIME_SPAN_NUM)/
+                    (int64_t)MCCONF_STEERING_RUNTIME_SPAN_DEN;
+    if(runtime<(int64_t)MCCONF_STEERING_MIN_SPAN_COUNTS)runtime=MCCONF_STEERING_MIN_SPAN_COUNTS;
+    runtime &= ~1LL;
+    return neg?-(int32_t)runtime:(int32_t)runtime;
+}
+
 bool mcpwm_foc_steering_set_span(int32_t span_counts, bool homed){
     mcpwm_foc_motor_t *m=&m_motor_1;
     int32_t a=span_counts<0?-span_counts:span_counts;
     if(a<MCCONF_STEERING_MIN_SPAN_COUNTS)return false;
-    const int32_t safe_span=steering_safe_span_from_measured(span_counts);
-    const int32_t safe_abs=safe_span<0?-safe_span:safe_span;
+    const int32_t runtime_span=steering_runtime_span_from_measured(span_counts);
+    const int32_t runtime_abs=runtime_span<0?-runtime_span:runtime_span;
     m->m_steering_span_counts=span_counts; /* persist/report measured hard-stop span */
     m->m_steering_calibrated=1u;
     m->m_steering_homed=homed?1u:0u;
-    /* Runtime position authority is limited to 95% of measured hard-stop span.
-     * The remaining 5% creates a symmetric 2.5% mechanical margin per side. */
-    const int32_t half=safe_abs/2;
+    /* Runtime authority uses the calibrated safe span, then keeps only 8/9
+     * of it. This corresponds to the previously measured physical 20..340
+     * region while the external coordinate remains normalized 0..360. */
+    const int32_t half=runtime_abs/2;
     m->m_position_min_counts=-half;
     m->m_position_max_counts= half;
     m->m_position_target_ramp_step_q16=0u; /* no hidden position slew; VESC PID uses requested target directly */
@@ -2067,11 +2080,11 @@ bool mcpwm_foc_steering_rebase_center(void){
 bool mcpwm_foc_steering_is_calibrated(void){return m_motor_1.m_steering_calibrated!=0u;}
 bool mcpwm_foc_steering_is_homed(void){return m_motor_1.m_steering_calibrated&&m_motor_1.m_steering_homed;}
 int32_t mcpwm_foc_steering_span_counts(void){return m_motor_1.m_steering_span_counts;}
-int32_t mcpwm_foc_steering_safe_span_counts(void){return steering_safe_span_from_measured(m_motor_1.m_steering_span_counts);}
+int32_t mcpwm_foc_steering_safe_span_counts(void){return steering_runtime_span_from_measured(m_motor_1.m_steering_span_counts);}
 
 float mcpwm_foc_get_steering_deg(void){
     const mcpwm_foc_motor_t *m=&m_motor_1;
-    const int32_t safe_span=steering_safe_span_from_measured(m->m_steering_span_counts);
+    const int32_t safe_span=steering_runtime_span_from_measured(m->m_steering_span_counts);
     if(!m->m_steering_calibrated || safe_span==0)return 0.0f;
     /* Count 0 is center. Logical feedback saturates at the safe 0/360 endpoints;
      * raw TIM4 and accumulated count remain available separately for diagnostics. */
@@ -2084,7 +2097,7 @@ float mcpwm_foc_get_steering_deg(void){
 
 bool mcpwm_foc_set_steering_deg(float deg){
     mcpwm_foc_motor_t *m=&m_motor_1;
-    const int32_t safe_span=steering_safe_span_from_measured(m->m_steering_span_counts);
+    const int32_t safe_span=steering_runtime_span_from_measured(m->m_steering_span_counts);
     if(!m->m_steering_calibrated || !m->m_steering_homed || !m->m_encoder_synced ||
        safe_span==0){mcpwm_foc_release_motor(false);return false;}
     if(deg<MCCONF_STEERING_POS_MIN_DEG)deg=MCCONF_STEERING_POS_MIN_DEG;
@@ -4522,7 +4535,7 @@ static int32_t relay_speed_erpm_now(const mcpwm_foc_motor_t *m, bool second) {
 }
 
 static int32_t relay_steering_mdeg_now(const mcpwm_foc_motor_t *m) {
-    const int32_t span=steering_safe_span_from_measured(m->m_steering_span_counts);
+    const int32_t span=steering_runtime_span_from_measured(m->m_steering_span_counts);
     if(span==0)return 0;
     int64_t x=(int64_t)m->m_position_counts*60000LL;
     x/=span;

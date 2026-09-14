@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Stage-1 FOC autotune: qualified R/L model -> D/Q-equal PI -> synchronized D/Q current-step qualification."""
 from __future__ import annotations
-import argparse,json,math,statistics,time
-from dataclasses import replace
+import sys
 from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import argparse,json,statistics,time
+from dataclasses import replace
+from vesc_common import u32_delta, quantize_u16, tuning_key
 from vesc_dual import VescDual,Tuning
 
 Q4_PER_A=800.0
 
-def d32(a,b): return (b-a)&0xffffffff
-def q(v,s): return max(0,min(65535,round(v*s)))
 
 def tuning_from_model(orig:Tuning,r:float,l:float,tc_us:float)->Tuning:
     # VESC current controller model: G(s)=1/(Ls+R), pole cancellation at 1/tc.
     bw=1.0/(tc_us*1e-6); kp=l*bw; ki=r*bw
-    return replace(orig,kpq=q(kp,1536),kpd=q(kp,1536),kiq=q(ki,4.608),kid=q(ki,4.608))
+    return replace(orig,kpq=quantize_u16(kp,1536),kpd=quantize_u16(kp,1536),kiq=quantize_u16(ki,4.608),kid=quantize_u16(ki,4.608))
 
 def metrics(rows,right,axis,pre_a,step_a,ts):
     p='right_' if right else 'left_'
@@ -47,20 +51,18 @@ def metrics(rows,right,axis,pre_a,step_a,ts):
             "cross_peak_a":crosspk,"saturation_samples":sat,"bad_quality_samples":badq,
             "fault":fault,"event_index":event}
 
-def _gain_key(t):
-    return (t.kpq,t.kiq,t.kpd,t.kid,t.kps,t.kis,t.kds,t.kpp,t.kip,t.kdp,t.telem_filter_q16)
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('port',nargs='?',default='auto');ap.add_argument('--arm',action='store_true')
-    ap.add_argument('--model',default='/home/otomasi/agv/data/esc/stage1/model_qualification.json')
+    ap.add_argument('--model',default=str(TOOLS_DIR.parent.parent / 'data/esc/stage1/model_qualification.json'))
     ap.add_argument('--motor',choices=('left','right','both'),default='both')
     ap.add_argument('--tc-us',default='750,1000,1250,1500,2000')
     ap.add_argument('--pre-a',type=float,default=0.25);ap.add_argument('--step-a',type=float,default=0.75)
     ap.add_argument('--pre-samples',type=int,default=8);ap.add_argument('--post-samples',type=int,default=24)
     ap.add_argument('--repeat',type=int,default=2);ap.add_argument('--max-isr-cycles',type=int,default=4000)
     ap.add_argument('--apply-best-ram',action='store_true');ap.add_argument('--store-best',action='store_true')
-    ap.add_argument('--output',default='/home/otomasi/agv/data/esc/stage1/foc_tuning.json');a=ap.parse_args()
+    ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/stage1/foc_tuning.json'));a=ap.parse_args()
     if not a.arm:raise SystemExit('ARM_REQUIRED: synchronized D/Q current steps energize the motor')
     if not 1<=a.repeat<=5:raise SystemExit('--repeat must be 1..5')
     if not 1000<=a.max_isr_cycles<=4000:raise SystemExit('--max-isr-cycles must be 1000..4000')
@@ -85,7 +87,7 @@ def main():
             r=mm['r_ohm']['median'];l=mm['l_h']['median'];candidates=[]
             for tc in tcs:
                 cand=tuning_from_model(originals[right],r,l,tc);applied=link.set_tuning(cand,right,store=False)
-                if _gain_key(applied)!=_gain_key(cand):raise RuntimeError(f'{name}: candidate readback mismatch tc={tc}')
+                if tuning_key(applied)!=tuning_key(cand):raise RuntimeError(f'{name}: candidate readback mismatch tc={tc}')
                 traces=[]
                 for axis in ('d','q'):
                     for rep in range(1,a.repeat+1):
@@ -100,7 +102,7 @@ def main():
                         if not st or not st['step_fired']:raise RuntimeError(f'{name} {axis}-axis aborted tc={tc}: {st}')
                         actual_pre=st['pre_q4']/Q4_PER_A;actual_step=st['step_q4']/Q4_PER_A
                         trace=link.download_trace();prof=link.isr_profile(False)
-                        m=metrics(trace,right,axis,actual_pre,actual_step,ts);dma_delta=d32(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
+                        m=metrics(trace,right,axis,actual_pre,actual_step,ts);dma_delta=u32_delta(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
                         m.update(repeat=rep,tc_us=tc,trace_count=len(trace),requested_pre_a=a.pre_a,requested_step_a=a.step_a,
                                  actual_pre_a=actual_pre,actual_step_a=actual_step,deadline_miss=prof['deadline_miss'],
                                  dma_tc_pending_exit_delta=dma_delta,slot_sequence_errors=prof['slot_sequence_errors'],isr_max_cycles=prof['total_max'])
@@ -122,7 +124,7 @@ def main():
         if a.apply_best_ram or a.store_best:
             for _,right in choices:
                 got=link.set_tuning(winners[right],right,store=False)
-                if _gain_key(got)!=_gain_key(winners[right]):raise RuntimeError('winner RAM readback mismatch')
+                if tuning_key(got)!=tuning_key(winners[right]):raise RuntimeError('winner RAM readback mismatch')
         else:
             for _,right in choices:link.set_tuning(originals[right],right,store=False)
         if a.store_best:
@@ -130,7 +132,7 @@ def main():
             try:
                 for _,right in choices:
                     got=link.set_tuning(winners[right],right,store=True)
-                    if _gain_key(got)!=_gain_key(winners[right]):raise RuntimeError('winner persistent readback mismatch')
+                    if tuning_key(got)!=tuning_key(winners[right]):raise RuntimeError('winner persistent readback mismatch')
             except Exception:
                 for _,right in choices:
                     try:link.set_tuning(originals[right],right,store=True)
@@ -138,7 +140,7 @@ def main():
                 persistence_started=False;raise
         expected=winners if (a.apply_best_ram or a.store_best) else originals
         for _,right in choices:
-            if _gain_key(link.get_tuning(right))!=_gain_key(expected[right]):raise RuntimeError('final tuning verification mismatch')
+            if tuning_key(link.get_tuning(right))!=tuning_key(expected[right]):raise RuntimeError('final tuning verification mismatch')
         out['best']=best;out['pass']=True;out['persistent_commit']=bool(a.store_best);out['dq_equal']=True
         out['note']='D/Q gains remain equal because Stage-1 identification does not prove saliency.'
         dst=Path(a.output);dst.parent.mkdir(parents=True,exist_ok=True);dst.write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')

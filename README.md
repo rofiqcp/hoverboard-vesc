@@ -99,8 +99,8 @@ target  = signed int32 bebas
 Contoh:
 
 ```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 pos-limits --motor left --min -1000000 --max 2000000
-python3 tools/vesc_debug.py /dev/ttyUSB0 pos-count --motor left --count -250 --seconds 2 --arm
+python3 tools/vesc_tool.py /dev/ttyUSB0 --no-telemetry --exec 'poscount limits -1000000 2000000 left'
+python3 tools/vesc_tool.py /dev/ttyUSB0 --no-telemetry --exec 'poscount set -250 left'
 ```
 
 Position min/max custom adalah konfigurasi runtime; V16 belum mengklaim persistence
@@ -123,7 +123,8 @@ Tidak ada lagi `LIVEON`, `LIVEOFF`, atau parameter `LIVE`.
 Contoh verifikasi host:
 
 ```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 rt --motor both --hz 50 --seconds 10
+python3 tools/vesc_tool.py /dev/ttyUSB0
+# lalu di prompt: telemetry on 50
 ```
 
 Regression host memeriksa `COMM_GET_VALUES` dan `COMM_GET_VALUES_SETUP`: reply langsung
@@ -223,61 +224,44 @@ SHA256 4ecae1f31c12c1ab415d47dd997396d0792e94249203cbeb877ada75f76d5340
 - Vd
 - Vq
 
-## vesc_debug.py
+## vesc_tool.py — satu CLI operasional
 
-Offline parser/selftest:
-
-```bash
-python3 tools/vesc_debug.py selftest
-```
-
-Informasi lengkap:
+Jalankan terminal interaktif:
 
 ```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 info
-python3 tools/vesc_debug.py /dev/ttyUSB0 diag --motor both
+python3 tools/vesc_tool.py auto
 ```
 
-Realtime 50 Hz:
+Contoh command di prompt:
+
+```text
+help
+target left
+telemetry on 10
+set pos 180
+steering status
+zero
+tuning get left
+tuning set pos 0.100 0.030 0.004 left store
+
+target right
+set rpm 2000
+stop right
+detect hall 4 right store
+
+values both
+diag both
+config save config/leftencoder_righthall.yaml
+term help @left
+```
+
+Semua frame memakai encoding VESC 6.00 dari `vesc_dual.py`; RIGHT dikirim melalui `COMM_FORWARD_CAN` ID 2. Satu-satunya frontend operasional adalah `vesc_tool.py`.
+
+Selftest tanpa hardware:
 
 ```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 rt --motor both --hz 50 --seconds 10
+python3 tools/vesc_tool.py --selftest
 ```
-
-Hall detect:
-
-```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 hall --motor left  --amps 1.0 --arm
-python3 tools/vesc_debug.py /dev/ttyUSB0 hall --motor right --amps 1.0 --arm
-```
-
-Current command path 3 A:
-
-```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 current --motor left --amps 3 --seconds 3 --arm
-```
-
-50 ERPM:
-
-```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 rpm --motor left --erpm 50 --seconds 5 --arm
-```
-
-VESC position 0..360:
-
-```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 pos-vesc --motor left --deg 90 --seconds 2 --arm
-```
-
-Long-range position:
-
-```bash
-python3 tools/vesc_debug.py /dev/ttyUSB0 pos-limits --motor left --min -1000000 --max 2000000
-python3 tools/vesc_debug.py /dev/ttyUSB0 pos-count  --motor left --count 150000 --seconds 2 --arm
-python3 tools/vesc_debug.py /dev/ttyUSB0 pos-state  --motor both
-```
-
-Semua motor-moving test sengaja membutuhkan `--arm`.
 
 ## Build target
 

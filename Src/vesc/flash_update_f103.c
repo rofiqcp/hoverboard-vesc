@@ -13,6 +13,11 @@ static uint16_t image_crc16(const uint8_t *data, uint32_t len) {
     for(uint32_t i=0u;i<len;++i){
         crc^=(uint16_t)data[i]<<8;
         for(uint8_t b=0u;b<8u;++b) crc=(crc&0x8000u)?(uint16_t)((crc<<1)^0x1021u):(uint16_t)(crc<<1);
+        /* Whole-image probation CRC is deliberately bitwise and can run long
+         * enough on a loaded F103 to approach the IWDG window. Refresh only
+         * during this integrity check; a bad image still fails CRC and cannot
+         * be confirmed. */
+        if((i & 0x3FFu)==0u) IWDG->KR=0xAAAAu;
     }
     return crc;
 }

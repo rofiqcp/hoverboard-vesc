@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Read-only ADC PWM-window envelope logger. It never sends a motor setpoint."""
 from __future__ import annotations
-import argparse,csv,json,time
+import sys
 from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import argparse,csv,json,time
 from vesc_dual import VescDual
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--seconds',type=float,default=10.0); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--output',default='/home/otomasi/agv/data/esc/adc_envelope_latest.csv'); a=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--seconds',type=float,default=10.0); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/adc_envelope_latest.csv')); a=ap.parse_args()
     link=VescDual(a.port,115200,timeout=.8); rows=[]
     try:
         plat=link.require_platform_compatible(require_build=True); start=time.monotonic(); period=1/max(1.0,a.hz); nxt=start

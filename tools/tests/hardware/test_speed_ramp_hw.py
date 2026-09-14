@@ -8,7 +8,9 @@ write during candidate evaluation.
 import sys
 from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
-if str(TOOLS_DIR) not in sys.path: sys.path.insert(0,str(TOOLS_DIR))
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
 import argparse,csv,json,re,time
 from vesc_dual import VescDual
 from test_speed_pid_sweep_hw import speed_candidate,run_case,release

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
+import sys
 from pathlib import Path
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+from vesc_common import crc16
 import hashlib
 import struct
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOT = ROOT / ".pio/build/BOOTLOADER_STLINK/firmware.bin"
@@ -20,13 +25,6 @@ META_STATE_CONFIRMED = 0x434E464D
 META_VERSION = 2
 RAM_LO = 0x20000000
 RAM_HI = 0x2000C000
-def crc16(data: bytes) -> int:
-    crc = 0
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
-    return crc
 
 def confirmed_meta(app: bytes) -> bytes:
     size = len(app); c = crc16(app)

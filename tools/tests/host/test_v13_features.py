@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import hashlib, re
+import hashlib
 R=next(p for p in Path(__file__).resolve().parents if (p/'platformio.ini').exists())
 com=(R/'Src/comms.c').read_text()
 mc=(R/'Src/motor/mcpwm_foc.c').read_text()
 vp=(R/'Src/vesc/vesc_protocol.c').read_text()
 main=(R/'Src/main.c').read_text()
-hov=(R/'tools/hoverserial.py').read_text()
+cli=(R/'tools/vesc_tool.py').read_text()
 dual=(R/'tools/vesc_dual.py').read_text()
 
 # V13 tuning/position parameters tetap ada. Jalur telemetry legacy/LIVE telah
@@ -27,7 +27,7 @@ assert 'position_pid_iq_target_step' in mc, 'position PID must feed Iq target'
 assert 'm_current_kpq_v_q16' in mc and 'm_current_kiq_dt_v_q16' in mc and 'm_current_kpd_v_q16' in mc and 'm_current_kid_dt_v_q16' in mc
 assert 'm->m_kps_q11' in mc and 'm->m_kis_q16' in mc and 'm->m_kds_q11' in mc and 'speed_pid_iq_target_step' in mc
 assert 'm->m_kpp_q11' in mc and 'm->m_kip_q16' in mc and 'm->m_kdp_q11' in mc
-assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA   5000u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling regression must match the active 5.0 A runtime safety limit'
+assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA   8000u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling regression must match the active 8.0 A runtime safety limit'
 assert 'MCCONF_STEERING_POSITION_KP_MULTIPLIER' not in (R/'Src/motor/mcconf_default.h').read_text(), 'hidden steering Kp multiplier must stay removed'
 assert 'const int32_t dc_foc=m->m_conf.foc_encoder_inverted?-dc:dc;' in mc, 'ABI RPM estimator must apply encoder inversion exactly once'
 assert 'encoder_count_mode && m->m_conf.foc_encoder_inverted' not in mc, 'process-D must not double-apply encoder inversion after RPM correction'
@@ -35,8 +35,8 @@ assert 'SerialFeedback' not in main and 'legacyTelemetryPrevMs' not in main, 'de
 assert 'USART3 hanya membawa protokol VESC' in main, 'VESC-exclusive USART3 rationale missing'
 assert 'case COMM_SET_POS:' in vp and 'COMM_FORWARD_CAN' in vp and 'COMM_PING_CAN' in vp
 assert 'Right power stage is physically mirrored' not in vp and 'right_sign' not in vp, 'virtual-right protocol must not rewrite VESC coordinates'
-assert 'op == "live"' not in hov.lower() and 'toggle custom live telemetry' not in hov.lower()
-assert 'reset pos' in hov and 'mode 5' in hov
+assert not (R/'tools/hoverserial.py').exists(), 'legacy HoverSerial tool must stay removed'
+assert 'poscount reset' in cli and 'poscount limits' in cli and 'telemetry on' in cli
 assert 'COMM_SET_POS = 9' in dual and 'def set_pos(' in dual and 'RIGHT_ID = 2' in dual
 # vesc/datatypes.h must remain exact reference, never custom-extended for these parameters.
 h=hashlib.sha256((R/'Src/vesc/datatypes.h').read_bytes()).hexdigest()

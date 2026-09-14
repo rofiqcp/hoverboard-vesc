@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
+import sys
+from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
 import argparse, time
+from vesc_common import u32_delta
 from vesc_dual import VescDual, parse_fw
 CPU_HZ=64_000_000
 PWM_HZ=16_000
 PROFILE_REV=0x00030000
 
-def delta32(a,b): return (b-a)&0xffffffff
 
 def main():
     ap=argparse.ArgumentParser(description='Read-only Stage-1 ISR profiler acceptance')
@@ -19,9 +25,9 @@ def main():
         base=link.isr_profile(reset=True)
         time.sleep(max(0.1,a.seconds))
         p=link.isr_profile(reset=False)
-        de=delta32(base['irq_entry'],p['irq_entry'])
-        dx=delta32(base['irq_exit'],p['irq_exit'])
-        dc=delta32(base['snapshot_dwt'],p['snapshot_dwt'])
+        de=u32_delta(base['irq_entry'],p['irq_entry'])
+        dx=u32_delta(base['irq_exit'],p['irq_exit'])
+        dc=u32_delta(base['snapshot_dwt'],p['snapshot_dwt'])
         freq=(de*CPU_HZ/dc) if dc else 0.0
         active=max(1,min(6,p['active_slot_count'])); slots=[p[f'slot{i}_count'] for i in range(active)]
         dslots=[p[f'detail_slot{i}_count'] for i in range(active)]
@@ -37,7 +43,7 @@ def main():
             'detail_walk': all(x>0 for x in dslots),
             'detail_ratio': abs(p['detail_sample_count']-expected_detail)<=2.0,
             'deadline': p['deadline_miss']==0 and p['total_max']<CPU_HZ//PWM_HZ,
-            'dma_backlog': delta32(base['dma_tc_pending_exit'],p['dma_tc_pending_exit'])==0,
+            'dma_backlog': u32_delta(base['dma_tc_pending_exit'],p['dma_tc_pending_exit'])==0,
         }
         print(f"ISR freq={freq:.2f} Hz entry={de} exit={dx} max={p['total_max']}/{CPU_HZ//PWM_HZ} cycles")
         print('slots',slots,'detail_slots',dslots,'detail',p['detail_sample_count'],f'expected~{expected_detail:.1f}')

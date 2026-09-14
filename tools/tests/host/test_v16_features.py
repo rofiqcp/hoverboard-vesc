@@ -137,7 +137,7 @@ assert 'local measure R/L values/units' in host and 'local measure flux26' in ho
 assert 'encoder_detect_calls' in host and 'standalone encoder must run electrical ABI detect first' in host, 'Manual encoder electrical-before-span regression missing'
 assert 'if(fails!=2u)success=false;' in vp and 'mcpwm_foc_hall_table_sane(table)' not in vp, 'Hall detect success must match upstream fails==2 criterion'
 assert 'Standard VESC OPENLOOP_CURRENT' in mc and 'm->m_iq_target_q4=amp_to_q4(m,current)' in mc and 'OPENLOOP_ERPM_Q16_TO_PHASE_Q32_Q24' in mc, 'standard VESC openloop must rotate signed Iq at electrical RPM with precomputed ISR coefficient'
-assert 'hall-phase' in (R/'tools/vesc_debug.py').read_text() and 'HALL_PHASE_PASS' in (R/'tools/vesc_debug.py').read_text(), 'active Hall phase-check utility missing'
+assert 'hall-phase' in (R/'tools/vesc_tool.py').read_text() and 'HALL_PHASE_PASS' in (R/'tools/vesc_tool.py').read_text(), 'active Hall phase-check utility missing'
 
 
 # F103 realtime efficiency contract: hardware ADC-DMA ISR at 16 kHz, staggered

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Repeatable non-persistent R/L/flux qualification for both hoverboard motors."""
 from __future__ import annotations
-import argparse,json,statistics,time
+import sys
 from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import argparse,json,statistics,time
 from vesc_dual import VescDual
 
 def stat(v):
@@ -18,7 +23,7 @@ def main():
     ap.add_argument('--flux-current',type=float,default=1.0)
     ap.add_argument('--flux-ramp-erpm-s',type=float,default=1800.0)
     ap.add_argument('--max-cv-r',type=float,default=0.08); ap.add_argument('--max-cv-l',type=float,default=0.10); ap.add_argument('--max-cv-flux',type=float,default=0.10)
-    ap.add_argument('--output',default='/home/otomasi/agv/data/esc/model_qualification_latest.json')
+    ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/model_qualification_latest.json'))
     a=ap.parse_args()
     if not a.arm: raise SystemExit('ARM_REQUIRED: rerun with --arm only when motors are safe to move')
     if not 3<=a.repeat<=12: raise SystemExit('--repeat must be 3..12')

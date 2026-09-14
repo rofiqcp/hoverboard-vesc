@@ -9,13 +9,13 @@ The control worker refreshes setpoints at 50 Hz (VESC timeout is 500 ms) and
 polls selective mc_values telemetry from both motors.
 """
 from __future__ import annotations
-import argparse
 import os
 import struct
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from vesc_common import crc16
 
 try:
     import serial
@@ -214,13 +214,6 @@ HB_FREEZE_TRACE = 22
 VALUE_MASK = sum(1 << b for b in (2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 19, 20))
 
 
-def crc16(data: bytes) -> int:
-    crc = 0
-    for x in data:
-        crc ^= x << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
 
 
 def frame(payload: bytes) -> bytes:
@@ -952,16 +945,6 @@ class VescDual:
                 if p != bytes((cmd,)):
                     raise ValueError("invalid MC temp ACK")
 
-    def appconf_roundtrip_no_store(self, right: bool = False) -> None:
-        """Uji tombol App Config no-store tanpa perlu memahami schema: GET lalu echo payload identik sebagai NO_STORE."""
-        get_req = bytes((COMM_GET_APPCONF,))
-        current = self.transact(self.fwd(get_req) if right else get_req, COMM_GET_APPCONF, 0.8)
-        if len(current) < 8:
-            raise ValueError("short App Config reply")
-        req = bytes((COMM_SET_APPCONF_NO_STORE,)) + current[1:]
-        p = self.transact(self.fwd(req) if right else req, COMM_SET_APPCONF_NO_STORE, 0.8)
-        if p != bytes((COMM_SET_APPCONF_NO_STORE,)):
-            raise ValueError("invalid App Config no-store ACK")
 
     def reboot(self, right: bool = False) -> None:
         """Kirim COMM_REBOOT. Tidak menunggu ACK karena VESC 6.00 langsung reset."""
@@ -1391,91 +1374,6 @@ class VescDual:
         raise last
 
 
-class ReplWorker:
-    def __init__(self, link: VescDual, hz: float, telemetry_hz: float):
-        self.link = link
-        self.period = 1.0 / hz
-        self.telemetry_period = 1.0 / telemetry_hz
-        self.lock = threading.Lock()
-        self.mode = "current"
-        self.left = 0.0
-        self.right = 0.0
-        self.active = False
-        self.stop_flag = False
-        self.exit = False
-        self.last_l = Values(vesc_id=1)
-        self.last_r = Values(vesc_id=2)
-        try:
-            dl, dr = self.link.diag(False), self.link.diag(True)
-            self.stop_erpm_l = 5 * (dl.pole_pairs or POLE_PAIRS)
-            self.stop_erpm_r = 5 * (dr.pole_pairs or POLE_PAIRS)
-        except Exception:
-            self.stop_erpm_l = self.stop_erpm_r = STOP_ERPM
-        self.thread = threading.Thread(target=self.run, daemon=True)
-        self.thread.start()
-
-    def set(self, mode: str, left: float, right: float):
-        with self.lock:
-            self.mode, self.left, self.right = mode, left, right
-            self.active, self.stop_flag = True, False
-
-    def stop_controlled(self):
-        with self.lock:
-            # Speed uses firmware RPM ramp-to-zero. Current/duty/position issue
-            # zero current once and stop refreshing; the 500-ms ownership timeout
-            # then releases the bridge to free-run.
-            if self.mode == "rpm":
-                self.left = 0.0
-                self.right = 0.0
-                self.stop_flag = True
-                self.active = True
-            else:
-                self.stop_flag = False
-                self.active = False
-        if self.mode != "rpm":
-            self.link.set_current(0.0, 0.0)
-
-    def release(self):
-        self.link.set_current(0.0, 0.0)
-        with self.lock:
-            self.active = False
-            self.stop_flag = False
-
-    def run(self):
-        next_tick = next_tel = time.monotonic()
-        while not self.exit:
-            now = time.monotonic()
-            if now < next_tick:
-                time.sleep(min(0.002, next_tick - now)); continue
-            next_tick += self.period
-            with self.lock:
-                mode, l, r, active, stopping = self.mode, self.left, self.right, self.active, self.stop_flag
-            try:
-                if active:
-                    if stopping and mode == "rpm":
-                        self.link.set_rpm(0, 0)
-                    elif mode == "current": self.link.set_current(l, r)
-                    elif mode == "rpm": self.link.set_rpm(int(l), int(r))
-                    elif mode == "duty": self.link.set_duty(l, r)
-                    elif mode == "pos": self.link.set_pos(l, r)
-                if now >= next_tel:
-                    next_tel = now + self.telemetry_period
-                    self.last_l = self.link.values(False)
-                    self.last_r = self.link.values(True)
-                    if stopping and mode == "rpm" and abs(self.last_l.rpm) <= self.stop_erpm_l and abs(self.last_r.rpm) <= self.stop_erpm_r:
-                        self.link.set_rpm(0, 0)
-                        with self.lock:
-                            self.active = False; self.stop_flag = False
-            except Exception as e:
-                print(f"[WARN] {e}")
-
-    def shutdown(self):
-        self.exit = True
-        self.thread.join(timeout=1.0)
-        try: self.link.set_current(0.0, 0.0)
-        except Exception: pass
-
-
 def parse_fw(p: bytes) -> str:
     if len(p) < 4: return repr(p)
     major, minor = p[1], p[2]
@@ -1484,53 +1382,9 @@ def parse_fw(p: bytes) -> str:
     return f"FW {major}.{minor:02d} HW={hw}"
 
 
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("port", nargs="?", default="auto",
-                    help="auto | direct | direct:/dev/ttyUSB0 | raw /dev/ttyUSBx")
-    ap.add_argument("--baud", type=int, default=DEFAULT_BAUD)
-    ap.add_argument("--command-hz", type=float, default=50.0)
-    ap.add_argument("--telemetry-hz", type=float, default=50.0,
-                    help="selective VESC telemetry polling; default 50 Hz")
-    args = ap.parse_args()
-    link = VescDual(args.port, args.baud)
-    try:
-        print("local:", parse_fw(link.fw(False)))
-        print("virtual CAN:", link.ping_can())
-        print("right:", parse_fw(link.fw(True)))
-        w = ReplWorker(link, args.command_hz, args.telemetry_hz)
-        print("commands: current L R [A] | rpm L R [ERPM] | duty L R [-1..1] | pos L R [deg] | hall [A] [left|right|both] | diag | posstate | stop | release | values | scan | fw | quit")
-        while True:
-            try: line = input("vesc-dual> ").strip()
-            except (EOFError, KeyboardInterrupt): break
-            if not line: continue
-            a = line.split(); cmd = a[0].lower()
-            try:
-                if cmd == "current" and len(a) == 3: w.set("current", float(a[1]), float(a[2]))
-                elif cmd == "rpm" and len(a) == 3: w.set("rpm", float(a[1]), float(a[2]))
-                elif cmd == "duty" and len(a) == 3: w.set("duty", float(a[1]), float(a[2]))
-                elif cmd in ("pos", "position") and len(a) == 3: w.set("pos", float(a[1]), float(a[2]))
-                elif cmd == "stop": w.stop_controlled()
-                elif cmd == "release": w.release()
-                elif cmd == "values": print("L", w.last_l.short()); print("R", w.last_r.short())
-                elif cmd == "scan": print("virtual CAN IDs:", link.ping_can())
-                elif cmd == "fw": print("L", parse_fw(link.fw(False))); print("R", parse_fw(link.fw(True)))
-                elif cmd == "diag": print("L", link.diag(False).short()); print("R", link.diag(True).short())
-                elif cmd == "posstate": print("L", link.position_state(False)); print("R", link.position_state(True))
-                elif cmd == "hall":
-                    current = float(a[1]) if len(a) >= 2 else 1.0
-                    which = a[2].lower() if len(a) >= 3 else "both"
-                    if which in ("left", "l", "both"):
-                        ok, tab = link.detect_hall(current, False); print("Hall LEFT", "OK" if ok else "FAIL", tab)
-                    if which in ("right", "r", "both"):
-                        ok, tab = link.detect_hall(current, True); print("Hall RIGHT", "OK" if ok else "FAIL", tab)
-                elif cmd in ("quit", "exit", "q"): break
-                else: print("usage: current L R | rpm L R | duty L R | pos L R | hall [A] [left|right|both] | stop | release | values | scan | fw | quit")
-            except Exception as e:
-                print("[ERR]", e)
-        w.shutdown()
-    finally:
-        link.close()
+    raise SystemExit("vesc_dual.py adalah backend protocol library; jalankan tools/vesc_tool.py")
 
 if __name__ == "__main__":
     main()

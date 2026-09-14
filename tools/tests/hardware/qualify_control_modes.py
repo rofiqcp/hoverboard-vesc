@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Non-persistent A/B qualification for VESC decoupling and speed-source modes."""
-import argparse,json,math,re,statistics,time
+import sys
 from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import argparse,json,math,re,statistics,time
+from vesc_common import u32_delta
 from vesc_dual import VescDual
-def d32(a,b): return (b-a)&0xffffffff
 
 def parse_cfg(txt):
     pats={k:rf'{k}=([0-9.+-]+)' for k in ('R','L','flux','dec','speed_src')}
@@ -37,7 +42,7 @@ def run_target(v,right,target,hold,hz,max_current,min_vin):
         if x.vin<min_vin: raise RuntimeError(f'vin low {x.vin:.2f}')
         time.sleep(dt)
     stop(v,right); prof=v.isr_profile(False)
-    dma_delta=d32(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
+    dma_delta=u32_delta(p0['dma_tc_pending_exit'],prof['dma_tc_pending_exit'])
     if prof['deadline_miss'] or dma_delta or prof['slot_sequence_errors']:
         raise RuntimeError(f'ISR integrity fail dma_delta={dma_delta} profile={prof}')
     actual=[r[0] for r in rows]; err=[a-target for a in actual]

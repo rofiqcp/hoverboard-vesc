@@ -4,9 +4,10 @@ from pathlib import Path
 TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
-import argparse,csv,json,math,statistics,struct,time,threading
-from dataclasses import asdict,replace
-from vesc_dual import VescDual,Tuning,COMM_SET_CURRENT,COMM_SET_RPM
+
+import argparse,csv,json,statistics,struct,time,threading
+from dataclasses import replace
+from vesc_dual import VescDual,COMM_SET_CURRENT,COMM_SET_RPM
 
 class AbortRun(RuntimeError): pass
 

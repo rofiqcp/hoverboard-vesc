@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Hardware qualification that proves process-D opposes measured logical steering motion."""
-import argparse,json,re,time
+import sys
 from pathlib import Path
+TOOLS_DIR = next(p for p in Path(__file__).resolve().parents if p.name == 'tools')
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import argparse,json,re,time
+from vesc_common import u32_delta
 from vesc_dual import VescDual
-def d32(a,b): return (b-a)&0xffffffff
 
 def stop(v):
     try: v.terminal('stop',False)
@@ -41,7 +46,7 @@ def main():
                 time.sleep(1.0/args.hz)
             stop(v)
         p=v.isr_profile(False); rep['isr']=p; rep.update(usable=usable,opposing=oppose,same_direction=same,opposing_ratio=(oppose/usable if usable else 0.0))
-        dma_delta=d32(p0['dma_tc_pending_exit'],p['dma_tc_pending_exit']); rep['dma_tc_pending_exit_delta']=dma_delta
+        dma_delta=u32_delta(p0['dma_tc_pending_exit'],p['dma_tc_pending_exit']); rep['dma_tc_pending_exit_delta']=dma_delta
         if p['deadline_miss'] or dma_delta or p['slot_sequence_errors']: raise RuntimeError('ISR integrity fail')
         if usable<5 or same>0 or oppose/usable<.95: raise RuntimeError(f'process-D sign FAIL usable={usable} oppose={oppose} same={same}')
     finally:

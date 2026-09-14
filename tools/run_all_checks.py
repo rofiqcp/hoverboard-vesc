@@ -23,7 +23,7 @@ def check_static():
         'Src/motor/foc_math.c','Src/motor/foc_math.h','Src/motor/mcconf_default.h',
         'Src/vesc/datatypes.h','Src/vesc/vesc_protocol.c','Src/vesc/vesc_protocol.h',
         'Src/vesc/buffer.c','Src/vesc/crc.c','Src/vesc/mcconf_serial.c',
-        'tools/build_factory_image.py','tools/install_bootloader_stlink.sh','tools/pio_vesc_upload.py','tools/tests/target/test_isr_callgraph.py','tools/vesc_dual.py','tools/vesc_debug.py','tools/hoverserial.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/host/test_hall_3rev_runtime.py','tools/tests/host/test_hall_3rev_runtime.c','tools/tests/host/test_motor_control_v12.py','tools/tests/host/test_motor_control_v12.c','tools/tests/host/test_motor_control_v13.py','tools/tests/host/test_motor_control_v13.c','tools/tests/host/test_v13_features.py','tools/tests/host/test_v14_features.py','tools/tests/host/test_v15_features.py'
+        'tools/build_factory_image.py','tools/install_bootloader_stlink.sh','tools/pio_vesc_upload.py','tools/tests/target/test_isr_callgraph.py','tools/vesc_dual.py','tools/vesc_tool.py','tools/tests/hardware/test_vesc_tool_rt50.py','tools/tests/host/test_hall_3rev_runtime.py','tools/tests/host/test_hall_3rev_runtime.c','tools/tests/host/test_motor_control_v12.py','tools/tests/host/test_motor_control_v12.c','tools/tests/host/test_motor_control_v13.py','tools/tests/host/test_motor_control_v13.c','tools/tests/host/test_v13_features.py','tools/tests/host/test_v14_features.py','tools/tests/host/test_v15_features.py'
     ]
     missing=[x for x in required if not (ROOT/x).exists()]
     assert not missing, f'missing required files: {missing}'
@@ -37,9 +37,12 @@ def check_static():
     ini=(ROOT/'platformio.ini').read_text()
     for token in ('src_dir = Src','[env:APP_STLINK]','[env:APP_USART_PC]','[env:BOOTLOADER_STLINK]','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
         assert token in ini, f'platformio.ini missing {token}'
-    # Normal deployment is direct VESC protocol over USART3. ST-Link remains
-    # recovery-only and is never the default upload path.
-    assert re.search(r'^default_envs\s*=\s*APP_USART_PC\s*$', ini, re.M), 'default PlatformIO upload must use APP_USART_PC'
+    # The default target may be switched intentionally for deployment/recovery,
+    # but it must always name a declared PlatformIO environment.
+    m = re.search(r'^default_envs\s*=\s*([A-Za-z0-9_,-]+)\s*$', ini, re.M)
+    assert m, 'platformio.ini must declare default_envs'
+    for env_name in (x.strip() for x in m.group(1).split(',') if x.strip()):
+        assert f'[env:{env_name}]' in ini, f'default PlatformIO env is not declared: {env_name}'
     # Warning policy: project sources use -Wall/-Wextra/-Werror via build_src_flags only.
     # Framework STM32Cube must not inherit project -Werror (avoids HAL_PCD unused-parameter build failure).
     before_build_flags=ini.split('build_flags =',1)[0]
@@ -276,6 +279,7 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_vesc_protocol_host.py'])
     config_size_check()
     run([sys.executable,'tools/tests/host/test_vesc_dual.py'])
+    run([sys.executable,'tools/tests/host/test_vesc_tool_cli.py'])
     run([sys.executable,'tools/tests/host/test_v13_features.py'])
     run([sys.executable,'tools/tests/host/test_v14_features.py'])
     run([sys.executable,'tools/tests/host/test_swd_boot_safety.py'])
@@ -295,7 +299,7 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_stage1_audit_hardening.py'])
     run([sys.executable,'tools/tests/host/test_stage2_autotune.py'])
     run([sys.executable,'tools/tests/host/test_measurement_authority_hardening.py'])
-    run([sys.executable,'tools/vesc_debug.py','selftest'])
+    run([sys.executable,'tools/vesc_tool.py','--selftest'])
     run([sys.executable,'tools/tests/host/test_hall_detect_algorithm.py'])
     run([sys.executable,'tools/tests/host/test_hall_3rev_runtime.py'])
     run([sys.executable,'tools/tests/host/test_encoder_abi_runtime.py'])
