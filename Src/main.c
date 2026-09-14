@@ -199,6 +199,7 @@ int main(void) {
   const uint32_t fw_test_start = HAL_GetTick();
   const uint32_t fw_test_fw_base = vesc_protocol_fw_version_count();
   uint32_t fw_test_loops = 0u;
+  uint32_t fw_test_kick_ms = fw_test_start;
   platform_watchdog_status_t fw_test_wd_base;
   platform_watchdog_get_status(&fw_test_wd_base);
   if (fw_test_probation) vesc_protocol_set_probation(true);
@@ -225,6 +226,14 @@ int main(void) {
     }
     mcpwm_foc_outer_control_non_isr(vesc_now_ms);
     platform_watchdog_service();
+    if (fw_test_probation && (uint32_t)(vesc_now_ms - fw_test_kick_ms) >= 100u) {
+      /* During firmware probation both bridges are intentionally inhibited, so
+       * normal motor-heartbeat watchdog criteria are not a valid firmware-health
+       * gate. A maintenance feed is allowed only from this live main context;
+       * a hung main loop still stops feeding IWDG and resets into recovery. */
+      fw_test_kick_ms = vesc_now_ms;
+      platform_watchdog_maintenance_kick();
+    }
 
     /* Drain USART3 circular DMA every main-loop pass as a deterministic
      * fallback to the IDLE-line IRQ, then process protocol in the remaining
@@ -239,15 +248,24 @@ int main(void) {
       mcpwm_foc_force_bridges_off();
       platform_watchdog_status_t w; platform_watchdog_get_status(&w);
       const uint32_t elapsed=(uint32_t)(vesc_now_ms-fw_test_start);
-      const bool protocol_ok=vesc_protocol_fw_version_count()!=fw_test_fw_base;
-      const bool realtime_ok=w.enabled && w.last_health_ok && w.feed_count>fw_test_wd_base.feed_count;
+      const bool protocol_seen=vesc_protocol_fw_version_count()!=fw_test_fw_base;
+      const bool realtime_ok=w.enabled && w.feed_count>fw_test_wd_base.feed_count;
       const bool main_ok=fw_test_loops>=100u;
-      if (elapsed>=3000u && protocol_ok && realtime_ok && main_ok &&
-          usart3_dma_runtime_healthy() && !controllerFaultActive()) {
+      const bool uart_ok=usart3_dma_runtime_healthy();
+      const bool elapsed_ok=elapsed>=3000u;
+      const uint32_t gate_bits=(elapsed_ok?1u:0u)|(main_ok?2u:0u)|(realtime_ok?4u:0u)|
+                               (uart_ok?8u:0u)|(protocol_seen?16u:0u);
+      /* Firmware integrity must be decidable without a PC being attached. Host traffic is
+       * useful evidence and is preserved in bit4, but it is NOT a confirmation prerequisite.
+       * Otherwise a healthy image deterministically falls into recovery when VESC Tool is
+       * closed, reconnects slowly, or the USB-UART is momentarily absent. */
+      if (elapsed_ok && realtime_ok && main_ok && uart_ok) {
+        *(volatile uint32_t *)F103_RESET_STAGE_ADDR = F103_STAGE_PROBATION_GATE_BASE | gate_bits;
         if (!f103_fw_confirm_running_image()) f103_fw_reset_to_bootloader();
         fw_test_probation=false;
         vesc_protocol_set_probation(false);
       } else if (elapsed>=15000u) {
+        *(volatile uint32_t *)F103_RESET_STAGE_ADDR = F103_STAGE_PROBATION_TIMEOUT_BASE | gate_bits;
         f103_fw_reset_to_bootloader();
       }
     }

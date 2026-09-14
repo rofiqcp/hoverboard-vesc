@@ -281,6 +281,8 @@ if __name__ == '__main__':
     run([sys.executable,'tools/tests/host/test_swd_boot_safety.py'])
     run([sys.executable,'tools/tests/host/test_stlink_update_safety.py'])
     run([sys.executable,'tools/tests/host/test_bootloader_layout.py'])
+    run([sys.executable,'tools/tests/host/test_watchdog_runtime_hardening.py'])
+    run([sys.executable,'tools/tests/host/test_boot_state_machine_hardening.py'])
     run([sys.executable,'tools/tests/host/test_external_stream_resume.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader.py'])
     run([sys.executable,'tools/tests/host/test_pio_vesc_uploader_recovery.py'])

@@ -56,3 +56,23 @@ with tempfile.TemporaryDirectory() as td:
         else: os.environ['F103_LKG_ROOT']=old
 assert app=='motor_left_updated'; assert link.updated and link.writes>=6 and link.confirmed_reads>=1
 print(f'PIO_VESC_UPLOADER_MOCK_PASS direct_uart=1 bytes={len(fw)} writes={link.writes} crc=0x{upl.crc16(fw):04x} confirmed=1')
+
+# Initial port resolution must tolerate a board that is still booting after ST-Link reset.
+_orig_candidates,_orig_link,_orig_fw=upl._serial_candidates,upl.Link,upl.fw_version
+_probe_calls={'n':0}
+class _ProbeLink:
+    def __init__(self,args): self.args=args
+    def close(self): pass
+def _flaky_fw(_link,_timeout=2.0):
+    _probe_calls['n']+=1
+    if _probe_calls['n']<3: raise TimeoutError('startup')
+    return 'motor_left'
+try:
+    upl._serial_candidates=lambda:[('/dev/mock-f103','mock USB-UART')]
+    upl.Link=_ProbeLink; upl.fw_version=_flaky_fw
+    _ns=types.SimpleNamespace(serial_port='auto',baud=115200,firmware='fw.bin')
+    _port=upl.resolve_serial_port(_ns,1.5)
+    assert _port=='/dev/mock-f103' and _probe_calls['n']>=3
+finally:
+    upl._serial_candidates,upl.Link,upl.fw_version=_orig_candidates,_orig_link,_orig_fw
+print(f'PIO_VESC_PORT_STARTUP_GRACE_PASS attempts={_probe_calls["n"]}')

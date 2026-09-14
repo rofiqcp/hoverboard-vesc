@@ -11,9 +11,11 @@ assert "normal SWD attach PASS" in u
 assert '--rescue-under-reset' not in u
 assert 'automatic connect-under-reset' not in u
 assert 'normal_attach_stable=3/3' in u
-assert 'app_runtime_verified=' in u
-assert 'expected_vtor=APP_BASE' in u and 'pc_min=APP_BASE' in u and 'pc_max=META_BASE' in u
-assert "resume_before_shutdown=True" in u
+assert 'app_image_verified=' in u and 'app_runtime_verified=' in u and 'wait_for_application_runtime' in u
+assert 'expected_vtor=APP_BASE' not in u and 'pc_min=APP_BASE' not in u and 'pc_max=META_BASE' not in u
+assert 'resume_before_shutdown=True' not in u
+assert 'verify_f103_target(openocd, scripts, 100)' in u
+assert 'need_halt =' in g and 'actions = ["init"]' in g
 assert 'under_reset' not in g and 'connect_assert_srst' not in g
 assert 'resume_before_shutdown: bool = False' in g
 # Import uploader and validate exact metadata ABI expected by F103 bootloader.
@@ -41,4 +43,4 @@ normal=m.openocd_program_cmd(Path('/x/openocd'),Path('/x/scripts'),'swd',Path('/
 assert not any('connect_assert_srst' in x for x in normal) and 'connect_assert_srst' not in u
 assert any('0x0803E800' in x and 'meta.bin' in x for x in normal)
 
-print('STLINK_UPDATE_SAFETY_PASS normal_primary=1 under_reset_disabled=1 postrun_normal_probe=3 app_vtor_pc_guard=1 confirmed_meta=1 vector_guard=1 partition_guard=1')
+print('STLINK_UPDATE_SAFETY_PASS normal_primary=1 under_reset_disabled=1 postrun_normal_probe=3 noninvasive_postrun=1 confirmed_meta=1 vector_guard=1 partition_guard=1')

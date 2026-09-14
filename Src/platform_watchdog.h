@@ -16,6 +16,11 @@ typedef struct {
     uint8_t enabled;
     uint8_t last_health_ok;
     uint8_t boot_was_iwdg;
+    uint8_t init_failed;
+    uint8_t init_fail_stage;
+    uint32_t iwdg_sr;
+    uint32_t iwdg_pr;
+    uint32_t iwdg_rlr;
 } platform_watchdog_status_t;
 
 void platform_watchdog_init(void);

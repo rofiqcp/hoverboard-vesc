@@ -26,21 +26,6 @@ static bool running_vector_valid(void) {
     return pc>=F103_APP_BASE_ADDR && pc<(F103_APP_BASE_ADDR+F103_APP_REGION_SIZE);
 }
 
-static bool program_halfwords(uint32_t base, const uint8_t *data, uint32_t len) {
-    if (!data || (base & 1u)) return false;
-    HAL_FLASH_Unlock();
-    for (uint32_t i = 0u; i < len; i += 2u) {
-        uint16_t hw = data[i];
-        if (i + 1u < len) hw |= (uint16_t)((uint16_t)data[i + 1u] << 8);
-        else hw |= 0xFF00u;
-        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD, base + i, hw) != HAL_OK) {
-            HAL_FLASH_Lock(); return false;
-        }
-    }
-    HAL_FLASH_Lock();
-    return memcmp((const void *)base, data, len) == 0;
-}
-
 static void release_both(void) {
     mcpwm_foc_release_motor(false);
     mcpwm_foc_release_motor(true);
@@ -48,19 +33,6 @@ static void release_both(void) {
     RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
 }
 
-
-static bool erase_pages(uint32_t base, uint32_t bytes) {
-    if ((base & (F103_FLASH_PAGE_SIZE - 1u)) != 0u || bytes == 0u) return false;
-    FLASH_EraseInitTypeDef e = {0};
-    uint32_t page_error = 0u;
-    e.TypeErase = FLASH_TYPEERASE_PAGES;
-    e.PageAddress = base;
-    e.NbPages = (bytes + F103_FLASH_PAGE_SIZE - 1u) / F103_FLASH_PAGE_SIZE;
-    HAL_FLASH_Unlock();
-    const HAL_StatusTypeDef st = HAL_FLASHEx_Erase(&e, &page_error);
-    HAL_FLASH_Lock();
-    return st == HAL_OK && page_error == 0xFFFFFFFFu;
-}
 
 bool f103_fw_erase_staging(uint32_t fw_size) {
     /* The 120-KiB internal staging slot no longer exists. Field upload must
@@ -93,16 +65,24 @@ bool f103_fw_confirm_running_image(void) {
     if (!f103_fw_test_pending()) return true;
     release_both();
     const f103_update_meta_t *cur = (const f103_update_meta_t *)F103_META_BASE_ADDR;
-    if (!running_vector_valid() || image_crc16((const uint8_t *)F103_APP_BASE_ADDR, cur->size) != cur->crc16)
+    if (!running_vector_valid()) {
+        *(volatile uint32_t *)F103_RESET_STAGE_ADDR = F103_STAGE_PROBATION_VECTOR_FAIL;
         return false;
-    f103_update_meta_t m = *cur;
-    m.state = F103_UPDATE_STATE_CONFIRMED;
-    m.test_attempt = 0xFFFFu;
-    m.test_attempt_inv = 0xFFFFu;
-    /* Fail-closed confirmation: power loss during erase/program leaves invalid
-     * metadata, and resident bootloader stays in recovery rather than booting unknown bytes. */
-    if (!erase_pages(F103_META_BASE_ADDR, F103_META_REGION_SIZE)) return false;
-    return program_halfwords(F103_META_BASE_ADDR, (const uint8_t *)&m, sizeof(m));
+    }
+    if (image_crc16((const uint8_t *)F103_APP_BASE_ADDR, cur->size) != cur->crc16) {
+        *(volatile uint32_t *)F103_RESET_STAGE_ADDR = F103_STAGE_PROBATION_CRC_FAIL;
+        return false;
+    }
+    /* Never erase/program internal flash from the running motor application.
+     * STM32F1 is single-bank; an IRQ fetch during metadata erase can strand a
+     * healthy TEST image. Hand the verified probation result to the resident
+     * bootloader through reset-persistent SRAM instead. */
+    *(volatile uint32_t *)F103_RESET_STAGE_ADDR = F103_STAGE_PROBATION_CONFIRM_OK;
+    *(volatile uint32_t *)F103_RESET_REASON_ADDR = F103_RESET_REASON_TEST_OK;
+    __DSB();
+    __ISB();
+    NVIC_SystemReset();
+    for (;;) { }
 }
 
 void f103_fw_reset_to_bootloader(void) {

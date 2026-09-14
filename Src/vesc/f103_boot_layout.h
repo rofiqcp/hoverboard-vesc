@@ -25,6 +25,16 @@
 #define F103_RESET_STAGE_ADDR        0x2000BFFCu
 #define F103_RESET_REASON_REBOOT     0x52454254u /* 'REBT' */
 #define F103_RESET_REASON_FW_UPDATE  0x46575550u /* 'FWUP' */
+#define F103_RESET_REASON_TEST_OK    0x544F4B21u /* 'TOK!' app probation passed; bootloader commits CONFIRMED */
+
+/* Reset-stage black-box values used by the TEST probation state machine.
+ * Low byte of GATE/TIMEOUT stores a bitmask: bit0 elapsed, bit1 main-loop,
+ * bit2 watchdog-feed progress, bit3 USART3-DMA healthy, bit4 host protocol seen. */
+#define F103_STAGE_PROBATION_GATE_BASE       0x50524700u /* 'PRG'+bits */
+#define F103_STAGE_PROBATION_TIMEOUT_BASE    0x50525400u /* 'PRT'+bits */
+#define F103_STAGE_PROBATION_CONFIRM_OK      0x50524F4Bu /* 'PROK' */
+#define F103_STAGE_PROBATION_VECTOR_FAIL     0x50525646u /* 'PRVF' */
+#define F103_STAGE_PROBATION_CRC_FAIL        0x50524346u /* 'PRCF' */
 
 #define F103_BOOT_BASE_ADDR        0x08000000u
 #define F103_BOOT_SIZE             0x00002800u /* resident recovery bootloader, 10 KiB */

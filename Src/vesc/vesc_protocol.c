@@ -250,7 +250,8 @@ typedef enum {
     DETECT_ALL_RL_STEP,
     DETECT_ALL_RL_HIGH,
     DETECT_ALL_FLUX_RAMP,
-    DETECT_ALL_FLUX_SAMPLE
+    DETECT_ALL_FLUX_SAMPLE,
+    DETECT_ALL_FLUX_RETURN
 } detect_all_stage_t;
 
 typedef struct {
@@ -290,6 +291,11 @@ typedef struct {
     uint8_t standalone_second;
     float standalone_flux_current;
     float standalone_flux_ramp_erpm_s;
+    uint8_t flux_bounded_left;
+    float flux_base_phase_deg;
+    float flux_return_phase_deg;
+    int32_t flux_guard_min_counts;
+    int32_t flux_guard_max_counts;
 } detect_all_job_t;
 
 static detect_all_job_t s_detect_all;
@@ -1645,12 +1651,36 @@ static bool conf_general_measure_flux_linkage_f103_worker_start(bool second, COM
     s_detect_all.flux_current=fabsf(current);
     if(s_detect_all.flux_current<0.50f)s_detect_all.flux_current=0.50f;
     if(s_detect_all.flux_current>fmax)s_detect_all.flux_current=fmax;
-    /* Keep flux motion bounded on the steering-capable board. The requested
-     * VESC acceleration is honored, but the identification sample is taken at
-     * 600 ERPM instead of spinning indefinitely to a duty threshold. */
-    s_detect_all.flux_target_erpm=600.0f;
-    if(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE && rpm_or_ramp>600.0f && rpm_or_ramp<1200.0f)
-        s_detect_all.flux_target_erpm=rpm_or_ramp;
+    s_detect_all.flux_bounded_left=0u;
+    if(!second){
+        const mc_configuration *lc=&s_detect_all.backup[0];
+        const bool abi=lc->m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
+            (lc->foc_sensor_mode==FOC_SENSOR_MODE_ENCODER || lc->foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB);
+        const bool bounded_ready=abi && mc_interface_steering_calibration_valid() &&
+            mcpwm_foc_steering_is_homed() && mcpwm_foc_encoder_is_synced(false) &&
+            mcpwm_foc_get_position_min_user_counts(false)<mcpwm_foc_get_position_max_user_counts(false);
+        if(bounded_ready){
+            s_detect_all.flux_bounded_left=1u;
+            s_detect_all.flux_base_phase_deg=mcpwm_foc_get_phase_motor(false);
+            s_detect_all.flux_guard_min_counts=mcpwm_foc_get_position_min_user_counts(false);
+            s_detect_all.flux_guard_max_counts=mcpwm_foc_get_position_max_user_counts(false);
+            if(s_detect_all.flux_current<MCCONF_STEERING_DETECT_CURRENT_START_A)
+                s_detect_all.flux_current=MCCONF_STEERING_DETECT_CURRENT_START_A;
+            if(s_detect_all.flux_current>5.0f)s_detect_all.flux_current=5.0f;
+            if(s_detect_all.flux_current>fmax)s_detect_all.flux_current=fmax;
+            s_detect_all.flux_target_erpm=400.0f;
+        }else{
+            /* Preserve protocol compatibility for non-steering/host models. On
+             * the deployed LEFT steering unit bounded_ready is mandatory and
+             * true after encoder detect/home, so continuous rotation is never
+             * selected there. */
+            s_detect_all.flux_target_erpm=600.0f;
+        }
+    }else{
+        s_detect_all.flux_target_erpm=600.0f;
+        if(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE && rpm_or_ramp>600.0f && rpm_or_ramp<1200.0f)
+            s_detect_all.flux_target_erpm=rpm_or_ramp;
+    }
     if(s_detect_all.standalone_flux_ramp_erpm_s<50.0f)s_detect_all.standalone_flux_ramp_erpm_s=50.0f;
     if(s_detect_all.standalone_flux_ramp_erpm_s>20000.0f)s_detect_all.standalone_flux_ramp_erpm_s=20000.0f;
     detect_all_apply_runtime(mi);
@@ -2023,7 +2053,11 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
         }
         break;
     case DETECT_ALL_RL_LOW:
-        s_detect_all.sum_i+=mcpwm_foc_get_id_motor(second);
+        /* Commissioning must use the regulator-owned instantaneous current.
+         * GET_VALUES telemetry is deliberately filtered/qualified and can be
+         * zero while the powered-offset path is settling, which made a real
+         * 3 A locked-rotor Id measurement fail as low_i=0. */
+        s_detect_all.sum_i+=(float)m->m_id_q4/(float)FOC_CURRENT_Q4_PER_A;
         s_detect_all.sum_v+=mcpwm_foc_get_vd_motor(second);
         s_detect_all.sum_i_raw+=m->m_id_q4;
         s_detect_all.sum_v_raw+=m->m_vd;
@@ -2044,16 +2078,32 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
             s_detect_all_last_detail=1; conf_general_detect_worker_finish(-10); return;
         }
         break;
-    case DETECT_ALL_RL_STEP:
-        if(elapsed>=350u){
+    case DETECT_ALL_RL_STEP: {
+        /* L comes from the dI transient, so do not integrate hundreds of ms of
+         * steady-state ADC noise after a 3->5 A step has already settled. At
+         * 16 kHz/DIV6, 32 regulator samples are about 12 ms and retain the
+         * informative transient. Keep a 100-ms/20-sample fallback for a busy
+         * main loop, then fail closed rather than fitting noise. */
+        mcpwm_foc_rl_capture_t live_cap;
+        mcpwm_foc_rl_capture_get(second,&live_cap);
+        const bool enough=(live_cap.samples>=32u) ||
+                          (elapsed>=100u && live_cap.samples>=20u);
+        if(enough){
             mcpwm_foc_rl_capture_stop(second);
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_RL_HIGH;
             s_detect_all.stage_start_time=now_time;
+        }else if(elapsed>=500u){
+            s_detect_all_last_detail=12; conf_general_detect_worker_finish(-10); return;
         }
         break;
+    }
     case DETECT_ALL_RL_HIGH:
-        s_detect_all.sum_i+=mcpwm_foc_get_id_motor(second);
+        /* Commissioning must use the regulator-owned instantaneous current.
+         * GET_VALUES telemetry is deliberately filtered/qualified and can be
+         * zero while the powered-offset path is settling, which made a real
+         * 3 A locked-rotor Id measurement fail as low_i=0. */
+        s_detect_all.sum_i+=(float)m->m_id_q4/(float)FOC_CURRENT_Q4_PER_A;
         s_detect_all.sum_v+=mcpwm_foc_get_vd_motor(second);
         s_detect_all.sum_i_raw+=m->m_id_q4;
         s_detect_all.sum_v_raw+=m->m_vd;
@@ -2089,6 +2139,27 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
         }
         break;
     case DETECT_ALL_FLUX_RAMP: {
+        if(s_detect_all.flux_bounded_left && !second){
+            const int32_t pos=mcpwm_foc_get_position_user_counts(false);
+            const int32_t margin=128;
+            if(pos<=s_detect_all.flux_guard_min_counts+margin || pos>=s_detect_all.flux_guard_max_counts-margin){
+                s_detect_all_last_detail=12; conf_general_detect_worker_finish(-10); return;
+            }
+            const float ramp_ms=300.0f;
+            float f=(float)elapsed/ramp_ms; if(f>1.0f)f=1.0f;
+            float ph=s_detect_all.flux_base_phase_deg-60.0f*f;
+            while(ph<0.0f)ph+=360.0f;
+            while(ph>=360.0f)ph-=360.0f;
+            float ia=s_detect_all.flux_current*f; if(ia<0.50f)ia=0.50f;
+            mcpwm_foc_set_openloop_phase(ia,ph,false);
+            mcpwm_foc_vesc_override_touch(false);
+            if((float)elapsed>=ramp_ms){
+                detect_all_reset_sample();
+                s_detect_all.stage=DETECT_ALL_FLUX_SAMPLE;
+                s_detect_all.stage_start_time=now_time;
+            }
+            break;
+        }
         float ramp_rate=s_detect_all.standalone_cmd ? s_detect_all.standalone_flux_ramp_erpm_s : 1800.0f;
         if(ramp_rate<50.0f)ramp_rate=50.0f;
         float ramp_ms=(s_detect_all.flux_target_erpm-80.0f)*1000.0f/ramp_rate;
@@ -2120,17 +2191,54 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
         break;
     }
     case DETECT_ALL_FLUX_SAMPLE: {
-        mcpwm_foc_set_openloop_current(s_detect_all.flux_current,s_detect_all.flux_target_erpm,second);
-        mcpwm_foc_vesc_override_touch(second);
-        const float id=mcpwm_foc_get_id_motor(second);
-        const float iq=mcpwm_foc_get_iq_motor(second);
+        bool take_sample=true;
+        uint32_t bounded_done_ms=0u;
+        if(s_detect_all.flux_bounded_left && !second){
+            const int32_t pos=mcpwm_foc_get_position_user_counts(false);
+            const int32_t margin=128;
+            if(pos<=s_detect_all.flux_guard_min_counts+margin || pos>=s_detect_all.flux_guard_max_counts-margin){
+                s_detect_all_last_detail=12; conf_general_detect_worker_finish(-10); return;
+            }
+            uint32_t leg_ms=(uint32_t)(20000.0f/s_detect_all.flux_target_erpm+0.5f);
+            if(leg_ms<40u)leg_ms=40u;
+            if(leg_ms>250u)leg_ms=250u;
+            const uint32_t cyc=leg_ms*2u;
+            bounded_done_ms=cyc*10u; /* exactly ten symmetric triangle cycles */
+            const uint32_t ce=elapsed%cyc;
+            const bool forward=ce<leg_ms;
+            const uint32_t le=forward?ce:(ce-leg_ms);
+            const float ff=(float)le/(float)leg_ms;
+            const float off=forward?(-60.0f+120.0f*ff):(60.0f-120.0f*ff);
+            float ph=s_detect_all.flux_base_phase_deg+off;
+            while(ph<0.0f)ph+=360.0f;
+            while(ph>=360.0f)ph-=360.0f;
+            mcpwm_foc_set_openloop_phase(s_detect_all.flux_current,ph,false);
+            s_detect_all.flux_return_phase_deg=ph;
+            mcpwm_foc_vesc_override_touch(false);
+            if(le<8u || le+8u>=leg_ms)take_sample=false;
+            const float ae=fabsf(mcpwm_foc_get_erpm_motor(false));
+            if(ae<s_detect_all.flux_target_erpm*0.35f || ae>s_detect_all.flux_target_erpm*1.80f)take_sample=false;
+        }else{
+            mcpwm_foc_set_openloop_current(s_detect_all.flux_current,s_detect_all.flux_target_erpm,second);
+            mcpwm_foc_vesc_override_touch(second);
+        }
+        /* Flux identification is commissioning, not user telemetry. Sample the
+         * direct FOC state so telemetry LPF/GET_VALUES consumption cannot bias
+         * |Idq| toward zero while the bridge is intentionally energized. */
+        const float id=(float)m->m_id_q4/(float)FOC_CURRENT_Q4_PER_A;
+        const float iq=(float)m->m_iq_q4/(float)FOC_CURRENT_Q4_PER_A;
         const float vd=mcpwm_foc_get_vd_motor(second);
         const float vq=mcpwm_foc_get_vq_motor(second);
-        s_detect_all.sum_i+=foc_sqrtf_slow(id*id+iq*iq);
-        s_detect_all.sum_v+=foc_sqrtf_slow(vd*vd+vq*vq);
-        s_detect_all.sum_erpm+=fabsf(mcpwm_foc_get_erpm_motor(second));
-        s_detect_all.sample_n++;
-        if(elapsed>=800u && s_detect_all.sample_n>=40u){
+        if(take_sample){
+            s_detect_all.sum_i+=foc_sqrtf_slow(id*id+iq*iq);
+            s_detect_all.sum_v+=foc_sqrtf_slow(vd*vd+vq*vq);
+            s_detect_all.sum_erpm+=fabsf(mcpwm_foc_get_erpm_motor(second));
+            s_detect_all.sample_n++;
+        }
+        const uint32_t min_elapsed=s_detect_all.flux_bounded_left?bounded_done_ms:800u;
+        const uint32_t max_elapsed=s_detect_all.flux_bounded_left?(bounded_done_ms+800u):3000u;
+        const uint32_t min_samples=s_detect_all.flux_bounded_left?200u:40u;
+        if(elapsed>=min_elapsed && s_detect_all.sample_n>=min_samples){
             const float n=(float)s_detect_all.sample_n;
             const float i_mag=s_detect_all.sum_i/n;
             const float v_mag=s_detect_all.sum_v/n;
@@ -2140,13 +2248,19 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
             const float omega=erpm*6.28318530717958647692f/60.0f;
             const float bemf=v_mag-s_detect_all.r[mi]*i_mag;
             if(bemf<=0.02f || omega<=1.0f){s_detect_all_last_detail=7;conf_general_detect_worker_finish(-10);return;}
-            /* Same VESC open-loop flux equation used by
-             * conf_general_measure_flux_linkage_openloop():
-             * lambda=(|Vdq|-R|Idq|)/omega - L|Idq|. */
             const float ldrop=s_detect_all.l[mi]*i_mag;
             const float flux=bemf/omega-ldrop;
             if(!(flux>=0.0001f && flux<=1.0f)){s_detect_all_last_detail=8;conf_general_detect_worker_finish(-10);return;}
             s_detect_all.flux[mi]=flux;
+            if(s_detect_all.flux_bounded_left && !second){
+                /* Return to the captured electrical phase before release. This
+                 * removes the cumulative steering drift that otherwise occurs
+                 * when a triangle measurement ends at an arbitrary phase. */
+                s_detect_all.flux_return_phase_deg=mcpwm_foc_get_phase_motor(false);
+                s_detect_all.stage=DETECT_ALL_FLUX_RETURN;
+                s_detect_all.stage_start_time=now_time;
+                break;
+            }
             if(s_detect_all.standalone_cmd){
                 conf_general_detect_worker_finish(0);
                 return;
@@ -2156,8 +2270,37 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
             mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
             if(mi==0u){measure_r_l_imax_f103_start(1u,now_time);}
             else conf_general_autodetect_apply_sensors_foc_start(now_time);
-        } else if(elapsed>=3000u && s_detect_all.sample_n<40u){
-            s_detect_all_last_detail=5; conf_general_detect_worker_finish(-10); return;
+        } else if(elapsed>=max_elapsed && s_detect_all.sample_n<min_samples){
+            s_detect_all_last_detail=s_detect_all.flux_bounded_left?13:5;
+            conf_general_detect_worker_finish(-10); return;
+        }
+        break;
+    }
+    case DETECT_ALL_FLUX_RETURN: {
+        if(!s_detect_all.flux_bounded_left || second){s_detect_all_last_detail=14;conf_general_detect_worker_finish(-10);return;}
+        const int32_t pos=mcpwm_foc_get_position_user_counts(false);
+        const int32_t margin=128;
+        if(pos<=s_detect_all.flux_guard_min_counts+margin || pos>=s_detect_all.flux_guard_max_counts-margin){
+            s_detect_all_last_detail=12; conf_general_detect_worker_finish(-10); return;
+        }
+        const float return_ms=300.0f;
+        float f=(float)elapsed/return_ms; if(f>1.0f)f=1.0f;
+        float d=s_detect_all.flux_base_phase_deg-s_detect_all.flux_return_phase_deg;
+        while(d>180.0f)d-=360.0f;
+        while(d<-180.0f)d+=360.0f;
+        float ph=s_detect_all.flux_return_phase_deg+d*f;
+        while(ph<0.0f)ph+=360.0f;
+        while(ph>=360.0f)ph-=360.0f;
+        float ia=s_detect_all.flux_current*(1.0f-0.75f*f);
+        if(ia<0.50f)ia=0.50f;
+        mcpwm_foc_set_openloop_phase(ia,ph,false);
+        mcpwm_foc_vesc_override_touch(false);
+        if((float)elapsed>=return_ms){
+            if(s_detect_all.standalone_cmd){conf_general_detect_worker_finish(0);return;}
+            conf_general_detect_apply_all_foc_finalize_motor(mi);
+            mc_interface_select_motor_thread(1); mc_interface_release_motor();
+            mcpwm_foc_vesc_override_clear(false); mc_interface_select_motor_thread(1);
+            measure_r_l_imax_f103_start(1u,now_time);
         }
         break;
     }
@@ -2370,12 +2513,15 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         uint8_t b[64]; int32_t j=0;
         b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
         b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
-        b[j++]=w.enabled; b[j++]=w.last_health_ok; b[j++]=w.boot_was_iwdg; b[j++]=0u;
+        b[j++]=w.enabled; b[j++]=w.last_health_ok; b[j++]=w.boot_was_iwdg; b[j++]=w.init_failed;
+        b[j++]=w.init_fail_stage; b[j++]=0u;
         buffer_append_uint32(b,w.boot_reset_csr,&j); buffer_append_uint32(b,w.boot_reset_reason,&j);
         buffer_append_uint32(b,w.boot_reset_stage,&j); buffer_append_uint32(b,w.feed_count,&j);
         buffer_append_uint32(b,w.reject_count,&j); buffer_append_uint32(b,w.last_adc_heartbeat,&j);
         buffer_append_uint32(b,w.last_motor_heartbeat[0],&j); buffer_append_uint32(b,w.last_motor_heartbeat[1],&j);
-        buffer_append_uint32(b,w.last_feed_ms,&j); uart_send_payload(b,(uint16_t)j); return;
+        buffer_append_uint32(b,w.last_feed_ms,&j); buffer_append_uint32(b,w.iwdg_sr,&j);
+        buffer_append_uint32(b,w.iwdg_pr,&j); buffer_append_uint32(b,w.iwdg_rlr,&j);
+        uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_GET_COMMS_HEALTH) {
         uint8_t b[96]; int32_t j=0;
@@ -3089,12 +3235,11 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         break;
     }
     case COMM_JUMP_TO_BOOTLOADER:
-        if (!second && !s_boot_handoff_pending) {
-            /* Legacy no-reply command remains supported, but reset is deferred
-             * until every already-queued byte has left the USART shift register. */
-            mcpwm_foc_force_bridges_off();
-            s_boot_handoff_deadline_ms=HAL_GetTick()+HB_BOOT_HANDOFF_TIMEOUT_MS;HB_MEMORY_BARRIER();s_boot_handoff_pending=1u;
-        }
+        /* Production field updates use HB_CUSTOM_BOOT_HANDOFF (magic + version + ACK).
+         * Do not let an unsolicited/legacy VESC Tool probe turn a healthy motor APP into
+         * an indefinitely resident bootloader. The resident bootloader still accepts
+         * COMM_JUMP_TO_BOOTLOADER to finalize an already-authenticated stream. */
+        (void)second;
         break;
     case COMM_GET_VALUES:
         reply_values(second, false, d, n);
@@ -3417,7 +3562,7 @@ static bool probation_packet_allowed(const uint8_t *p, uint16_t len) {
     if (!s_probation) return true;
     if (!p || len == 0u) return false;
     const COMM_PACKET_ID id=(COMM_PACKET_ID)p[0];
-    if (id==COMM_FW_VERSION || id==COMM_JUMP_TO_BOOTLOADER) return true;
+    if (id==COMM_FW_VERSION) return true;
     if (id==COMM_CUSTOM_APP_DATA && len>=5u && p[1]==HB_CUSTOM_MAGIC0 && p[2]==HB_CUSTOM_MAGIC1 && p[3]==HB_CUSTOM_VERSION) {
         const uint8_t op=p[4];
         return op==HB_CUSTOM_GET_FW_UPDATE_STATE || op==HB_CUSTOM_GET_PLATFORM_INFO || op==HB_CUSTOM_BOOT_HANDOFF;

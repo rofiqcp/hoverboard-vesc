@@ -548,7 +548,7 @@ static void recovery_custom(const uint8_t *d, uint16_t n) {
     const uint8_t op = d[3];
     const f103_update_meta_t *m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
     if (op == HB_BOOT_GET_INFO) {
-        uint8_t r[28]; uint16_t i = 0u;
+        uint8_t r[40]; uint16_t i = 0u;
         r[i++] = COMM_CUSTOM_APP_DATA; r[i++] = HB_MAGIC0; r[i++] = HB_MAGIC1;
         r[i++] = HB_VERSION; r[i++] = op; r[i++] = 0u;
         put_be32(&r[i], F103_APP_REGION_SIZE); i += 4u;
@@ -560,6 +560,8 @@ static void recovery_custom(const uint8_t *d, uint16_t n) {
         put_be32(&r[i], done == 0u ? 0u : done + F103_VESC_IMAGE_HEADER_SIZE); i += 4u;
         put_be16(&r[i], meta_common_valid(m) ? m->test_attempt : 0xFFFFu); i += 2u;
         r[i++] = app_vector_valid() ? 1u : 0u;
+        put_be32(&r[i], *(volatile uint32_t *)F103_RESET_REASON_ADDR); i += 4u;
+        put_be32(&r[i], *(volatile uint32_t *)F103_RESET_STAGE_ADDR); i += 4u;
         send_payload(r, i);
         return;
     }
@@ -650,6 +652,7 @@ int main(void) {
     boot_request[1] = 0u;
     __DSB();
 
+    const uint32_t reset_reason = *(volatile uint32_t *)F103_RESET_REASON_ADDR;
     const f103_update_meta_t *m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
     bool recovery = force_recovery;
 
@@ -658,15 +661,32 @@ int main(void) {
             recovery = true;
         } else if (m->state == F103_UPDATE_STATE_TEST) {
             if (force_recovery) {
+                /* A TEST application explicitly requested recovery (startup/probation
+                 * failure). Persist that fact instead of leaving ambiguous TEST+attempt. */
+                if (meta_crc_valid(m)) (void)write_meta(F103_UPDATE_STATE_RECOVERY, m->size, m->crc16, true);
                 recovery = true;
             } else if (!meta_crc_valid(m) || !app_vector_valid() ||
                        crc16((const uint8_t *)F103_APP_BASE_ADDR, m->size) != m->crc16) {
                 (void)write_meta(F103_UPDATE_STATE_RECOVERY, m->size, m->crc16, meta_crc_valid(m));
                 recovery = true;
             } else if (!test_attempt_blank(m)) {
-                /* TEST was already attempted and reset before CONFIRMED. */
-                (void)write_meta(F103_UPDATE_STATE_RECOVERY, m->size, m->crc16, true);
-                recovery = true;
+                if (reset_reason == F103_RESET_REASON_TEST_OK) {
+                    /* Application probation already validated vector, whole-image CRC,
+                     * main loop, watchdog and USART. Commit CONFIRMED in resident code,
+                     * whose flash erase/program primitives execute from RAM. */
+                    *(volatile uint32_t *)F103_RESET_REASON_ADDR = 0u;
+                    const uint32_t size = m->size;
+                    const uint16_t crc = m->crc16;
+                    if (write_meta(F103_UPDATE_STATE_CONFIRMED, size, crc, true)) {
+                        m = (const f103_update_meta_t *)F103_META_BASE_ADDR;
+                        if (confirmed_app_valid(m)) jump_app();
+                    }
+                    recovery = true;
+                } else {
+                    /* TEST reset/crash without the explicit healthy handoff. */
+                    (void)write_meta(F103_UPDATE_STATE_RECOVERY, m->size, m->crc16, true);
+                    recovery = true;
+                }
             } else if (mark_test_attempt()) {
                 jump_app();
             } else {

@@ -86,26 +86,39 @@ def _serial_candidates():
         if dev not in [x[0] for x in out]: out.append((dev,desc))
     return out
 
-def resolve_serial_port(args):
+def resolve_serial_port(args, timeout_s: float = 1.5):
     requested=(args.serial_port or 'auto').strip()
-    if requested.lower() in ('auto','detect'):
-        candidates=_serial_candidates()
-        if not candidates: raise RuntimeError('no USB serial ports detected; connect the direct F103 USB-UART or use --serial-port explicitly')
-    else:
-        candidates=[(_stable_linux_port(requested),'explicit USB-UART')]
-    errors=[]
-    for dev,desc in candidates:
-        probe=argparse.Namespace(**vars(args)); probe.serial_port=dev; link=None
-        try:
-            link=Link(probe); hw=fw_version(link,1.2)
-            if not hw or hw=='unknown': raise RuntimeError('empty COMM_FW_VERSION identity')
-            print(f'[PORT] verified direct F103 UART {dev} ({desc}) target={hw}',flush=True); return dev
-        except Exception as e: errors.append(f'{dev}:{type(e).__name__}:{e}')
-        finally:
-            if link is not None:
-                try: link.close()
-                except Exception: pass
-    raise RuntimeError('no F103 VESC target responded: '+', '.join(errors))
+    auto=requested.lower() in ('auto','detect')
+    deadline=time.monotonic()+max(0.1,float(timeout_s))
+    attempt=0; last_errors=[]
+    while True:
+        attempt += 1
+        if auto:
+            candidates=_serial_candidates()
+            if not candidates:
+                last_errors=['no USB serial ports detected']
+        else:
+            candidates=[(_stable_linux_port(requested),'explicit USB-UART')]
+        errors=[]
+        for dev,desc in candidates:
+            probe=argparse.Namespace(**vars(args)); probe.serial_port=dev; link=None
+            try:
+                link=Link(probe); hw=fw_version(link,1.2)
+                if not hw or hw=='unknown': raise RuntimeError('empty COMM_FW_VERSION identity')
+                print(f'[PORT] verified direct F103 UART {dev} ({desc}) target={hw}',flush=True); return dev
+            except Exception as e: errors.append(f'{dev}:{type(e).__name__}:{e}')
+            finally:
+                if link is not None:
+                    try: link.close()
+                    except Exception: pass
+        if errors: last_errors=errors
+        if time.monotonic()>=deadline: break
+        if attempt==1 or attempt%3==0:
+            remain=max(0.0,deadline-time.monotonic())
+            print(f'[PORT] waiting for F103 UART startup attempt={attempt} remaining={remain:.1f}s',flush=True)
+        time.sleep(.25)
+    detail=', '.join(last_errors) if last_errors else 'no candidates'
+    raise RuntimeError('no F103 VESC target responded within startup grace window: '+detail)
 
 class Link:
     """Direct USB-UART transport to STM32F103 USART3."""
@@ -179,6 +192,8 @@ def boot_info(link, timeout=2.0):
         'resume':struct.unpack('>I',p[20:24])[0],
         'attempt':struct.unpack('>H',p[24:26])[0],
         'app_valid': bool(p[26]) if len(p)>=27 else True,
+        'reset_reason': struct.unpack('>I',p[27:31])[0] if len(p)>=31 else None,
+        'reset_stage': struct.unpack('>I',p[31:35])[0] if len(p)>=35 else None,
     }
 
 
@@ -363,17 +378,35 @@ def app_update_info(link, timeout=2.0):
     if status!=0: raise RuntimeError('application update metadata invalid')
     return {'state':state,'size':size,'crc':crc}
 
-def _wait_confirmed(link, fw:bytes, label:str, timeout:float=20.0):
-    wanted_crc=crc16(fw); deadline=time.monotonic()+timeout; last=None
+def _wait_confirmed(link, fw:bytes, label:str, timeout:float=25.0):
+    wanted_crc=crc16(fw); deadline=time.monotonic()+timeout; last=None; failures=0
     while time.monotonic()<deadline:
         try:
-            info=app_update_info(link,2.0); last=info
+            info=app_update_info(link,1.5); last=info; failures=0
             if info['state']==STATE_CONFIRMED and info['size']==len(fw) and info['crc']==wanted_crc:
                 print(f'[VESC] {label} CONFIRMED size={len(fw)} crc16=0x{wanted_crc:04X}',flush=True)
                 return info
         except Exception as e:
-            last=e
-        time.sleep(.25)
+            last=e; failures+=1
+            # Confirmation intentionally resets the F103 through resident bootloader.
+            # Reopen the host transport instead of assuming one serial fd survives every
+            # UART peripheral reset/USB-UART driver combination.
+            if failures>=2:
+                try:
+                    link.reconnect_transport(); failures=0
+                    hw=fw_version(link,1.0)
+                    if 'bootloader' in hw.lower():
+                        bi=boot_info(link,1.5); last=bi
+                        st=bi.get('state',0); rr=bi.get('reset_reason'); rs=bi.get('reset_stage')
+                        print(f'[VESC] {label} confirmation transition boot_state=0x{st:08X} '
+                              f'reason={None if rr is None else hex(rr)} stage={None if rs is None else hex(rs)}',flush=True)
+                        if st in (STATE_RECOVERY,STATE_TEST) and rr not in (None,0x544F4B21):
+                            raise RuntimeError(f'candidate entered recovery during probation: {bi}')
+                except RuntimeError:
+                    raise
+                except Exception as re:
+                    last=re
+        time.sleep(.20)
     raise RuntimeError(f'{label} application ran but did not reach CONFIRMED metadata: {last}')
 
 def _wait_application(link, label:str, timeout:float=65.0):
@@ -441,7 +474,9 @@ def upload(link,fw:bytes):
     if hw is None: raise RuntimeError(f'initial firmware probe failed after recovery window: {last_error}')
     wait_for_bootloader(link,hw)
     info=boot_info(link,3.0)
-    print(f'[BOOT] app_region={info["app_region"]} state=0x{info["state"]:08X} resume={info["resume"]}',flush=True)
+    print(f'[BOOT] app_region={info["app_region"]} state=0x{info["state"]:08X} resume={info["resume"]} '
+          f'reason={None if info.get("reset_reason") is None else hex(info["reset_reason"])} '
+          f'stage={None if info.get("reset_stage") is None else hex(info["reset_stage"])}',flush=True)
     lkg=ensure_lkg_backup(link,info)
     try:
         return _stream_install(link,fw,'candidate')
@@ -483,7 +518,7 @@ def main():
     ap.add_argument('--fault-stop-after',type=int,default=0)
     a=ap.parse_args()
     if a.selftest: selftest(); return
-    a.serial_port=resolve_serial_port(a)
+    a.serial_port=resolve_serial_port(a,15.0 if a.firmware else 3.0)
     lock_key=f'serial_{a.serial_port or "none"}'
     with UploadProcessLock(lock_key):
         link=Link(a)

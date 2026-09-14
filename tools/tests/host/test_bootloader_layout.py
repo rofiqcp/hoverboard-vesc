@@ -38,7 +38,7 @@ for token in ('F103_UPDATE_STATE_STREAM','F103_UPDATE_STATE_TEST','stream_begin'
 assert 'recv_payload(RECOVERY_BOOT_WINDOW_MS' not in boot
 assert '__disable_irq();' in boot and 'cpsie i' not in boot
 app=(R/'Src/main.c').read_text()
-assert '__enable_irq();' in app and app.index('__enable_irq();') > app.index('HAL_ADC_Start(&hadc2);')
+assert '__enable_irq();' in app and app.index('__enable_irq();') > app.index('HAL_ADC_Start(&hadc1)') and app.index('__enable_irq();') > app.index('HAL_ADC_Start(&hadc2)')
 assert ('branch_to_app' in boot and '__attribute__((naked, noreturn))' in boot) or '__set_MSP(sp);' in boot
 assert 'void SysTick_Handler(void)' in boot and 'HAL_IncTick();' in boot
 assert 'SystemCoreClockUpdate();' in boot and boot.index('SystemCoreClockUpdate();') < boot.index('HAL_Init();')

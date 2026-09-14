@@ -37,10 +37,16 @@ def verify_f103_target(openocd: Path, scripts: Path, speed: int = 100,
     transport = resolve_stlink_transport(scripts)
     cmd = [str(openocd), "-s", str(scripts), "-f", "interface/stlink.cfg",
            "-c", f"transport select {transport}"]
-    actions = ["init", "halt", "flash info 0"]
+    # Identity-only probes must not halt a healthy running motor controller.
+    # Some ST-Link V2/OpenOCD combinations report a live F103 as unknown on halt.
+    need_halt = expected_vtor is not None or pc_min is not None or pc_max is not None or resume_before_shutdown
+    actions = ["init"]
+    if need_halt:
+        actions += ["halt"]
+    actions += ["flash info 0"]
     if expected_vtor is not None or pc_min is not None or pc_max is not None:
         actions += ["mdw 0xE000ED08 1", "reg pc"]
-    if resume_before_shutdown:
+    if resume_before_shutdown and need_halt:
         actions += ["resume"]
     actions += ["shutdown"]
     cmd += ["-f", "target/stm32f1x.cfg",

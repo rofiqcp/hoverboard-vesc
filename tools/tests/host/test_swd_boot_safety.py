@@ -36,7 +36,9 @@ stlink=(R/'tools/pio_stlink_upload.py').read_text(); factory=(R/'tools/build_fac
 guard=(R/'tools/stlink_target_guard.py').read_text()
 assert 'under_reset' not in guard and 'connect_assert_srst' not in guard
 assert '--rescue-under-reset' not in stlink and 'normal_attach_stable=3/3' in stlink
-assert 'app_runtime_verified=' in stlink and 'expected_vtor=APP_BASE' in stlink
+assert 'app_image_verified=' in stlink and 'app_runtime_verified=' in stlink and 'wait_for_application_runtime' in stlink and 'expected_vtor=APP_BASE' not in stlink
+assert 'verify_f103_target(openocd, scripts, 100)' in stlink and 'resume_before_shutdown=True' not in stlink
+assert 'need_halt =' in guard and 'actions = ["init"]' in guard
 assert 'META_STATE_CONFIRMED = 0x434E464D' in stlink and 'confirmed_meta(image_bytes)' in stlink
 assert 'META_STATE_CONFIRMED = 0x434E464D' in factory and 'confirmed_meta(app)' in factory
 assert '[env:BOOTLOADER_STAGE2_UART]' not in ini

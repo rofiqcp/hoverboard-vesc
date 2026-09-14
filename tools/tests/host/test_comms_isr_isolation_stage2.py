@@ -19,7 +19,7 @@ assert 's_rt_cmd_coalesced++' in vp and 's_rx_queue_drop++' in vp and 's_tx_queu
 assert 's_tx_queue_highwater' in vp and 's_rx_queue_highwater' in vp
 # ISR-owned telemetry snapshots are retry-coherent without globally masking IRQ.
 assert 'void mcpwm_foc_get_irq_epoch' in mc and 'void mcpwm_foc_get_irq_epoch' in mh
-assert 'foc_telem_isr_snapshot' in mc and 'if(e0==e1 && x0==x1 && e1==x1)break;' in mc
+assert 'foc_telem_isr_snapshot' in mc and re.search(r'if\s*\(e0\s*==\s*e1\s*&&\s*x0\s*==\s*x1\s*&&\s*e1\s*==\s*x1\s*\)\s*\{?[^\n]*break;', mc)
 scaled=mc[mc.index('void mcpwm_foc_get_values_scaled'):mc.index('void mcpwm_foc_get_values(',mc.index('void mcpwm_foc_get_values_scaled'))]
 vals=mc[mc.index('void mcpwm_foc_get_values('):]
 assert '__disable_irq()' not in scaled
@@ -52,6 +52,6 @@ assert 'HB_GET_COMMS_HEALTH = 24' in dual and 'def comms_health(self)' in dual
 
 # Profile coherent snapshot also rejects a read made while the IRQ itself is active.
 prof=mc[mc.index('void mcpwm_foc_get_isr_profile'):mc.index('/* Normalisasi fitur',mc.index('void mcpwm_foc_get_isr_profile'))]
-assert 'if(e0!=x0)continue;' in prof
-assert 'if(e0==e1 && x0==x1 && e1==x1)break;' in prof
+assert re.search(r'if\s*\(e0\s*!=\s*x0\s*\)\s*continue;', prof)
+assert re.search(r'if\s*\(e0\s*==\s*e1\s*&&\s*x0\s*==\s*x1\s*&&\s*e1\s*==\s*x1\s*\)\s*\{?[^\n]*break;', prof)
 print('COMMS_ISR_ISOLATION_STAGE2_STATIC_PASS protocol_irq_mask=0 rx_depth=16 tx_depth=8 batch=2 adc_prio=0 uart_rx_prio=1 tx_prio=2 coherent_snapshots=1 health_op=24')

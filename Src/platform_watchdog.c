@@ -18,6 +18,7 @@ static volatile uint32_t s_last_motor_heartbeat[2]={0u,0u};
 static volatile uint8_t s_enabled=0u;
 static volatile uint8_t s_last_health_ok=0u;
 static volatile uint8_t s_init_failed=0u;
+static volatile uint8_t s_init_fail_stage=0u;
 
 static inline void platform_iwdg_reload(void) {
 #ifdef STM32F103xE
@@ -44,18 +45,21 @@ void platform_watchdog_init(void) {
     s_last_feed_ms=HAL_GetTick();
 #ifdef STM32F103xE
     s_init_failed=0u;
-    SET_BIT(RCC->CSR, RCC_CSR_LSION);
-    uint32_t guard=8000000u;
-    while ((RCC->CSR & RCC_CSR_LSIRDY) == 0u && guard-- != 0u) {}
-    if ((RCC->CSR & RCC_CSR_LSIRDY) == 0u) { s_init_failed=1u; goto fail_closed; }
-    IWDG->KR=0x5555u;
-    IWDG->PR=6u; /* divide LSI by 256 */
-    IWDG->RLR=PLATFORM_IWDG_RELOAD;
-    guard=8000000u;
-    while ((IWDG->SR & (IWDG_SR_PVU|IWDG_SR_RVU)) != 0u && guard-- != 0u) {}
-    if ((IWDG->SR & (IWDG_SR_PVU|IWDG_SR_RVU)) != 0u) { s_init_failed=1u; goto fail_closed; }
-    platform_iwdg_reload();
-    IWDG->KR=0xCCCCu;
+    s_init_fail_stage=0u;
+    /* STM32F1 requires the watchdog to be STARTED before PR/RLR update flags
+     * can complete. Use ST's HAL sequence exactly: START -> write access ->
+     * PR/RLR -> wait update -> reload. The previous code waited on SR before
+     * START and therefore failed closed on real F103 hardware. */
+    IWDG_HandleTypeDef hiwdg={0};
+    hiwdg.Instance=IWDG;
+    hiwdg.Init.Prescaler=IWDG_PRESCALER_256;
+    hiwdg.Init.Reload=PLATFORM_IWDG_RELOAD;
+    if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
+        s_init_failed=1u; s_init_fail_stage=1u; goto fail_closed;
+    }
+    if ((IWDG->SR & (IWDG_SR_PVU|IWDG_SR_RVU)) != 0u) {
+        s_init_failed=1u; s_init_fail_stage=2u; goto fail_closed;
+    }
 #endif
     s_enabled=1u; s_last_health_ok=1u; return;
 fail_closed:
@@ -114,4 +118,11 @@ void platform_watchdog_get_status(platform_watchdog_status_t *out) {
     out->enabled=s_enabled;
     out->last_health_ok=s_last_health_ok;
     out->boot_was_iwdg=platform_watchdog_boot_was_iwdg()?1u:0u;
+    out->init_failed=s_init_failed;
+    out->init_fail_stage=s_init_fail_stage;
+#ifdef STM32F103xE
+    out->iwdg_sr=IWDG->SR;
+    out->iwdg_pr=IWDG->PR;
+    out->iwdg_rlr=IWDG->RLR;
+#endif
 }

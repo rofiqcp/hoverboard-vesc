@@ -96,9 +96,12 @@ def _direct_serial_candidates() -> list[tuple[str, str]]:
     """Enumerate generic USB-UART ports; no intermediate MCU gateway assumptions."""
     if serial is None:
         return []
-    import serial.tools.list_ports
+    # Do not use ``import serial.tools...`` here: inside a function that syntax
+    # binds ``serial`` as a local name and makes the guard above raise
+    # UnboundLocalError. Import only the submodule symbol.
+    from serial.tools import list_ports
     ranked=[]
-    for q in serial.tools.list_ports.comports():
+    for q in list_ports.comports():
         dev=_stable_serial_path(q.device)
         meta=" ".join(str(x or "") for x in (q.description,q.manufacturer,q.hwid)).lower()
         if q.vid is None and "/dev/ttyUSB" not in q.device and "/dev/ttyACM" not in q.device and "usb" not in meta:
@@ -1138,13 +1141,15 @@ class VescDual:
     def platform_health(self) -> dict[str, int | bool]:
         p=self.custom_transact(HB_GET_PLATFORM_HEALTH,right=False,timeout=max(self.timeout,1.2))
         status=parse_custom_header(p,HB_GET_PLATFORM_HEALTH)
-        if status or len(p)!=46:
+        if status or len(p)!=60:
             raise RuntimeError(f"platform_health status={status} len={len(p)}")
-        enabled,healthy,boot_iwdg,_=p[6:10]
-        vals=struct.unpack_from(">9I",p,10)
+        enabled,healthy,boot_iwdg,init_failed,init_fail_stage,_=p[6:12]
+        vals=struct.unpack_from(">12I",p,12)
         names=("boot_reset_csr","boot_reset_reason","boot_reset_stage","feed_count","reject_count",
-               "adc_heartbeat","left_heartbeat","right_heartbeat","last_feed_ms")
-        out=dict(zip(names,vals)); out.update(enabled=bool(enabled),healthy=bool(healthy),boot_iwdg=bool(boot_iwdg))
+               "adc_heartbeat","left_heartbeat","right_heartbeat","last_feed_ms",
+               "iwdg_sr","iwdg_pr","iwdg_rlr")
+        out=dict(zip(names,vals)); out.update(enabled=bool(enabled),healthy=bool(healthy),boot_iwdg=bool(boot_iwdg),
+                                              init_failed=bool(init_failed),init_fail_stage=init_fail_stage)
         return out
 
     def comms_health(self) -> dict[str, int]:

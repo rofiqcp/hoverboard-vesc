@@ -98,6 +98,56 @@ def unique_speeds(preferred: int):
     return out
 
 
+def wait_for_application_runtime(size: int, wanted_crc: int, timeout_s: float = 15.0) -> bool:
+    """Verify the freshly flashed app through the production USART3 protocol.
+
+    If no direct USB-UART is physically present, APP_STLINK can still be used as
+    an ST-Link-only recovery path and returns False. If a UART candidate exists,
+    however, failure to reach the matching CONFIRMED runtime is a hard failure.
+    """
+    try:
+        import pio_vesc_upload as vu
+        candidates=vu._serial_candidates()
+    except Exception as exc:
+        print(f'[STLINK] UART runtime proof unavailable: {exc}', flush=True)
+        return False
+    if not candidates:
+        print('[STLINK] no direct USB-UART detected; runtime proof limited to image/metadata + SWD', flush=True)
+        return False
+    deadline=time.monotonic()+max(1.0,float(timeout_s)); last='no response'; attempt=0
+    while time.monotonic()<deadline:
+        attempt += 1
+        try:
+            candidates=vu._serial_candidates() or candidates
+        except Exception:
+            pass
+        for dev,_desc in candidates:
+            link=None
+            try:
+                ns=argparse.Namespace(serial_port=dev,baud=115200)
+                link=vu.Link(ns)
+                hw=vu.fw_version(link,1.0)
+                if hw and 'bootloader' not in hw.lower():
+                    info=vu.app_update_info(link,1.0)
+                    if info['state']==vu.STATE_CONFIRMED and info['size']==size and info['crc']==wanted_crc:
+                        print(f'[STLINK] application runtime PASS uart={dev} hw={hw} CONFIRMED size={size} crc16=0x{wanted_crc:04X}', flush=True)
+                        return True
+                    last=f'{hw} metadata={info}'
+                else:
+                    last=hw or 'empty identity'
+            except Exception as exc:
+                last=f'{dev}: {type(exc).__name__}: {exc}'
+            finally:
+                if link is not None:
+                    try: link.close()
+                    except Exception: pass
+        if attempt==1 or attempt%3==0:
+            remain=max(0.0,deadline-time.monotonic())
+            print(f'[STLINK] waiting application UART runtime attempt={attempt} remaining={remain:.1f}s last={last}', flush=True)
+        time.sleep(.30)
+    raise RuntimeError(f'application UART runtime did not become healthy: {last}')
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True)
@@ -165,29 +215,30 @@ def main() -> None:
                   f'address=0x{args.address:08X} swd={speed}kHz mode={mode}', flush=True)
             last_rc = subprocess.run(cmd, check=False).returncode
             if last_rc == 0:
-                # A 250-ms probe can catch the resident bootloader before it has
-                # CRC-checked and jumped to APP, producing a false PASS. Require
-                # several fresh NORMAL-SWD reconnects after the target has had
-                # enough time to enter the final runtime image. APP uploads also
-                # prove VTOR and PC are inside the 0x08002800 application region.
+                # Post-run proof must be non-invasive. On this ST-Link V2/OpenOCD pair,
+                # halting a healthy running F103 can report an "unknown state" and
+                # fabricate PC/MSP=0 even though normal SWD examination remains valid.
+                # The image and CONFIRMED metadata were already byte-verified above;
+                # here we prove repeated normal-SWD attach without reset/under-reset.
                 app_runtime = args.confirmed_meta_address is not None
                 checks = ((0.75, 1), (1.25, 2), (3.00, 3))
                 for delay_s, check_no in checks:
                     time.sleep(delay_s)
                     try:
-                        verify_f103_target(
-                            openocd, scripts, 100,
-                            resume_before_shutdown=True,
-                            expected_vtor=APP_BASE if app_runtime else None,
-                            pc_min=APP_BASE if app_runtime else None,
-                            pc_max=META_BASE if app_runtime else None)
+                        verify_f103_target(openocd, scripts, 100)
                     except RuntimeError as exc:
                         raise SystemExit(
                             f'STLINK_POSTRUN_NORMAL_ATTACH_FAIL check={check_no}/3 '
                             f'app_runtime={int(app_runtime)}: {exc}')
                     print(f'[STLINK] post-run normal SWD check {check_no}/3 PASS', flush=True)
+                runtime_verified=False
+                if app_runtime:
+                    try:
+                        runtime_verified=wait_for_application_runtime(size,crc16(image_bytes))
+                    except RuntimeError as exc:
+                        raise SystemExit(f'STLINK_POSTRUN_APP_RUNTIME_FAIL: {exc}')
                 print(f'STLINK_BIN_UPLOAD_PASS swd={speed}kHz normal_attach_stable=3/3 '
-                      f'app_runtime_verified={int(app_runtime)}', flush=True)
+                      f'app_image_verified={int(app_runtime)} app_runtime_verified={int(runtime_verified)}', flush=True)
                 return
             if attempt < len(speeds):
                 print(f'[STLINK] retrying at safer SWD clock after rc={last_rc}', file=sys.stderr, flush=True)
