@@ -190,6 +190,9 @@ int main(void) {
   /* Start IWDG only after potentially long boot/home/button waits. From here on
    * every intentional blocking commissioning helper services the same health gate. */
   platform_watchdog_init();
+  if (platform_watchdog_boot_was_iwdg()) {
+    mcpwm_foc_report_watchdog_reset_fault();
+  }
 
   /* TEST images must prove normal main-context + USART protocol health, not
    * merely ADC/FOC ISR liveness. Until confirmation all actuator commands are

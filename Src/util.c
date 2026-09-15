@@ -139,12 +139,21 @@ bool Input_Init(void) {
 }
 
 void poweronMelody(void) {
-  buzzerCount = 0;
-  for (int i = 8; i >= 0; --i) {
-    buzzerFreq = (uint8_t)i;
-    HAL_Delay(100);
+  /* Compact ESC/VESC-style ascending arpeggio. The hoverboard buzzer is driven
+   * from the 16-kHz motor ISR, so a smaller divider is a higher note. Keep the
+   * melody short and buzzer-only: power-on audio must never energize a motor
+   * phase or interfere with steering homing. */
+  static const uint8_t notes[] = {12u, 9u, 7u, 5u};
+  static const uint16_t duration_ms[] = {65u, 65u, 75u, 120u};
+  buzzerCount = 0u;
+  buzzerPattern = 0u;
+  for (uint8_t i = 0u; i < (uint8_t)(sizeof(notes) / sizeof(notes[0])); ++i) {
+    buzzerFreq = notes[i];
+    HAL_Delay(duration_ms[i]);
+    buzzerFreq = 0u;
+    if (i + 1u < (uint8_t)(sizeof(notes) / sizeof(notes[0]))) HAL_Delay(20u);
   }
-  buzzerFreq = 0;
+  buzzerFreq = 0u;
 }
 
 void beepCount(uint8_t cnt, uint8_t freq, uint8_t pattern) {

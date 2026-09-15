@@ -3067,6 +3067,46 @@ static void terminal_send_text(const char *text) {
     b[0]=COMM_PRINT; memcpy(&b[1],text,n); uart_send_payload(b,(uint16_t)(n+1u));
 }
 
+static const char *vesc_fault_name(mc_fault_code fault) {
+    switch (fault) {
+    case FAULT_CODE_NONE: return "NONE";
+    case FAULT_CODE_OVER_VOLTAGE: return "OVER_VOLTAGE";
+    case FAULT_CODE_UNDER_VOLTAGE: return "UNDER_VOLTAGE";
+    case FAULT_CODE_DRV: return "DRV";
+    case FAULT_CODE_ABS_OVER_CURRENT: return "ABS_OVER_CURRENT";
+    case FAULT_CODE_OVER_TEMP_FET: return "OVER_TEMP_FET";
+    case FAULT_CODE_OVER_TEMP_MOTOR: return "OVER_TEMP_MOTOR";
+    case FAULT_CODE_GATE_DRIVER_OVER_VOLTAGE: return "GATE_DRIVER_OVER_VOLTAGE";
+    case FAULT_CODE_GATE_DRIVER_UNDER_VOLTAGE: return "GATE_DRIVER_UNDER_VOLTAGE";
+    case FAULT_CODE_MCU_UNDER_VOLTAGE: return "MCU_UNDER_VOLTAGE";
+    case FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET: return "BOOTING_FROM_WATCHDOG_RESET";
+    case FAULT_CODE_ENCODER_SPI: return "ENCODER_SPI";
+    case FAULT_CODE_ENCODER_SINCOS_BELOW_MIN_AMPLITUDE: return "ENCODER_SINCOS_BELOW_MIN_AMPLITUDE";
+    case FAULT_CODE_ENCODER_SINCOS_ABOVE_MAX_AMPLITUDE: return "ENCODER_SINCOS_ABOVE_MAX_AMPLITUDE";
+    case FAULT_CODE_FLASH_CORRUPTION: return "FLASH_CORRUPTION";
+    case FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1: return "HIGH_OFFSET_CURRENT_SENSOR_1";
+    case FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_2: return "HIGH_OFFSET_CURRENT_SENSOR_2";
+    case FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_3: return "HIGH_OFFSET_CURRENT_SENSOR_3";
+    case FAULT_CODE_UNBALANCED_CURRENTS: return "UNBALANCED_CURRENTS";
+    case FAULT_CODE_BRK: return "BRK";
+    case FAULT_CODE_RESOLVER_LOT: return "RESOLVER_LOT";
+    case FAULT_CODE_RESOLVER_DOS: return "RESOLVER_DOS";
+    case FAULT_CODE_RESOLVER_LOS: return "RESOLVER_LOS";
+    case FAULT_CODE_FLASH_CORRUPTION_APP_CFG: return "FLASH_CORRUPTION_APP_CFG";
+    case FAULT_CODE_FLASH_CORRUPTION_MC_CFG: return "FLASH_CORRUPTION_MC_CFG";
+    case FAULT_CODE_ENCODER_NO_MAGNET: return "ENCODER_NO_MAGNET";
+    case FAULT_CODE_ENCODER_MAGNET_TOO_STRONG: return "ENCODER_MAGNET_TOO_STRONG";
+    case FAULT_CODE_PHASE_FILTER: return "PHASE_FILTER";
+    case FAULT_CODE_ENCODER_FAULT: return "ENCODER_FAULT";
+    case FAULT_CODE_LV_OUTPUT_FAULT: return "LV_OUTPUT_FAULT";
+    case FAULT_CODE_ENCODER_SLIP: return "ENCODER_SLIP";
+    case FAULT_CODE_OVERSPEED: return "OVERSPEED";
+    case FAULT_CODE_UNDERSPEED: return "UNDERSPEED";
+    case FAULT_CODE_ABS_OVERSPEED: return "ABS_OVERSPEED";
+    default: return "UNKNOWN";
+    }
+}
+
 /* Tiny decimal parsers avoid pulling strtof/strtol into the 120-KiB app image. */
 static bool terminal_float(const char *s,float *out){
     if(!s||!out||!*s)return false;
@@ -3090,8 +3130,8 @@ static void terminal_help(void){
 
 static void terminal_values(bool second){
     mc_values v;get_values_normalized(second,&v);char o[260];
-    snprintf(o,sizeof(o),"id=%u fault=%u Vin=%.2f erpm=%.0f duty=%.3f Im=%.2f Iin=%.2f Id=%.2f Iq=%.2f Vd=%.2f Vq=%.2f pos=%.2f hall=%u state=%u mode=%u\n",
-        (unsigned)v.vesc_id,(unsigned)v.fault_code,(double)v.v_in,(double)v.rpm,(double)v.duty_now,
+    snprintf(o,sizeof(o),"id=%u fault=%u(%s) Vin=%.2f erpm=%.0f duty=%.3f Im=%.2f Iin=%.2f Id=%.2f Iq=%.2f Vd=%.2f Vq=%.2f pos=%.2f hall=%u state=%u mode=%u\n",
+        (unsigned)v.vesc_id,(unsigned)v.fault_code,vesc_fault_name(v.fault_code),(double)v.v_in,(double)v.rpm,(double)v.duty_now,
         (double)v.current_motor,(double)v.current_in,(double)v.id,(double)v.iq,(double)v.vd,(double)v.vq,
         (double)v.position,(unsigned)mcpwm_foc_get_motor_const(second)->m_hall_state,(unsigned)mc_interface_get_state_motor(second),(unsigned)mcpwm_foc_get_motor_const(second)->m_control_mode);
     terminal_send_text(o);

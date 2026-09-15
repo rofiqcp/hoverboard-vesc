@@ -445,6 +445,9 @@ void mcpwm_foc_release_motor(bool is_second_motor);
  * to qualify and fault again normally. */
 void mcpwm_foc_clear_fault(bool is_second_motor);
 void mcpwm_foc_clear_faults(void);
+/* Publish a hardware-IWDG reboot through the standard VESC fault enum. The
+ * fault is transient and uses the configured VESC fault-stop interval. */
+void mcpwm_foc_report_watchdog_reset_fault(void);
 void mcpwm_foc_force_bridges_off(void);
 /* VESC COMM_MOTOR_ESTOP: hentikan kedua bridge dan abaikan perintah motor
  * selama duration_ms. Nilai 0 berarti release sekali tanpa hold tambahan. */

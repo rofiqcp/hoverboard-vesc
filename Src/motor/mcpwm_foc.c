@@ -2625,6 +2625,23 @@ void mcpwm_foc_clear_faults(void) {
     mcpwm_foc_clear_fault(true);
 }
 
+void mcpwm_foc_report_watchdog_reset_fault(void) {
+    /* VESC defines FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET as code 10. This is
+     * a boot-cause report, not a live electrical failure: release both bridges
+     * first, expose the fault long enough for the host to observe it, then let
+     * the normal VESC fault-stop recovery timer clear it. Do not feed it into
+     * the pre-fault flight recorder because there is no valid pre-reset trace. */
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_release_motor(true);
+    mcpwm_foc_motor_t *motors[2] = {&m_motor_1, &m_motor_2};
+    for (uint8_t i = 0u; i < 2u; ++i) {
+        mcpwm_foc_motor_t *m = motors[i];
+        m->m_fault = FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET;
+        m->m_fault_recovery_ticks = m->m_fault_stop_ticks ? m->m_fault_stop_ticks : 1u;
+        m->m_state = MC_STATE_OFF;
+    }
+}
+
 bool mcpwm_foc_estop_active(void) {
     return s_estop_ticks != 0u;
 }
