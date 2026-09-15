@@ -405,9 +405,9 @@ int main(void){
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("legacy enable must not bypass owned VESC timeout");
     mcpwm_foc_vesc_override_clear(false); enable=0u; motorRunReq=0u;
 
-    /* Standard VESC telemetry must report zero motor/input current while the
-     * bridge is released. Raw high-Z ADC/baseline information belongs only to
-     * project diagnostic packets and must never leak into COMM_GET_VALUES. */
+    /* Stable bridge-OFF telemetry uses the qualified high-impedance baseline so
+     * VESC Tool can still observe real near-zero current while stopped. It must
+     * stay bounded and must not be replaced by a synthetic all-zero packet. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     legacy_sync();
     adc_buffer.rlA=2263; adc_buffer.rlB=2281; adc_buffer.dcl=1925;
@@ -419,8 +419,12 @@ int main(void){
     legacy_sync();
     mc_values offv; mcpwm_foc_get_values(&offv,false);
     if(m_motor_1.m_state!=MC_STATE_OFF || (LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)return fail("released bridge state regression");
-    if(fabsf(offv.current_in)>0.001f || fabsf(offv.id)>0.001f || fabsf(offv.iq)>0.001f || fabsf(offv.current_motor)>0.001f)
-        return fail("standard OFF current telemetry must be zero");
+    if(!isfinite(offv.current_in)||!isfinite(offv.id)||!isfinite(offv.iq)||!isfinite(offv.current_motor))
+        return fail("standard OFF current telemetry must stay finite");
+    if(fabsf(offv.current_in)>0.20f || fabsf(offv.id)>0.20f || fabsf(offv.iq)>0.20f || fabsf(offv.current_motor)>0.20f)
+        return fail("standard OFF current telemetry exceeds qualified near-zero bound");
+    if(fabsf(offv.id)<0.001f && fabsf(offv.iq)<0.001f && fabsf(offv.current_motor)<0.001f)
+        return fail("standard OFF current telemetry was incorrectly forced to zero");
 
     /* One Hall count is four mechanical degrees at 15 pole-pairs. Kp=0.060
      * would request about 0.24 A with a 1 A motor-current limit, but the

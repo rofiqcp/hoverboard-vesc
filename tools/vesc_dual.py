@@ -11,10 +11,17 @@ polls selective mc_values telemetry from both motors.
 from __future__ import annotations
 import os
 import struct
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# Keep sibling imports working both for direct CLI execution and for importlib/
+# test harness loading from another working directory.
+_TOOLS_DIR = Path(__file__).resolve().parent
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
 from vesc_common import crc16
 
 try:
