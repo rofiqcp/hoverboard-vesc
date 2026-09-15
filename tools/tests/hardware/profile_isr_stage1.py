@@ -16,7 +16,7 @@ PROFILE_REV=0x00030000
 def main():
     ap=argparse.ArgumentParser(description='Read-only Stage-1 ISR profiler acceptance')
     ap.add_argument('port',nargs='?',default='auto')
-    ap.add_argument('--baud',type=int,default=115200)
+    ap.add_argument('--baud',type=int,default=921600)
     ap.add_argument('--seconds',type=float,default=2.0)
     a=ap.parse_args()
     link=VescDual(a.port,a.baud,timeout=1.5)

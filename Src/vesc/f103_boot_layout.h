@@ -7,10 +7,12 @@
 #define F103_FLASH_TOTAL_SIZE     0x00040000u /* 256 KiB */
 #define F103_FLASH_PAGE_SIZE      0x00000800u /* 2 KiB for STM32F103xE */
 
-/* Native VESC transport: F103 USART3 PB10/PB11 <-> external USB-UART <-> PC/NUC.
- * The motor-controller UART remains 115200 baud for VESC traffic and firmware
- * streaming. No intermediate MCU gateway is part of the production path. */
-#define F103_VESC_UART_BAUD       115200u
+/* Native VESC transport: F103 USART3 PB10/PB11 <-> CH340 USB-UART <-> PC/NUC.
+ * Runtime application and resident recovery bootloader both use 921600 baud
+ * for fast VESC traffic and firmware streaming over CH340 USB-UART. The host
+ * uploader retains a 115200 legacy fallback for one-time bootloader migration. */
+#define F103_VESC_UART_BAUD       921600u
+#define F103_BOOT_UART_BAUD       921600u
 
 /* Top 16 bytes of SRAM are reserved in BOTH linker scripts. A two-word magic
  * makes application -> resident-bootloader entry independent of flash writes.

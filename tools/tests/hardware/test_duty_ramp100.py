@@ -42,7 +42,7 @@ def main():
     motors=[]
     if a.motor in ('left','both'): motors.append((False,'left'))
     if a.motor in ('right','both'): motors.append((True,'right'))
-    link=VescDual(a.port,115200,timeout=.5)
+    link=VescDual(a.port,921600,timeout=.5)
     link.require_platform_compatible(True)
     rows=[]
     try:

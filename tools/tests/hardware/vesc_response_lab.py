@@ -187,7 +187,7 @@ def main():
     ap.add_argument('--speed-kp',type=float); ap.add_argument('--speed-ki',type=float); ap.add_argument('--speed-kd',type=float)
     ap.add_argument('--pos-kp',type=float); ap.add_argument('--pos-ki',type=float); ap.add_argument('--pos-kd',type=float); ap.add_argument('--filter',type=float)
     ap.add_argument('--out',default='tools/results/response_lab')
-    a=ap.parse_args(); right=a.motor=='right'; link=VescDual(a.port,115200,timeout=.65); link.require_platform_compatible(True); outdir=Path(a.out)
+    a=ap.parse_args(); right=a.motor=='right'; link=VescDual(a.port,921600,timeout=.65); link.require_platform_compatible(True); outdir=Path(a.out)
     try:
         base=link.get_tuning(right)
         if a.mode=='show': print(json.dumps(base.physical,indent=2)); return

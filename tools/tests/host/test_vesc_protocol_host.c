@@ -699,9 +699,9 @@ int main(void){
             return fail("APP_ADC_UART support");
         ac=*app_vesc_get_configuration(false); ac.app_to_use=APP_UART;
         if(!app_vesc_set_configuration(false,&ac) || app_vesc_get_configuration(false)->app_to_use!=APP_UART ||
-           app_vesc_get_configuration(false)->app_uart_baudrate!=115200u ||
+           app_vesc_get_configuration(false)->app_uart_baudrate!=921600u ||
            !app_vesc_get_configuration(false)->permanent_uart_enabled)
-            return fail("APP_UART permanent VESC-standard 115200 support");
+            return fail("APP_UART permanent VESC-standard 921600 support");
     }
 
     {

@@ -15,7 +15,7 @@ PROFILE_REV=0x00030000
 def main():
     ap=argparse.ArgumentParser(description='Read-only Stage-2 communications/ISR stress acceptance')
     ap.add_argument('port',nargs='?',default='auto')
-    ap.add_argument('--baud',type=int,default=115200)
+    ap.add_argument('--baud',type=int,default=921600)
     ap.add_argument('--seconds',type=float,default=5.0)
     ap.add_argument('--pair-hz',type=float,default=25.0,help='LEFT+RIGHT selective telemetry pairs per second')
     a=ap.parse_args()

@@ -60,7 +60,7 @@ __attribute__((used, externally_visible)) int _write(int file, char *data, int l
   (void)file;
   (void)data;
   if (len <= 0) return 0;
-  /* USART3 PB10/PB11 is an exclusive native VESC 6.00 transport at validated 115200 baud.
+  /* USART3 PB10/PB11 is an exclusive native VESC 6.00 runtime transport at 921600 baud.
    * Raw printf/debug bytes are never legal on this wire. */
   return len;
 }

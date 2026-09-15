@@ -36,7 +36,7 @@ def main():
     rawp=out/'ramp_raw.csv'; sump=out/'ramp_summary.csv'
     configs={'left':(.009,.020,0.0),'right':(.0095,.022,0.0)}; ramps=[600,900,1200,1500]
     fields=['case','motor','kp','ki','kd','target','phase','t','erpm','iq','id','imotor','iin','duty','vq','vd','fault']
-    link=VescDual(a.port,115200,timeout=.65); orig_tuning={}; orig_ramp={}; res=[]
+    link=VescDual(a.port,921600,timeout=.65); orig_tuning={}; orig_ramp={}; res=[]
     try:
         link.require_platform_compatible(True)
         for right,motor in ((False,'left'),(True,'right')):

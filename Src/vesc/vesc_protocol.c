@@ -483,7 +483,7 @@ bool vesc_protocol_rx_byte(uint8_t byte) {
     const uint32_t now_ms = HAL_GetTick();
     if (s_rx_active && (uint32_t)(now_ms - s_rx_last_byte_ms) > VESC_RX_INTERBYTE_TIMEOUT_MS) {
         /* A truncated/corrupt long frame must never poison all later traffic.
-         * Direct USB-UART upload chunks are explicitly paced on the validated 115200-baud F103 link, so 12 ms leaves margin while preventing a false start byte from swallowing later RT frames. */
+         * Direct USB-UART upload chunks are explicitly paced on the validated direct F103 UART link, so 12 ms leaves margin while preventing a false start byte from swallowing later RT frames. */
         rx_reset();
         s_rx_timeout_reset++;
     }

@@ -42,7 +42,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--arm',action='store_true'); ap.add_argument('--repeat',type=int,default=5); ap.add_argument('--hold',type=float,default=2.0); ap.add_argument('--dt',type=float,default=.04); ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/qualification_10x5_latest.json')); a=ap.parse_args()
     if not a.arm: raise SystemExit('ARM_REQUIRED: 10x5 moves both motors')
     if a.repeat!=5: raise SystemExit('--repeat must remain 5 for the production 10x5 gate')
-    link=VescDual(a.port,115200,timeout=1.0); result={"runs":[]}
+    link=VescDual(a.port,921600,timeout=1.0); result={"runs":[]}
     try:
         result['platform']=link.require_platform_compatible(require_build=True); before={"left":link.get_tuning(False).physical,"right":link.get_tuning(True).physical}
         result['locked_tuning']=before

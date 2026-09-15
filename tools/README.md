@@ -21,7 +21,7 @@ cd /home/otomasi/agv/hoverboard-vesc
 python3 tools/vesc_tool.py auto
 ```
 
-Default baud 115200 dan transport diprobe positif sebagai F103 VESC sebelum command dikirim. LEFT adalah local VESC ID 1; RIGHT adalah virtual CAN ID 2 via `COMM_FORWARD_CAN`.
+Default baud 921600 dan transport diprobe positif sebagai F103 VESC sebelum command dikirim. LEFT adalah local VESC ID 1; RIGHT adalah virtual CAN ID 2 via `COMM_FORWARD_CAN`.
 
 Contoh di dalam terminal:
 

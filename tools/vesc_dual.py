@@ -76,7 +76,7 @@ COMM_SHUTDOWN = 156
 RIGHT_ID = 2
 POLE_PAIRS = 15
 STOP_ERPM = 5 * POLE_PAIRS  # 5 mechanical rpm
-DEFAULT_BAUD = 115200
+DEFAULT_BAUD = 921600
 EXPECTED_LOCAL_TARGETS = {"motor_left", "f103rc_bootloader"}
 # STM32F1 EEPROM emulation can compact a 205-variable page on persistent writes.
 # Keep normal request/reply deadlines short; only commands that explicitly store

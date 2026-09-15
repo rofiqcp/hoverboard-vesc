@@ -46,7 +46,7 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=1.2)
     args = parser.parse_args()
 
-    link = VescDual(args.port, 115200, timeout=0.3)
+    link = VescDual(args.port, 921600, timeout=0.3)
     ok = True
     try:
         for right in (False, True):

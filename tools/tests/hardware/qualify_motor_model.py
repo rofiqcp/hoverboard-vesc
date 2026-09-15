@@ -27,7 +27,7 @@ def main():
     a=ap.parse_args()
     if not a.arm: raise SystemExit('ARM_REQUIRED: rerun with --arm only when motors are safe to move')
     if not 3<=a.repeat<=12: raise SystemExit('--repeat must be 3..12')
-    link=VescDual(a.port,115200,timeout=1.0); result={"motors":{},"repeat":a.repeat}
+    link=VescDual(a.port,921600,timeout=1.0); result={"motors":{},"repeat":a.repeat}
     try:
         result['platform']=link.require_platform_compatible(require_build=True)
         choices=[('left',False),('right',True)] if a.motor=='both' else [(a.motor,a.motor=='right')]

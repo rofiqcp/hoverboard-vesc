@@ -8,7 +8,7 @@ spec=importlib.util.spec_from_file_location('upl',R/'tools/pio_vesc_upload.py');
 
 class FakeDirectF103:
     def __init__(self,fw):
-        self.args=types.SimpleNamespace(transport='serial',serial_port='/dev/mock-f103',baud=115200,fault_stop_after=0)
+        self.args=types.SimpleNamespace(transport='serial',serial_port='/dev/mock-f103',baud=921600,boot_baud=921600,fault_stop_after=0)
         self.buf=bytearray(); self.mode='app'; self.updated=False; self.state=0; self.size=0; self.crc=0
         self.stage=bytearray(); self.written=0; self.writes=0; self.confirmed_reads=0; self.fw=fw
     def close(self): pass
@@ -69,7 +69,7 @@ def _flaky_fw(_link,_timeout=2.0):
 try:
     upl._serial_candidates=lambda:[('/dev/mock-f103','mock USB-UART')]
     upl.Link=_ProbeLink; upl.fw_version=_flaky_fw
-    _ns=types.SimpleNamespace(serial_port='auto',baud=115200,firmware='fw.bin')
+    _ns=types.SimpleNamespace(serial_port='auto',baud=921600,boot_baud=921600,firmware='fw.bin')
     _port=upl.resolve_serial_port(_ns,1.5)
     assert _port=='/dev/mock-f103' and _probe_calls['n']>=3
 finally:

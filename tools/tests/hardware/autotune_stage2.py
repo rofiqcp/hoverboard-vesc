@@ -194,7 +194,7 @@ def main():
     if not p.exists():raise SystemExit(f'STAGE2_REFUSED: stage1 result not found: {p}')
     stage1=json.loads(p.read_text())
     if not stage1.get('pass') or not all(k in stage1.get('best',{}) for k in ('left','right')):raise SystemExit('STAGE2_REFUSED: stage1 FOC qualification is not PASS')
-    link=VescDual(a.port,115200,timeout=1.0);out={'stage':2,'stage1':a.stage1};success=False;persistence=False;originals={}
+    link=VescDual(a.port,921600,timeout=1.0);out={'stage':2,'stage1':a.stage1};success=False;persistence=False;originals={}
     try:
         out['platform']=link.require_platform_compatible(require_build=True);cal=link.steering_calibration();left_role=cal['role']
         if left_role not in ('encoder','hall'):raise RuntimeError(f'LEFT unsupported sensor role {cal}')

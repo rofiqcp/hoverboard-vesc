@@ -96,7 +96,7 @@ try:
         calls.append((dev,baud)); return chosen,'motor_left'
     vd._probe_f103_uart=explicit_probe
     tr=vd.open_transport('/dev/mock-explicit',vd.DEFAULT_BAUD); assert tr is chosen
-    assert calls==[('/dev/mock-explicit',115200)]
+    assert calls==[('/dev/mock-explicit',921600)]
 finally:
     vd._probe_f103_uart=orig_probe
 

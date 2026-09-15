@@ -73,7 +73,7 @@ def main():
     tcs=[float(x) for x in a.tc_us.split(',') if x.strip()]
     if not tcs or any(x<=0 for x in tcs):raise SystemExit('TUNING_REFUSED: tc-us must be positive')
 
-    link=VescDual(a.port,115200,timeout=1.0);out={"stage":1,"method":"R/L pole cancellation + D/Q trace bandwidth sweep","model":str(a.model),"candidates":{}}
+    link=VescDual(a.port,921600,timeout=1.0);out={"stage":1,"method":"R/L pole cancellation + D/Q trace bandwidth sweep","model":str(a.model),"candidates":{}}
     choices=[];originals={};winners={};success=False;persistence_started=False
     try:
         plat=link.require_platform_compatible(require_build=True);out['platform']=plat

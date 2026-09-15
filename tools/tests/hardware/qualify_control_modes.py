@@ -62,7 +62,7 @@ def main():
     ap.add_argument('--output',default='data/esc/control_mode_qualification.json'); args=ap.parse_args()
     if not args.arm: raise SystemExit('ARM_REQUIRED: A/B qualification moves the selected motor')
     right=args.motor=='right'; targets=[int(x) for x in args.targets.split(',') if x.strip()]
-    v=VescDual(args.port,115200,timeout=1.0); report={'motor':args.motor,'targets':targets,'results':{}}
+    v=VescDual(args.port,921600,timeout=1.0); report={'motor':args.motor,'targets':targets,'results':{}}
     try:
         report['platform']=v.require_platform_compatible(True); cfg0=parse_cfg(v.terminal('config',right)); report['initial']=cfg0
         if cfg0['dec'] is None or cfg0['speed_src'] is None: raise RuntimeError('firmware lacks RAM mode observability')

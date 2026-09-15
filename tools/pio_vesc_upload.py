@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, fcntl, hashlib, os, struct, sys, time
+import argparse, fcntl, os, struct, sys, time
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -10,7 +10,7 @@ from vesc_common import crc16
 COMM_FW_VERSION=0; COMM_JUMP_TO_BOOTLOADER=1; COMM_ERASE_NEW_APP=2; COMM_WRITE_NEW_APP_DATA=3
 COMM_CUSTOM_APP_DATA=36
 MAX_FW=240*1024
-HB_MAGIC=b"HB"; HB_BOOT_VERSION=1; HB_APP_VERSION=2; HB_BOOT_GET_INFO=0xF0; HB_BOOT_READ_APP=0xF1
+HB_MAGIC=b"HB"; HB_BOOT_VERSION=1; HB_APP_VERSION=2; HB_BOOT_GET_INFO=0xF0
 STATE_STREAM=0x5354524D; STATE_TEST=0x54455354; STATE_RECOVERY=0x52454356; STATE_CONFIRMED=0x434E464D
 HB_CUSTOM_GET_FW_UPDATE_STATE=23; HB_CUSTOM_BOOT_HANDOFF=29
 
@@ -97,7 +97,7 @@ def resolve_serial_port(args, timeout_s: float = 1.5):
         for dev,desc in candidates:
             probe=argparse.Namespace(**vars(args)); probe.serial_port=dev; link=None
             try:
-                link=Link(probe); hw=fw_version(link,1.2)
+                link=Link(probe); hw=_probe_known_bauds(link,1.2)
                 if not hw or hw=='unknown': raise RuntimeError('empty COMM_FW_VERSION identity')
                 print(f'[PORT] verified direct F103 UART {dev} ({desc}) target={hw}',flush=True); return dev
             except Exception as e: errors.append(f'{dev}:{type(e).__name__}:{e}')
@@ -118,11 +118,12 @@ class Link:
     """Direct USB-UART transport to STM32F103 USART3."""
     def __init__(self,args):
         self.args=args; self.ser=None; self.buf=bytearray(); self.route="serial"
+        self.current_baud=int(args.baud)
         self.open()
 
     def open(self):
         import serial
-        self.ser=serial.Serial(self.args.serial_port,self.args.baud,timeout=.10,write_timeout=2,exclusive=True)
+        self.ser=serial.Serial(self.args.serial_port,self.current_baud,timeout=.10,write_timeout=2,exclusive=True)
         try: self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
         except Exception: pass
 
@@ -133,6 +134,12 @@ class Link:
 
     def reconnect_transport(self):
         self.close(); self.buf.clear(); time.sleep(.20); self.open()
+
+    def set_baud(self, baud:int):
+        baud=int(baud)
+        if baud==self.current_baud: return
+        self.close(); self.buf.clear(); self.current_baud=baud; time.sleep(.08); self.open()
+        print(f'[VESC] host UART -> {baud} baud', flush=True)
 
     def write(self,b):
         self.ser.write(b); self.ser.flush()
@@ -191,81 +198,32 @@ def boot_info(link, timeout=2.0):
     }
 
 
-def read_active_image(link, size:int)->bytes:
-    if size<=0 or size>MAX_FW: raise RuntimeError(f'invalid active region size {size}')
-    out=bytearray()
-    step=240
-    for off in range(0,size,step):
-        want=min(step,size-off)
-        req=bytes((COMM_CUSTOM_APP_DATA,))+HB_MAGIC+bytes((HB_BOOT_VERSION,HB_BOOT_READ_APP))+struct.pack('>IH',off,want)
-        p=link.transact(req,COMM_CUSTOM_APP_DATA,3.0)
-        if len(p)<12 or p[1:3]!=HB_MAGIC or p[3]!=HB_BOOT_VERSION or p[4]!=HB_BOOT_READ_APP or p[5]!=0:
-            raise RuntimeError(f'active backup read failed at {off}: {p.hex()[:120]}')
-        got_off=struct.unpack('>I',p[6:10])[0]; got_len=struct.unpack('>H',p[10:12])[0]
-        if got_off!=off or got_len!=want or len(p)!=12+want:
-            raise RuntimeError(f'active backup framing mismatch at {off}')
-        out.extend(p[12:])
-        if off==0 or off+want>=size or off%(32*1024)<step:
-            print(f'[LKG] backup read {min(off+want,size)}/{size}',flush=True)
-    return bytes(out)
-
-
-def _lkg_root():
-    return Path(os.environ.get('F103_LKG_ROOT', str(Path(__file__).resolve().parents[1]/'recovery'/'host_lkg')))
-
-def latest_lkg_path():
-    root=_lkg_root()
-    root.mkdir(parents=True,exist_ok=True)
-    latest=root/'LATEST'
-    if latest.is_file():
-        try:
-            q=Path(latest.read_text().strip())
-            if q.is_file(): return q
-        except Exception: pass
-    files=sorted(root.glob('f103_lkg_*.bin'))
-    return files[-1] if files else None
-
-
-def ensure_lkg_backup(link, info):
-    if not info.get('app_valid', True):
-        print('[LKG] no valid application; resident bootloader is the recovery authority',flush=True)
-        return None
-    if info['state'] in (STATE_STREAM,STATE_TEST,STATE_RECOVERY):
-        prev=latest_lkg_path()
-        if prev is None:
-            print(f'[LKG] recovery state=0x{info["state"]:08X}; no prior CONFIRMED LKG, resident bootloader remains recovery authority',flush=True)
-            return None
-        print(f'[LKG] recovery state=0x{info["state"]:08X}; preserving existing {prev}',flush=True)
-        return prev
-    if info['state'] != STATE_CONFIRMED:
-        prev=latest_lkg_path()
-        if prev is not None:
-            print(f'[LKG] target metadata is not CONFIRMED; refusing to bless it as LKG, preserving {prev}',flush=True)
-            return prev
-        print('[LKG] target metadata is not CONFIRMED; first migration proceeds without legacy LKG',flush=True)
-        return None
-    image_size=info.get('size',0)
-    if image_size<=0 or image_size>info['app_region']:
-        raise RuntimeError(f'confirmed metadata has invalid image size {image_size}')
-    image=read_active_image(link,image_size)
-    digest=hashlib.sha256(image).hexdigest()
-    root=_lkg_root()
-    root.mkdir(parents=True,exist_ok=True)
-    stamp=time.strftime('%Y%m%d_%H%M%S')
-    out=root/f'f103_lkg_{stamp}_{digest[:12]}.bin'
-    tmp=out.with_suffix('.tmp'); tmp.write_bytes(image); os.replace(tmp,out)
-    (root/'LATEST').write_text(str(out)+'\n')
-    print(f'[LKG] saved {out} bytes={len(image)} sha256={digest}',flush=True)
-    return out
-
-
 def fw_version(link,timeout=2.0):
     p=link.transact(bytes((COMM_FW_VERSION,)),COMM_FW_VERSION,timeout)
     if len(p)<4: return 'unknown'
     z=p.find(b'\0',3); return p[3:z if z>=0 else len(p)].decode(errors='replace')
 
+
+def _set_link_baud(link, baud:int):
+    if hasattr(link,'set_baud'):
+        link.set_baud(int(baud))
+
+def _probe_known_bauds(link, timeout=1.2):
+    app_baud=int(getattr(link.args,'baud',921600))
+    boot_baud=int(getattr(link.args,'boot_baud',921600))
+    errors=[]
+    for baud in dict.fromkeys((app_baud,boot_baud,115200)):
+        try:
+            _set_link_baud(link,baud)
+            return fw_version(link,timeout)
+        except Exception as exc:
+            errors.append(f'{baud}:{type(exc).__name__}:{exc}')
+    raise RuntimeError('no response at known UART bauds: '+', '.join(errors))
+
 def wait_for_bootloader(link, initial_hw: str) -> str:
+    boot_baud=int(getattr(link.args,'boot_baud',921600))
     if 'bootloader' in initial_hw.lower():
+        _set_link_baud(link,boot_baud)
         return initial_hw
     print(f'[VESC] application connected: {initial_hw}; entering resident bootloader', flush=True)
     # New APP protocol v2 ACKs the handoff and resets only after UART DMA + shift
@@ -280,27 +238,27 @@ def wait_for_bootloader(link, initial_hw: str) -> str:
     except Exception as exc:
         print(f'[VESC] legacy application handoff fallback: {exc}',flush=True)
         link.write(frame(bytes((COMM_JUMP_TO_BOOTLOADER,))))
-    # Resetting only the F103 must not require manual action on the host.
-    # The external USB-UART remains powered; reopen it automatically if needed.
+    # Resetting only the F103 must not require manual action on the host. Probe
+    # preferred 921600 first, then legacy 115200 for one-time field migration.
     link.buf.clear()
     deadline=time.monotonic()+20.0
-    last=''; failures=0; reconnects=0
+    last=''; reconnects=0
+    bauds=list(dict.fromkeys((boot_baud,115200)))
     while time.monotonic()<deadline:
-        time.sleep(.25)
+        time.sleep(.20)
+        for baud in bauds:
+            try:
+                _set_link_baud(link,baud)
+                last=fw_version(link,0.8)
+                if 'bootloader' in last.lower():
+                    print(f'[VESC] bootloader ready: {last} baud={baud} reconnects={reconnects}', flush=True)
+                    return last
+            except Exception as exc:
+                last=f'{baud}:{type(exc).__name__}: {exc}'
         try:
-            last=fw_version(link,1.0); failures=0
-            if 'bootloader' in last.lower():
-                print(f'[VESC] bootloader ready: {last} reconnects={reconnects}', flush=True)
-                return last
-        except Exception as exc:
-            failures += 1
-            if failures >= 2:
-                try:
-                    link.reconnect_transport(); reconnects += 1; failures=0
-                    print(f'[VESC] auto-reopened direct F103 UART after reset ({reconnects})',flush=True)
-                except Exception:
-                    pass
-            last=f'{type(exc).__name__}: {exc}'
+            link.reconnect_transport(); reconnects += 1
+        except Exception:
+            pass
     raise RuntimeError(f'bootloader did not appear; last={last!r} reconnects={reconnects}')
 
 
@@ -310,9 +268,9 @@ def _recover_bootloader_transport(link, reason: str):
     for attempt in range(1,5):
         try:
             link.reconnect_transport()
-            hw=fw_version(link,3.0)
+            hw=_probe_known_bauds(link,1.5)
             if 'bootloader' in hw.lower():
-                print(f'[VESC] recovery probe bootloader ready: {hw}', flush=True)
+                print(f'[VESC] recovery probe bootloader ready: {hw} baud={link.current_baud}', flush=True)
                 return
             wait_for_bootloader(link,hw)
             raise RestartUploadSession('target application restarted; staging session must restart from erase')
@@ -329,7 +287,7 @@ def _stage_once(link,fw:bytes,session:int):
     resume=struct.unpack('>I',p[2:6])[0] if len(p)>=6 else 0
     if resume<0 or resume>len(staged): raise RuntimeError(f'invalid bootloader resume offset {resume}')
     if resume: print(f'[VESC] session={session} resume at stream offset={resume}/{len(staged)}',flush=True)
-    # Direct 115200-baud F103 UART. Bounded chunks keep ACK latency predictable
+    # Resident-bootloader UART. Runtime application and current bootloader baud are selected dynamically; production target is 921600. Bounded chunks keep ACK latency predictable
     # while bootloader idempotent writes make retries safe.
     step=192
     for off in range(resume,len(staged),step):
@@ -443,6 +401,7 @@ def _stream_install(link, fw:bytes, label:str):
     print(f'[VESC] {label} full CRC complete; TEST boot requested',flush=True)
     link.buf.clear()
     if hasattr(link,'linebuf'): link.linebuf.clear()
+    _set_link_baud(link,int(getattr(link.args,'baud',921600)))
     app=_wait_application(link,label)
     _wait_confirmed(link,fw,label)
     return app
@@ -455,7 +414,7 @@ def upload(link,fw:bytes):
     while time.monotonic()<probe_deadline:
         attempt += 1
         try:
-            hw=fw_version(link,1.2); break
+            hw=_probe_known_bauds(link,1.2); break
         except Exception as e:
             last_error=e
             if attempt%4==0:
@@ -471,30 +430,14 @@ def upload(link,fw:bytes):
     print(f'[BOOT] app_region={info["app_region"]} state=0x{info["state"]:08X} resume={info["resume"]} '
           f'reason={None if info.get("reset_reason") is None else hex(info["reset_reason"])} '
           f'stage={None if info.get("reset_stage") is None else hex(info["reset_stage"])}',flush=True)
-    lkg=ensure_lkg_backup(link,info)
+    print('[VESC] direct install: host LKG backup disabled; resident bootloader is recovery authority',flush=True)
     try:
         return _stream_install(link,fw,'candidate')
     except IntentionalStreamStop:
         raise
     except Exception as candidate_error:
-        print(f'[ROLLBACK] candidate failed: {candidate_error}',file=sys.stderr,flush=True)
-        if lkg is None:
-            raise RuntimeError(f'candidate failed; resident bootloader remains in recovery and no previous relocated LKG exists: {candidate_error}')
-        backup=lkg.read_bytes()
-        if len(backup)>MAX_FW: raise RuntimeError(f'{candidate_error}; LKG size invalid {len(backup)}')
-        last=None
-        for _ in range(12):
-            try:
-                last=fw_version(link,2.0)
-                if 'bootloader' in last.lower(): break
-                wait_for_bootloader(link,last); last='f103rc_bootloader'; break
-            except Exception:
-                time.sleep(.5)
-        if not last or 'bootloader' not in last.lower():
-            raise RuntimeError(f'{candidate_error}; rollback bootloader unavailable')
-        print(f'[ROLLBACK] restoring host LKG {lkg}',flush=True)
-        _stream_install(link,backup,'rollback')
-        raise RuntimeError(f'candidate failed and LKG rollback completed: {candidate_error}')
+        print(f'[VESC] candidate failed; resident bootloader remains recovery authority: {candidate_error}',file=sys.stderr,flush=True)
+        raise RuntimeError(f'candidate install failed: {candidate_error}')
 
 def selftest():
     p=b'\x00\x06\x00test\x00'; f=frame(p)
@@ -505,7 +448,7 @@ def selftest():
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--transport',choices=['serial'],default='serial')
-    ap.add_argument('--serial-port',default='auto'); ap.add_argument('--baud',type=int,default=115200)
+    ap.add_argument('--serial-port',default='auto'); ap.add_argument('--baud',type=int,default=921600); ap.add_argument('--boot-baud',type=int,default=921600)
     ap.add_argument('--firmware'); ap.add_argument('--selftest',action='store_true')
     ap.add_argument('--probe-only',action='store_true')
     ap.add_argument('--boot-info-only',action='store_true')
@@ -518,7 +461,7 @@ def main():
         link=Link(a)
         try:
             if a.probe_only or a.boot_info_only:
-                hw=fw_version(link,2.0); print(f'VESC_TARGET_PROBE_PASS hw={hw}',flush=True)
+                hw=_probe_known_bauds(link,2.0); print(f'VESC_TARGET_PROBE_PASS hw={hw} baud={getattr(link,"current_baud","mock")}',flush=True)
                 if a.boot_info_only:
                     if 'bootloader' not in hw.lower(): hw=wait_for_bootloader(link,hw)
                     print('BOOT_INFO',boot_info(link,3.0),flush=True)

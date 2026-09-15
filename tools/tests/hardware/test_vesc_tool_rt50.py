@@ -72,7 +72,7 @@ def parse_values(payload:bytes, selective=True)->RtValues:
     return v
 
 class Link:
-    def __init__(self,port,baud=115200,timeout=.06):
+    def __init__(self,port,baud=921600,timeout=.06):
         self.ser=open_transport(port,baud,timeout=.001); self.timeout=timeout; self.dec=PacketDecoder()
         self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
     def close(self):
@@ -154,7 +154,7 @@ def poll_one(link,right,count,hz):
     return (replies[-1] if replies else None),lat,fail,d0,d1,finished-started,send_rate,reply_rate,len(replies)
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--baud',type=int,default=115200); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--seconds',type=float,default=5.0)
+    ap=argparse.ArgumentParser(); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--baud',type=int,default=921600); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--seconds',type=float,default=5.0)
     a=ap.parse_args(); count=max(1,round(a.hz*a.seconds))
     link=Link(a.port, baud=a.baud, timeout=(0.50 if str(a.port).startswith('tcp://') else 0.06))
     try:

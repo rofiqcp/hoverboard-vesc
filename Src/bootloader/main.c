@@ -136,7 +136,7 @@ static bool boot_clock_init(void) {
 
 static bool uart_init(void) {
     huart3.Instance = USART3;
-    huart3.Init.BaudRate = F103_VESC_UART_BAUD;
+    huart3.Init.BaudRate = F103_BOOT_UART_BAUD;
     huart3.Init.WordLength = UART_WORDLENGTH_8B;
     huart3.Init.StopBits = UART_STOPBITS_1;
     huart3.Init.Parity = UART_PARITY_NONE;

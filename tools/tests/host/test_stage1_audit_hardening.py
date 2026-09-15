@@ -7,7 +7,7 @@ R=Path(__file__).resolve().parents[3]
 
 dual=read_source(R, 'tools/vesc_dual.py')
 cli=read_source(R, 'tools/vesc_tool.py')
-assert 'DEFAULT_BAUD = 115200' in dual
+assert 'DEFAULT_BAUD = 921600' in dual
 assert 'EXPECTED_LOCAL_TARGETS = {"motor_left", "f103rc_bootloader"}' in dual
 assert 'ser,name=_probe_f103_uart(target,baud,timeout)' in dual, 'explicit serial path must be positively probed'
 assert 'unexpected VESC target' in dual
@@ -44,4 +44,4 @@ for name,s in [('speed_pid_sweep',sweep),('speed_ramp',ramp)]:
     assert 'set_tuning(' in s and 'store=False' in s, f'{name} must use RAM-only candidate tuning'
 assert "terminal(f'set speed_ramp" in ramp, 'speed ramp candidates must use RAM-only terminal setter'
 assert 'persistent_writes=False' in sweep
-print('STAGE1_AUDIT_HARDENING_PASS baud=115200 explicit_probe=1 arm_gate=1 build_gate=1 speed_sweep_ram_only=1')
+print('STAGE1_AUDIT_HARDENING_PASS baud=921600 explicit_probe=1 arm_gate=1 build_gate=1 speed_sweep_ram_only=1')

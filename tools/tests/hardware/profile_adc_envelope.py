@@ -12,7 +12,7 @@ from vesc_dual import VescDual
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__); ap.add_argument('port',nargs='?',default='auto'); ap.add_argument('--seconds',type=float,default=10.0); ap.add_argument('--hz',type=float,default=50.0); ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/adc_envelope_latest.csv')); a=ap.parse_args()
-    link=VescDual(a.port,115200,timeout=.8); rows=[]
+    link=VescDual(a.port,921600,timeout=.8); rows=[]
     try:
         plat=link.require_platform_compatible(require_build=True); start=time.monotonic(); period=1/max(1.0,a.hz); nxt=start
         base={False:link.adc_validity(False)['invalid_count'],True:link.adc_validity(True)['invalid_count']}

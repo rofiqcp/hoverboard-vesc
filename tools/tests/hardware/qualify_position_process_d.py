@@ -20,7 +20,7 @@ def main():
     ap.add_argument('--angles',default='-20,20,-10,10,0'); ap.add_argument('--hold',type=float,default=1.2); ap.add_argument('--hz',type=float,default=50.0)
     ap.add_argument('--max-current',type=float,default=5.0); ap.add_argument('--min-vin',type=float,default=35.0); ap.add_argument('--output',default='data/esc/position_process_d.json'); args=ap.parse_args()
     if not args.arm: raise SystemExit('ARM_REQUIRED: steering process-D qualification moves LEFT steering')
-    angles=[float(x) for x in args.angles.split(',') if x.strip()]; v=VescDual(args.port,115200,timeout=1.0); rep={'angles':angles,'samples':[]}
+    angles=[float(x) for x in args.angles.split(',') if x.strip()]; v=VescDual(args.port,921600,timeout=1.0); rep={'angles':angles,'samples':[]}
     try:
         rep['platform']=v.require_platform_compatible(True); enc=v.terminal('encoder',False); tun=v.terminal('tuning',False)
         if not all(x in enc for x in ('cal=1','homed=1','sync=1')): raise RuntimeError(f'steering not qualified: {enc.strip()}')
