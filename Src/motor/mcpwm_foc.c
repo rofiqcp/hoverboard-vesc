@@ -4173,7 +4173,21 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
        m->m_control_mode!=CONTROL_MODE_OPENLOOP &&
        m->m_control_mode!=CONTROL_MODE_OPENLOOP_PHASE &&
        m->m_control_mode!=CONTROL_MODE_HANDBRAKE){
-        hall_update(m,second,false);
+        /* Stagger dual-motor Hall interpolation/SVPWM so a full current-control
+         * slot never carries the other motor's held-vector work. LEFT refreshes
+         * on slots 2/4, RIGHT on 3/5; both still sample/debounce Hall every PWM
+         * frame and process a real edge immediately. */
+        const uint8_t slot=foc_isr_profile_slot;
+        const bool hold_due=second ? (slot==3u || slot==5u) : (slot==2u || slot==4u);
+        if(!hold_due){
+            /* This motor is intentionally idle for this scheduler slot. Its Hall
+             * input is sampled on its own control slot plus two staggered hold
+             * slots = 8 kHz, so do not stack sensor work on the other motor's
+             * full current-control frame. Outer hard gates still own timeout,
+             * E-stop, current trip and fault shutdown at 16 kHz. */
+            m->m_state=MC_STATE_RUNNING; m->m_isr_count++; return;
+        }
+        hall_update(m,second,true);
         if(m->m_control_mode==CONTROL_MODE_NONE){ /* Hall fail-safe may release. */
             m->m_state=MC_STATE_OFF; m->m_ccr_a=m->m_ccr_b=m->m_ccr_c=pwm_res/2u;
             m->m_isr_count++; return;
@@ -4234,7 +4248,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                 m->m_rpm=0; m->m_hall_direction=0; m->m_hall_interp_active=0u;
             }
         }
-    } else hall_update(m, second, control_update);
+    } else hall_update(m, second, false);
     if (m->m_control_mode==CONTROL_MODE_OPENLOOP) {
         openloop_update(m);
     } else if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) {
