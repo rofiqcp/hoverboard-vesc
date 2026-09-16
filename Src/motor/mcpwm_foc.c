@@ -1343,6 +1343,7 @@ static void driven_offset_finalize_non_isr(void) {
         m->m_driven_offsetdc=(int16_t)((m->m_driven_offset_sumdc+den/2)/den);
         const bool valid=driven_offset_pair_plausible(m->m_driven_offset0,m->m_driven_offset1);
         m->m_driven_offset_valid=valid?1u:0u;
+        m->m_driven_offset_powered_valid=valid?1u:0u;
         m->m_current_offset_valid=valid?1u:0u;
         m->m_driven_offset_calibrating=0u;
         m->m_driven_offset_finalize_pending=0u;
@@ -5108,7 +5109,10 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
         if(offsetcount==2000u){
             m_motor_1.m_driven_offset0=offsetrlA; m_motor_1.m_driven_offset1=offsetrlB; m_motor_1.m_driven_offsetdc=offsetdcl;
             m_motor_2.m_driven_offset0=offsetrrB; m_motor_2.m_driven_offset1=offsetrrC; m_motor_2.m_driven_offsetdc=offsetdcr;
+            /* Startup samples are bridge-OFF. They are a valid ADC baseline but
+             * are not the upstream-style driven (50% PWM zero-vector) baseline. */
             m_motor_1.m_driven_offset_valid=1u; m_motor_2.m_driven_offset_valid=1u;
+            m_motor_1.m_driven_offset_powered_valid=0u; m_motor_2.m_driven_offset_powered_valid=0u;
             m_motor_1.m_current_offset_valid=current_offset_pair_plausible(offsetrlA,offsetrlB)?1u:0u;
             m_motor_2.m_current_offset_valid=current_offset_pair_plausible(offsetrrB,offsetrrC)?1u:0u;
             if(!m_motor_1.m_current_offset_valid)motor_fault_set(&m_motor_1,FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1);
@@ -5181,16 +5185,19 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     const uint8_t rightBridgeWasOn=(RIGHT_TIM->BDTR&TIM_BDTR_MOE)?1u:0u;
     if(leftDriveRequest && !leftBridgeWasOn && m_motor_1.m_fault==FAULT_CODE_NONE){
         m_motor_1.m_bridge_settle_ticks=MCCONF_BRIDGE_SETTLE_SAMPLES;
-        /* The hoverboard low-side current amplifiers shift common-mode when
-         * MOE turns on. Re-measure the driven baseline during the existing
-         * zero-vector settle window instead of applying the bridge-OFF boot
-         * offset to powered samples. This keeps the 8 A open-loop protection
-         * meaningful without false trips from a several-ampere offset step. */
-        m_motor_1.m_driven_offset_valid=0u;
-        m_motor_1.m_driven_offset_calibrating=1u;
-        m_motor_1.m_driven_offset_samples=0u;
-        m_motor_1.m_driven_offset_sum0=0; m_motor_1.m_driven_offset_sum1=0; m_motor_1.m_driven_offset_sumdc=0;
-        m_motor_1.m_driven_offset_finalize_pending=0u;
+        /* The powered low-side baseline is learned once per boot. Subsequent
+         * OFF->RUN transitions still hold the zero-vector settle window, but
+         * they reuse the validated powered baseline instead of making every
+         * teleop start look like a fresh motor calibration. */
+        if(!m_motor_1.m_driven_offset_powered_valid){
+            m_motor_1.m_driven_offset_calibrating=1u;
+            m_motor_1.m_driven_offset_samples=0u;
+            m_motor_1.m_driven_offset_sum0=0; m_motor_1.m_driven_offset_sum1=0; m_motor_1.m_driven_offset_sumdc=0;
+            m_motor_1.m_driven_offset_finalize_pending=0u;
+        }else{
+            m_motor_1.m_driven_offset_calibrating=0u;
+            m_motor_1.m_driven_offset_finalize_pending=0u;
+        }
         LEFT_TIM->LEFT_TIM_U=pwm_res/2u; LEFT_TIM->LEFT_TIM_V=pwm_res/2u; LEFT_TIM->LEFT_TIM_W=pwm_res/2u;
         reset_current_pi(&m_motor_1);
         m_motor_1.m_current_lpf_q16[0]=m_motor_1.m_current_lpf_q16[1]=0;
@@ -5200,11 +5207,15 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     }
     if(rightDriveRequest && !rightBridgeWasOn && m_motor_2.m_fault==FAULT_CODE_NONE){
         m_motor_2.m_bridge_settle_ticks=MCCONF_BRIDGE_SETTLE_SAMPLES;
-        m_motor_2.m_driven_offset_valid=0u;
-        m_motor_2.m_driven_offset_calibrating=1u;
-        m_motor_2.m_driven_offset_samples=0u;
-        m_motor_2.m_driven_offset_sum0=0; m_motor_2.m_driven_offset_sum1=0; m_motor_2.m_driven_offset_sumdc=0;
-        m_motor_2.m_driven_offset_finalize_pending=0u;
+        if(!m_motor_2.m_driven_offset_powered_valid){
+            m_motor_2.m_driven_offset_calibrating=1u;
+            m_motor_2.m_driven_offset_samples=0u;
+            m_motor_2.m_driven_offset_sum0=0; m_motor_2.m_driven_offset_sum1=0; m_motor_2.m_driven_offset_sumdc=0;
+            m_motor_2.m_driven_offset_finalize_pending=0u;
+        }else{
+            m_motor_2.m_driven_offset_calibrating=0u;
+            m_motor_2.m_driven_offset_finalize_pending=0u;
+        }
         RIGHT_TIM->RIGHT_TIM_U=pwm_res/2u; RIGHT_TIM->RIGHT_TIM_V=pwm_res/2u; RIGHT_TIM->RIGHT_TIM_W=pwm_res/2u;
         reset_current_pi(&m_motor_2);
         m_motor_2.m_current_lpf_q16[0]=m_motor_2.m_current_lpf_q16[1]=0;
@@ -5222,7 +5233,7 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
      * appear as a 10 A telemetry spike. */
     if(!leftDriveRequest && leftBridgeWasOn){
         m_motor_1.m_driven_offset_calibrating=0u;
-        m_motor_1.m_driven_offset_valid=0u;
+        /* Preserve the validated powered baseline across normal coast/stop. */
         m_motor_1.m_driven_offset_finalize_pending=0u;
         m_motor_1.m_current_lpf_q16[0]=m_motor_1.m_current_lpf_q16[1]=0;
         m_motor_1.m_telem_current_lpf_q16[0]=m_motor_1.m_telem_current_lpf_q16[1]=m_motor_1.m_telem_current_lpf_q16[2]=0;
@@ -5231,7 +5242,7 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     }
     if(!rightDriveRequest && rightBridgeWasOn){
         m_motor_2.m_driven_offset_calibrating=0u;
-        m_motor_2.m_driven_offset_valid=0u;
+        /* Preserve the validated powered baseline across normal coast/stop. */
         m_motor_2.m_driven_offset_finalize_pending=0u;
         m_motor_2.m_current_lpf_q16[0]=m_motor_2.m_current_lpf_q16[1]=0;
         m_motor_2.m_telem_current_lpf_q16[0]=m_motor_2.m_telem_current_lpf_q16[1]=m_motor_2.m_telem_current_lpf_q16[2]=0;
