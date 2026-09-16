@@ -1,5 +1,6 @@
 #include "stm32f1xx_hal.h"
 #include "vesc/f103_boot_layout.h"
+#include "control_uart.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -90,7 +91,11 @@ static void safe_gpio_init(void) {
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_AFIO_CLK_ENABLE();
+#if defined(F103_CONTROL_USART2)
+    __HAL_RCC_USART2_CLK_ENABLE();
+#else
     __HAL_RCC_USART3_CLK_ENABLE();
+#endif
 
     /* Hoverboard half-bridges: high-side pins LOW, complementary low-side pins HIGH. */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8, GPIO_PIN_RESET);
@@ -107,13 +112,18 @@ static void safe_gpio_init(void) {
     g.Pin = GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_5 | GPIO_PIN_4; HAL_GPIO_Init(GPIOA, &g);
     g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15; HAL_GPIO_Init(GPIOB, &g);
 
-    g.Mode = GPIO_MODE_AF_PP; g.Pin = GPIO_PIN_10; HAL_GPIO_Init(GPIOB, &g);
-    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_NOPULL; g.Pin = GPIO_PIN_11; HAL_GPIO_Init(GPIOB, &g);
+#if defined(F103_CONTROL_USART2)
+    g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL; g.Pin = GPIO_PIN_2; HAL_GPIO_Init(GPIOA, &g);
+    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP; g.Pin = GPIO_PIN_3; HAL_GPIO_Init(GPIOA, &g);
+#else
+    g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL; g.Pin = GPIO_PIN_10; HAL_GPIO_Init(GPIOB, &g);
+    g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP; g.Pin = GPIO_PIN_11; HAL_GPIO_Init(GPIOB, &g);
+#endif
 }
 
 
 static bool boot_clock_init(void) {
-    /* Match the application clock tree so USART3 can run the project-wide
+    /* Match the application clock tree so the selected UART can run the project-wide
      * high-speed VESC transport: HSI/2 * 16 = 64 MHz SYSCLK, APB1 = 32 MHz.
      * HAL_Init() is called first with a correct 8-MHz SystemCoreClock model,
      * therefore the oscillator-switch timeouts and SysTick are valid. */
@@ -135,8 +145,8 @@ static bool boot_clock_init(void) {
 }
 
 static bool uart_init(void) {
-    huart3.Instance = USART3;
-    huart3.Init.BaudRate = F103_BOOT_UART_BAUD;
+    huart3.Instance = CONTROL_UART_INSTANCE;
+    huart3.Init.BaudRate = CONTROL_UART_BOOT_BAUD;
     huart3.Init.WordLength = UART_WORDLENGTH_8B;
     huart3.Init.StopBits = UART_STOPBITS_1;
     huart3.Init.Parity = UART_PARITY_NONE;
@@ -447,15 +457,15 @@ static void jump_app(void) {
 static bool uart_recv_byte(uint8_t *out, uint32_t timeout_ms) {
     const uint32_t start = HAL_GetTick();
     while ((HAL_GetTick() - start) < timeout_ms) {
-        const uint32_t sr = USART3->SR;
+        const uint32_t sr = CONTROL_UART_INSTANCE->SR;
         if ((sr & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) != 0u) {
-            volatile uint32_t discard = USART3->DR;
+            volatile uint32_t discard = CONTROL_UART_INSTANCE->DR;
             (void)discard;
             ++boot_diag_uart_errors;
             continue;
         }
         if ((sr & USART_SR_RXNE) != 0u) {
-            *out = (uint8_t)USART3->DR;
+            *out = (uint8_t)CONTROL_UART_INSTANCE->DR;
             ++boot_diag_rx_bytes;
             return true;
         }
@@ -467,13 +477,13 @@ static bool uart_send_bytes(const uint8_t *data, uint16_t len, uint32_t timeout_
     if (!data || len == 0u) return false;
     for (uint16_t i = 0u; i < len; ++i) {
         const uint32_t start = HAL_GetTick();
-        while ((USART3->SR & USART_SR_TXE) == 0u) {
+        while ((CONTROL_UART_INSTANCE->SR & USART_SR_TXE) == 0u) {
             if ((HAL_GetTick() - start) >= timeout_ms) { ++boot_diag_uart_errors; return false; }
         }
-        USART3->DR = data[i];
+        CONTROL_UART_INSTANCE->DR = data[i];
     }
     const uint32_t start = HAL_GetTick();
-    while ((USART3->SR & USART_SR_TC) == 0u) {
+    while ((CONTROL_UART_INSTANCE->SR & USART_SR_TC) == 0u) {
         if ((HAL_GetTick() - start) >= timeout_ms) { ++boot_diag_uart_errors; return false; }
     }
     return true;
@@ -632,7 +642,7 @@ int main(void) {
     f103_debug_keepalive();
     /* Startup SystemInit() leaves the MCU on HSI=8 MHz but the CMSIS variable
      * defaults to 72 MHz. Fix the software model first, then raise the actual
-     * clock to the same 64/32-MHz tree as the application before USART3 init. */
+     * clock to the same 64/32-MHz tree as the application before control-UART init. */
     SystemCoreClockUpdate();
     HAL_Init();
     /* Reassert after HAL_Init as well; no peripheral init may strand SWD. */

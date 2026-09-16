@@ -197,7 +197,7 @@ void app_vesc_defaults(app_configuration *a, uint8_t id) {
     a->permanent_uart_enabled = true;
     a->can_mode = CAN_MODE_VESC;
     a->app_to_use = APP_UART;
-    a->app_uart_baudrate = USART3_BAUD;
+    a->app_uart_baudrate = CONTROL_UART_BAUD;
     a->app_adc_conf.ctrl_type = ADC_CTRL_TYPE_NONE;
     a->app_adc_conf.hyst = 0.15f;
     a->app_adc_conf.voltage_start = 0.9f;
@@ -239,14 +239,19 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
     app_configuration c = *conf;
     c.controller_id = second ? 2u : 1u;
     c.can_mode = CAN_MODE_VESC;
-    c.permanent_uart_enabled = true; /* USART3 selalu harus dapat diakses VESC Tool. */
-    /* Hardware ini hanya mempunyai jalur aplikasi UART dan dua ADC PA2/PA3.
-     * Mode PPM/Nunchuk/NRF/PAS tidak memiliki input fisik, sehingga jangan
-     * menerima konfigurasi yang tampak valid tetapi tidak mungkin bekerja. */
+    c.permanent_uart_enabled = true; /* Selected UART must remain reachable by VESC Tool. */
+#if CONTROL_UART_APP_ADC_AVAILABLE
+    /* USART3 keeps PA2/PA3 available as the two VESC App-ADC inputs. */
     if (c.app_to_use != APP_UART && c.app_to_use != APP_ADC && c.app_to_use != APP_ADC_UART) {
         c.app_to_use = APP_UART;
     }
     if (c.app_adc_conf.ctrl_type > ADC_CTRL_TYPE_PID_REV_BUTTON) c.app_adc_conf.ctrl_type = ADC_CTRL_TYPE_NONE;
+#else
+    /* USART2 owns PA2/PA3 electrically. APP_ADC/APP_ADC_UART therefore cannot
+     * be allowed to claim those pins or issue motor commands from stale samples. */
+    c.app_to_use = APP_UART;
+    c.app_adc_conf.ctrl_type = ADC_CTRL_TYPE_NONE;
+#endif
     if (c.app_adc_conf.throttle_exp_mode != THR_EXP_POLY) c.app_adc_conf.throttle_exp_mode = THR_EXP_POLY;
     if (c.app_adc_conf.update_rate_hz == 0u) c.app_adc_conf.update_rate_hz = 1u;
     /* Fail-closed production policy: App Config tidak boleh menonaktifkan atau
@@ -257,7 +262,7 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
     else if (c.timeout_msec > VESC_RUNTIME_TIMEOUT_MAX_MS) c.timeout_msec = VESC_RUNTIME_TIMEOUT_MAX_MS;
     /* This board has one physical VESC UART. Keep its electrical link fixed at
      * F103_VESC_UART_BAUD so writing App Config cannot strand VESC Tool on an unknown baud. */
-    c.app_uart_baudrate = USART3_BAUD;
+    c.app_uart_baudrate = CONTROL_UART_BAUD;
     /* Leaving an active ADC controller must release its last motor command once.
      * In APP_ADC_UART with ctrl_type NONE, subsequent UART SET_* commands remain
      * authoritative because the ADC app no longer touches the motor at all. */
@@ -297,7 +302,12 @@ bool app_vesc_output_disabled(uint32_t now_ms) {
 }
 
 static bool adc_app_enabled(const app_configuration *a) {
+#if CONTROL_UART_APP_ADC_AVAILABLE
     return a->app_to_use == APP_ADC || a->app_to_use == APP_ADC_UART;
+#else
+    (void)a;
+    return false;
+#endif
 }
 
 static void touch(bool second) {
@@ -345,7 +355,7 @@ static void set_rpm_user(bool second, float erpm) {
     mc_interface_set_pid_speed(erpm);
 }
 
-static void apply_adc(bool second, const app_configuration *a, uint32_t now_ms, float raw_v1, float raw_v2) {
+static void __attribute__((unused)) apply_adc(bool second, const app_configuration *a, uint32_t now_ms, float raw_v1, float raw_v2) {
     app_adc_state_t *st = &s_state[second ? 1 : 0];
     const adc_config *c = &a->app_adc_conf;
     uint32_t hz = c->update_rate_hz;
@@ -469,11 +479,9 @@ static void apply_adc(bool second, const app_configuration *a, uint32_t now_ms, 
 
 void app_vesc_process(uint32_t now_ms) {
     if(app_vesc_output_disabled(now_ms)) { mc_interface_select_motor_thread(1); return; }
+#if CONTROL_UART_APP_ADC_AVAILABLE
     const float v1 = (float)adc_buffer.adc2_spare4 * (3.3f / 4095.0f); /* PA2 / ADC2 CH2 */
     const float v2 = (float)adc_buffer.adc2_spare5 * (3.3f / 4095.0f); /* PA3 / ADC2 CH3 */
-    /* Realtime ADC VESC Tool harus tetap menampilkan tegangan pin walaupun
-     * App ADC tidak sedang dipilih. apply_adc() akan menimpa cache ini dengan
-     * nilai terfilter bila App ADC memang aktif. */
     s_v1 = v1;
     s_v2 = v2;
     const bool local_adc = adc_app_enabled(&s_conf[0]);
@@ -483,6 +491,16 @@ void app_vesc_process(uint32_t now_ms) {
     } else if (adc_app_enabled(&s_conf[1])) {
         apply_adc(true, &s_conf[1], now_ms, v1, v2);
     }
+#else
+    /* USART2 mode: PA2/PA3 are serial pins. Report App-ADC as unavailable and
+     * never consume the dummy ADC2 ranks that preserve the FOC dual-ADC frame. */
+    (void)now_ms;
+    s_v1 = 0.0f;
+    s_v2 = 0.0f;
+    s_dec1 = 0.0f;
+    s_dec2 = 0.0f;
+    s_range_ok = false;
+#endif
     mc_interface_select_motor_thread(1);
 }
 

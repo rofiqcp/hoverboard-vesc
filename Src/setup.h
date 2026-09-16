@@ -30,7 +30,7 @@ void MX_GPIO_Init(void);
 bool MX_TIM_Init(void);
 bool MX_ADC1_Init(void);
 bool MX_ADC2_Init(void);
-bool UART3_Init(void);
+bool Control_UART_Init(void);
 
 #endif
 

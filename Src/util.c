@@ -60,7 +60,7 @@ __attribute__((used, externally_visible)) int _write(int file, char *data, int l
   (void)file;
   (void)data;
   if (len <= 0) return 0;
-  /* USART3 PB10/PB11 is an exclusive native VESC 6.00 runtime transport at 921600 baud.
+  /* The selected control UART is an exclusive native VESC 6.00 runtime transport at 921600 baud.
    * Raw printf/debug bytes are never legal on this wire. */
   return len;
 }
@@ -76,17 +76,17 @@ void Input_Lim_Init(void) {
 }
 
 void UART_EnableRxErrorRecovery(UART_HandleTypeDef *huart) {
-  if (!huart || huart->Instance != USART3) return;
+  if (!huart || huart->Instance != CONTROL_UART_INSTANCE) return;
   SET_BIT(huart->Instance->CR3, USART_CR3_EIE);
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
-  if (!huart || huart->Instance != USART3) return;
+  if (!huart || huart->Instance != CONTROL_UART_INSTANCE) return;
   vesc_protocol_tx_complete_isr();
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-  if (!huart || huart->Instance != USART3) return;
+  if (!huart || huart->Instance != CONTROL_UART_INSTANCE) return;
   ++usart3RxErrorCount;
   /* IRQ context never owns DMA position/restart state. HAL may have aborted the
    * current DMA transfer before this callback; main() notices this flag on its
@@ -103,7 +103,7 @@ static volatile uint8_t s_eeprom_persistence_healthy = 0u;
 bool eeprom_persistence_healthy(void) { return s_eeprom_persistence_healthy != 0u; }
 
 bool Input_Init(void) {
-  if (!UART3_Init()) return false;
+  if (!Control_UART_Init()) return false;
   vesc_protocol_init();
   if (HAL_UART_Receive_DMA(&huart3, rxBuffer, sizeof(rxBuffer)) != HAL_OK) return false;
   UART_EnableRxErrorRecovery(&huart3);
@@ -238,7 +238,7 @@ static void __attribute__((unused)) serialAcceptLegacyByte(uint8_t byte) {
 }
 
 static void serialAcceptByte(uint8_t byte) {
-  /* USART3 is VESC-exclusive. The VESC parser safely ignores non 2/3/4 start
+  /* The selected control UART is VESC-exclusive. The VESC parser safely ignores non 2/3/4 start
    * bytes while idle, so never fall back into the obsolete legacy parser. */
   (void)vesc_protocol_rx_byte(byte);
 }
@@ -284,7 +284,7 @@ void usart3_rx_check(void) {
     /* New traffic epoch after an idle wire. Give the first VESC frame a full
      * valid-progress window before recovery is allowed. Without this guard the
      * first bytes made RAW recent while last-valid was still old, so recovery
-     * reset USART3 in the middle of the first frame and emitted a deterministic
+     * reset the control UART in the middle of the first frame and emitted a deterministic
      * 0xFF artifact / lost first reply. */
     usart3RxEpochMs = rx_now;
   }
@@ -319,7 +319,7 @@ void usart3_recovery_tick(uint32_t now_ms) {
   vesc_protocol_transport_reset();
   (void)HAL_UART_DMAStop(&huart3);
   (void)HAL_UART_DeInit(&huart3);
-  const bool uart_reinit_ok = UART3_Init();
+  const bool uart_reinit_ok = Control_UART_Init();
   usart3RxErrorPending = 0u;
   usart3RxOldPos = 0u;
   huart3.ErrorCode = HAL_UART_ERROR_NONE;
@@ -377,7 +377,7 @@ void poweroff(void) {
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_RESET);
   while (1) { }
 #else
-  /* Development mode: never drop PA5 OFF latch, so USART3/VESC Tool stays alive. */
+  /* Development mode: never drop PA5 OFF latch, so the selected UART/VESC Tool stays alive. */
   HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
 #endif
 }

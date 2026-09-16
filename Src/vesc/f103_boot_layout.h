@@ -7,10 +7,10 @@
 #define F103_FLASH_TOTAL_SIZE     0x00040000u /* 256 KiB */
 #define F103_FLASH_PAGE_SIZE      0x00000800u /* 2 KiB for STM32F103xE */
 
-/* Native VESC transport: F103 USART3 PB10/PB11 <-> CH340 USB-UART <-> PC/NUC.
- * Runtime application and resident recovery bootloader both use 921600 baud
- * for fast VESC traffic and firmware streaming over CH340 USB-UART. The host
- * uploader retains a 115200 legacy fallback for one-time bootloader migration. */
+/* Native VESC transport is selected at build time: USART2 PA2/PA3 or
+ * USART3 PB10/PB11. Runtime application and matching resident bootloader both
+ * use 921600 baud. The host uploader retains a 115200 legacy fallback for
+ * one-time bootloader migration. */
 #define F103_VESC_UART_BAUD       921600u
 #define F103_BOOT_UART_BAUD       921600u
 
@@ -31,7 +31,7 @@
 
 /* Reset-stage black-box values used by the TEST probation state machine.
  * Low byte of GATE/TIMEOUT stores a bitmask: bit0 elapsed, bit1 main-loop,
- * bit2 watchdog-feed progress, bit3 USART3-DMA healthy, bit4 host protocol seen. */
+ * bit2 watchdog-feed progress, bit3 selected-UART DMA healthy, bit4 host protocol seen. */
 #define F103_STAGE_PROBATION_GATE_BASE       0x50524700u /* 'PRG'+bits */
 #define F103_STAGE_PROBATION_TIMEOUT_BASE    0x50525400u /* 'PRT'+bits */
 #define F103_STAGE_PROBATION_CONFIRM_OK      0x50524F4Bu /* 'PROK' */

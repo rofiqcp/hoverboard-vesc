@@ -35,6 +35,7 @@ void usart3_recovery_tick(uint32_t now_ms);
 
 void poweronMelody(void);
 void beepCount(uint8_t cnt, uint8_t freq, uint8_t pattern);
+void beepErrorCode(uint8_t code, uint8_t freq);
 void beepShort(uint8_t freq);
 void calcAvgSpeed(void);
 

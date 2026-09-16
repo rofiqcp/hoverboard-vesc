@@ -3,8 +3,9 @@
 
 #include "stm32f1xx_hal.h"
 #include "vesc/f103_boot_layout.h"
+#include "control_uart.h"
 
-/* Fixed firmware profile: BOARD 0 + USART3 only. */
+/* UART transport is selected by the PlatformIO environment. */
 #ifndef VARIANT_USART
 #define VARIANT_USART
 #endif
@@ -120,7 +121,7 @@
 #define RATE                     480
 #define FILTER                   6553
 
-/* Independent signed motor commands over USART3. Mode 3 supports +/-3000 cA
+/* Independent signed motor commands over the selected control UART. Mode 3 supports +/-3000 cA
  * to represent the full +/-30 A hard motor-current range; modes 1/2 are still saturated by their
  * own generated-controller limits, while mode 4 clamps to +/-I_MOT_MAX A. */
 #define PRI_INPUT1               2, -3000, 0, 3000, 0
@@ -128,17 +129,21 @@
 #define INPUTS_NR                1
 #define FLASH_WRITE_KEY          0x1002
 
-/* One physical communication interface only: USART3 PB10/PB11. */
+/* One physical VESC communication interface, selected at build time. */
+#if defined(F103_CONTROL_USART2)
+#define CONTROL_SERIAL_USART2    1
+#define FEEDBACK_SERIAL_USART2
+#define DEBUG_SERIAL_USART2
+#else
 #define CONTROL_SERIAL_USART3    1
 #define FEEDBACK_SERIAL_USART3
 #define DEBUG_SERIAL_USART3
+#endif
 #define DEBUG_SERIAL_PROTOCOL
 #define SERIAL_START_FRAME       0xABCD
 #define SERIAL_BUFFER_SIZE       768
 #define SERIAL_DEBUG_LINE_SIZE   96
 #define SERIAL_TIMEOUT           160
-#define USART3_BAUD              F103_VESC_UART_BAUD
-#define USART3_WORDLENGTH        UART_WORDLENGTH_8B
 
 /* Batas watchdog aktuator lokal. host command layer boleh lebih ketat, tetapi F103 adalah
  * otoritas terakhir yang benar-benar mematikan PWM bila command stream hilang. */

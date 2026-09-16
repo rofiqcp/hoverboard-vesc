@@ -180,46 +180,25 @@ void f103_SysTick_Handler_impl(void) {
 
 
 
-/**
-  * @brief This function handles DMA1 channel2 global interrupt.
-  */
-void f103_DMA1_Channel2_IRQHandler_impl(void)
+/** Selected control-UART TX DMA interrupt. */
+void f103_ControlUartTxDma_IRQHandler_impl(void)
 {
-  /* USER CODE BEGIN DMA1_Channel2_IRQn 0 */
-
-  /* USER CODE END DMA1_Channel2_IRQn 0 */
   HAL_DMA_IRQHandler(&hdma_usart3_tx);
-  /* USER CODE BEGIN DMA1_Channel2_IRQn 1 */
-
-  /* USER CODE END DMA1_Channel2_IRQn 1 */
 }
 
-/**
-  * @brief This function handles DMA1 channel3 global interrupt.
-  */
-void f103_DMA1_Channel3_IRQHandler_impl(void)
+/** Selected control-UART RX DMA interrupt. */
+void f103_ControlUartRxDma_IRQHandler_impl(void)
 {
-  /* USER CODE BEGIN DMA1_Channel3_IRQn 0 */
-
-  /* USER CODE END DMA1_Channel3_IRQn 0 */
   HAL_DMA_IRQHandler(&hdma_usart3_rx);
-  /* USER CODE BEGIN DMA1_Channel3_IRQn 1 */
-
-  /* USER CODE END DMA1_Channel3_IRQn 1 */
 }
 
-
-/**
-  * @brief This function handles USART3 global interrupt.
-  */
-void f103_USART3_IRQHandler_impl(void)
+/** Selected control-UART global interrupt. */
+void f103_ControlUart_IRQHandler_impl(void)
 {
   if ((__HAL_UART_GET_FLAG(&huart3, UART_FLAG_IDLE) != RESET) &&
       (__HAL_UART_GET_IT_SOURCE(&huart3, UART_IT_IDLE) != RESET)) {
-    /* RX DMA is drained only from the main loop. Calling usart3_rx_check()
-     * here races its static oldPos against the main-loop caller and can feed
-     * the same DMA bytes twice into the VESC parser, producing false CRC
-     * errors on otherwise valid frames. IDLE only wakes/acknowledges UART. */
+    /* RX DMA is drained only from main context. IDLE is acknowledged here so
+     * the same DMA bytes can never be consumed concurrently by IRQ and main. */
     __HAL_UART_CLEAR_IDLEFLAG(&huart3);
   }
   HAL_UART_IRQHandler(&huart3);
