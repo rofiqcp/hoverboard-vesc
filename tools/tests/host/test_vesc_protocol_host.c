@@ -174,6 +174,7 @@ void mcpwm_foc_vesc_override_clear(bool second) { touch_count[second?1:0]=0u; }
 bool mcpwm_foc_vesc_override_active(bool second) { return touch_count[second?1:0] != 0u; }
 mcpwm_foc_motor_t *mcpwm_foc_get_motor(bool second) { return &diag_motors[second?1:0]; }
 const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool second) { return &diag_motors[second?1:0]; }
+float mcpwm_foc_get_duty_cycle_motor(bool second) { return (float)diag_motors[second?1:0].m_duty_now_permille / 1000.0f; }
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
     const int j=second?1:0;
     const float ia=plant_fail_rl?0.0f:fabsf(current);

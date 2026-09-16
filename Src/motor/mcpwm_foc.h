@@ -156,6 +156,9 @@ typedef struct {
      * 2.667-kHz per-motor control cadence and atomically consumed by COMM_GET_VALUES. */
     volatile int32_t m_telem_sum_id_q4;
     volatile int32_t m_telem_sum_iq_q4;
+    /* Upstream VESC accumulates filtered motor-current magnitude itself;
+     * do not reconstruct Imotor later from averaged D/Q components. */
+    volatile int32_t m_telem_sum_imotor_q4;
     volatile int32_t m_telem_sum_ibus_counts;
     volatile uint16_t m_telem_avg_samples;
     /* Short OFF->RUN sample blanking; fixed startup control offsets are never
@@ -183,6 +186,13 @@ typedef struct {
     volatile uint16_t m_off_offset_samples;
     volatile uint16_t m_off_settle_ticks;
     volatile uint8_t m_off_offset_valid;
+    /* DC-link shunt remains physically observable with PWM released. Keep its
+     * zero independently valid across RUN->OFF while phase-shunt high-Z zero
+     * is re-acquired after each driven interval. */
+    volatile uint8_t m_off_dc_valid;
+    volatile uint8_t m_off_dc_track_div;
+    /* Passive OFF DC-current LPF, Q16 ADC-counts. Independent from phase FOC. */
+    int32_t m_off_dc_current_lpf_q16;
     int32_t m_off_offset_sum0, m_off_offset_sum1, m_off_offset_sumdc;
 
     /* VESC energy counters since boot. Upstream exposes separate drawn and
