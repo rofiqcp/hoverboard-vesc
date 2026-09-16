@@ -224,11 +224,16 @@ void MX_GPIO_Init(void) {
 
   /* PA2/PA3 are VESC App-ADC inputs only in the USART3 build. In USART2
    * mode they are TX/RX and must never be configured as analog inputs. */
-#if CONTROL_UART_APP_ADC_AVAILABLE
+#if defined(F103_CONTROL_USART3)
   GPIO_InitStruct.Pin = GPIO_PIN_3;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   GPIO_InitStruct.Pin = GPIO_PIN_2;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+#elif defined(F103_CONTROL_USART2)
+  /* USART2 mode: do not touch PA2/PA3 here. Input_Init()/HAL_UART_MspInit()
+   * later configures PA2=TX(AF-PP) and PA3=RX(input pull-up). */
+#else
+#error "Control UART must be selected before GPIO configuration"
 #endif
 
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -331,7 +336,7 @@ bool MX_TIM_Init(void) {
 
   // Start counting >0 to effectively offset timers by the time it takes for one ADC conversion to complete.
   // This method allows that the Phase currents ADC measurements are properly aligned with LOW-FET ON region for both motors
-  LEFT_TIM->CNT 		     = ADC_TOTAL_CONV_TIME;
+  LEFT_TIM->CNT 		     = FOC_ADC_PHASE_OFFSET_COUNTS;
 
   sConfigOC.OCMode       = TIM_OCMODE_PWM1;
   sConfigOC.Pulse        = 0;
@@ -490,18 +495,19 @@ bool MX_ADC2_Init(void) {
   sConfig.Rank    = 3;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
-#if CONTROL_UART_APP_ADC_AVAILABLE
-  sConfig.Channel = ADC_CHANNEL_2;  // PA2 App ADC input in USART3 mode
+#if defined(F103_CONTROL_USART3)
+  /* USART3 uses PB10/PB11, therefore PA2/PA3 remain available to App-ADC. */
+  sConfig.Channel = ADC_CHANNEL_2;  // PA2 App ADC input
   sConfig.Rank    = 4;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
-  sConfig.Channel = ADC_CHANNEL_3;  // PA3 App ADC input in USART3 mode
+  sConfig.Channel = ADC_CHANNEL_3;  // PA3 App ADC input
   sConfig.Rank    = 5;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
-#else
-  /* Dual regular simultaneous mode must keep five ADC2 ranks to match ADC1.
-   * USART2 owns PA2/PA3, so ranks 4/5 sample already-active motor-current
-   * channels as harmless dummies instead of electrically touching PA2/PA3. */
+#elif defined(F103_CONTROL_USART2)
+  /* USART2 owns PA2/PA3. Never put ADC2 CH2/CH3 in the conversion sequence.
+   * Dual regular simultaneous mode still requires five ADC2 ranks to match
+   * ADC1, so ranks 4/5 use existing current-sense pins only as dummy slots. */
   sConfig.Channel = ADC_CHANNEL_10; // PC0 duplicate/dummy
   sConfig.Rank    = 4;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
@@ -509,6 +515,8 @@ bool MX_ADC2_Init(void) {
   sConfig.Channel = ADC_CHANNEL_13; // PC3 duplicate/dummy
   sConfig.Rank    = 5;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
+#else
+#error "Control UART must be selected before ADC2 configuration"
 #endif
 
   hadc2.Instance->CR2 |= ADC_CR2_DMA;

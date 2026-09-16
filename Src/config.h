@@ -33,6 +33,9 @@
  * dalam satuan cycle timer 64 MHz. */
 #define ADC_CLOCK_DIV            6
 #define ADC_TOTAL_CONV_TIME      (ADC_CLOCK_DIV * ADC_CONV_CLOCK_CYCLES)
+/* ADC trigger phase relative to the synchronized TIM1/TIM8 PWM pair.
+ * Tuned from real driven-zero current measurements; keep independent from ADC conversion time. */
+#define FOC_ADC_PHASE_OFFSET_COUNTS 120u
 /* Conservative fixed-trigger current-sample qualification. The sample is only
  * declared window-valid when the centered low-side zero-vector half-window
  * exceeds dead-time + one ADC conversion alignment interval + settling margin. */

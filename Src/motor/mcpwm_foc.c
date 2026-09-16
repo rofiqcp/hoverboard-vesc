@@ -5180,7 +5180,7 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
     const uint8_t leftBridgeWasOn=(LEFT_TIM->BDTR&TIM_BDTR_MOE)?1u:0u;
     const uint8_t rightBridgeWasOn=(RIGHT_TIM->BDTR&TIM_BDTR_MOE)?1u:0u;
     if(leftDriveRequest && !leftBridgeWasOn && m_motor_1.m_fault==FAULT_CODE_NONE){
-        m_motor_1.m_bridge_settle_ticks=MCCONF_BRIDGE_SETTLE_SAMPLES;
+        m_motor_1.m_bridge_settle_ticks=(uint16_t)(MCCONF_BRIDGE_PRESETTLE_SAMPLES+MCCONF_BRIDGE_SETTLE_SAMPLES);
         /* The hoverboard low-side current amplifiers shift common-mode when
          * MOE turns on. Re-measure the driven baseline during the existing
          * zero-vector settle window instead of applying the bridge-OFF boot
@@ -5199,7 +5199,7 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
         m_motor_1.m_telem_sum_id_q4=0; m_motor_1.m_telem_sum_iq_q4=0; m_motor_1.m_telem_sum_ibus_counts=0; m_motor_1.m_telem_avg_samples=0u;
     }
     if(rightDriveRequest && !rightBridgeWasOn && m_motor_2.m_fault==FAULT_CODE_NONE){
-        m_motor_2.m_bridge_settle_ticks=MCCONF_BRIDGE_SETTLE_SAMPLES;
+        m_motor_2.m_bridge_settle_ticks=(uint16_t)(MCCONF_BRIDGE_PRESETTLE_SAMPLES+MCCONF_BRIDGE_SETTLE_SAMPLES);
         m_motor_2.m_driven_offset_valid=0u;
         m_motor_2.m_driven_offset_calibrating=1u;
         m_motor_2.m_driven_offset_samples=0u;
@@ -5303,23 +5303,29 @@ void f103_DMA1_Channel1_IRQHandler_impl(void) {
      * settle_ticks sengaja ditahan di 1 sampai slow-path menandai baseline valid. */
     if(leftBridgeWasOn && leftDriveRequest && m_motor_1.m_bridge_settle_ticks>0u &&
        m_motor_1.m_driven_offset_calibrating && !m_motor_1.m_driven_offset_finalize_pending){
-        m_motor_1.m_driven_offset_sum0+=(int32_t)adc_buffer.rlA;
-        m_motor_1.m_driven_offset_sum1+=(int32_t)adc_buffer.rlB;
-        m_motor_1.m_driven_offset_sumdc+=(int32_t)adc_buffer.dcl;
-        if(m_motor_1.m_driven_offset_samples<MCCONF_BRIDGE_SETTLE_SAMPLES)
-            m_motor_1.m_driven_offset_samples++;
-        if(m_motor_1.m_driven_offset_samples>=MCCONF_BRIDGE_SETTLE_SAMPLES)
-            m_motor_1.m_driven_offset_finalize_pending=1u;
+        /* Discard the first powered frames while the current-amplifier
+         * common-mode moves. Start averaging only after pre-settle. */
+        if(m_motor_1.m_bridge_settle_ticks<=MCCONF_BRIDGE_SETTLE_SAMPLES){
+            m_motor_1.m_driven_offset_sum0+=(int32_t)adc_buffer.rlA;
+            m_motor_1.m_driven_offset_sum1+=(int32_t)adc_buffer.rlB;
+            m_motor_1.m_driven_offset_sumdc+=(int32_t)adc_buffer.dcl;
+            if(m_motor_1.m_driven_offset_samples<MCCONF_BRIDGE_SETTLE_SAMPLES)
+                m_motor_1.m_driven_offset_samples++;
+            if(m_motor_1.m_driven_offset_samples>=MCCONF_BRIDGE_SETTLE_SAMPLES)
+                m_motor_1.m_driven_offset_finalize_pending=1u;
+        }
     }
     if(rightBridgeWasOn && rightDriveRequest && m_motor_2.m_bridge_settle_ticks>0u &&
        m_motor_2.m_driven_offset_calibrating && !m_motor_2.m_driven_offset_finalize_pending){
-        m_motor_2.m_driven_offset_sum0+=(int32_t)adc_buffer.rrB;
-        m_motor_2.m_driven_offset_sum1+=(int32_t)adc_buffer.rrC;
-        m_motor_2.m_driven_offset_sumdc+=(int32_t)adc_buffer.dcr;
-        if(m_motor_2.m_driven_offset_samples<MCCONF_BRIDGE_SETTLE_SAMPLES)
-            m_motor_2.m_driven_offset_samples++;
-        if(m_motor_2.m_driven_offset_samples>=MCCONF_BRIDGE_SETTLE_SAMPLES)
-            m_motor_2.m_driven_offset_finalize_pending=1u;
+        if(m_motor_2.m_bridge_settle_ticks<=MCCONF_BRIDGE_SETTLE_SAMPLES){
+            m_motor_2.m_driven_offset_sum0+=(int32_t)adc_buffer.rrB;
+            m_motor_2.m_driven_offset_sum1+=(int32_t)adc_buffer.rrC;
+            m_motor_2.m_driven_offset_sumdc+=(int32_t)adc_buffer.dcr;
+            if(m_motor_2.m_driven_offset_samples<MCCONF_BRIDGE_SETTLE_SAMPLES)
+                m_motor_2.m_driven_offset_samples++;
+            if(m_motor_2.m_driven_offset_samples>=MCCONF_BRIDGE_SETTLE_SAMPLES)
+                m_motor_2.m_driven_offset_finalize_pending=1u;
+        }
     }
 
     /* Three current-sampling states are kept deliberately separate:

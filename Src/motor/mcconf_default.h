@@ -156,11 +156,12 @@
 #define MCCONF_ENCODER_STUCK_MIN_ERPM             100u
 #define MCCONF_ENCODER_STUCK_CURRENT_MA           1000u
 #define MCCONF_ENCODER_STUCK_TIMEOUT_TICKS       8000u /* 0,5 s @16 kHz */
-/* OFF->RUN powered-current baseline. Keep a zero vector for 80 PWM frames
- * (5.0 ms @16 kHz), average the low-side shunt operating point, then finalize
- * outside ISR. This is intentionally longer than a simple gate-settle delay:
- * real hardware showed a different driven common-mode than bridge-OFF. */
-#define MCCONF_BRIDGE_SETTLE_SAMPLES               80u
+/* OFF->RUN powered-current baseline. The low-side current amplifiers move to
+ * a different common-mode when MOE turns on. Real hardware needs a short
+ * discard window before the baseline is stationary; only then average 80 PWM
+ * frames. 160 discard + 80 average = 15 ms total @16 kHz. */
+#define MCCONF_BRIDGE_PRESETTLE_SAMPLES            160u
+#define MCCONF_BRIDGE_SETTLE_SAMPLES                80u
 /* OFF/high-impedance telemetry uses its own frozen zero-current ADC baseline.
  * Remove a few ADC counts of amplifier noise without hiding real passive/regen
  * current changes when the wheel is back-driven manually. 4 counts = 0.08 A. */
