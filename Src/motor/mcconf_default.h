@@ -57,9 +57,10 @@
 #define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A       15.00f /* hard board/config ceiling; never exceeded */
 #define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       120u
 #define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       120u
-/* Physical LEFT steering envelope. VESC COMM_SET_POS is still the wire API,
- * but the user coordinate is signed mechanical degrees around center. 330 deg
- * from a legacy 0..360 UI is interpreted as -30 deg. */
+/* Internal LEFT steering normalization envelope. External owners always use
+ * standard VESC COMM_SET_POS 0..360; this internal -30..+30 coordinate only maps
+ * that raw actuator position onto the calibrated encoder-count span. Vehicle
+ * physical wheel-angle calibration is owned by ROS/ROS Web. */
 #define MCCONF_STEERING_POS_MIN_DEG             (-30.0f)
 #define MCCONF_STEERING_POS_MAX_DEG               30.0f
 /* Runtime steering deliberately avoids the high-friction end regions found in

@@ -164,6 +164,10 @@ typedef struct {
     volatile int16_t m_duty_now_permille;
     volatile uint8_t m_driven_offset_calibrating;
     volatile uint8_t m_driven_offset_valid;
+    /* Upstream VESC distinguishes driven (50% PWM / zero-vector) calibration
+     * from the undriven bridge-OFF baseline. This flag means a powered baseline
+     * has actually completed successfully during this boot. */
+    volatile uint8_t m_driven_offset_powered_valid;
     volatile uint16_t m_driven_offset_samples;
     volatile int16_t m_driven_offset0, m_driven_offset1, m_driven_offsetdc;
     /* Akumulasi zero-vector powered dilakukan tanpa pembagian di ISR. Setelah

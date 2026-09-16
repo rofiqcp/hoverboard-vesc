@@ -621,8 +621,9 @@ static float wrap_angle_diff_deg(float a, float b) {
 }
 
 static float steering_vesc_position_deg(void) {
-    /* Public VESC position remains the stock 0..360 widget coordinate while
-     * ROS/custom steering stays signed mechanical degrees. Center is 180. */
+    /* VESC Tool-compatible public position for LEFT steering. This is a raw
+     * normalized actuator coordinate 0..360 derived from the calibrated encoder
+     * count span. Vehicle wheel-angle calibration belongs to ROS/ROS Web. */
     const float mech=mc_interface_get_steering_deg();
     float pos=(mech-MCCONF_STEERING_POS_MIN_DEG) * 360.0f /
         (MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);
@@ -651,10 +652,8 @@ static bool display_rotor_pos(bool second, disp_pos_mode mode, float *out) {
         else *out=(float)m->m_phase_hall*(360.0f/65536.0f);
         return true;
     case DISP_POS_MODE_PID_POS:
-        /* Match COMM_GET_VALUES.position exactly. LEFT is a calibrated steering
-         * axis, so its public VESC position is physical steering degrees rather
-         * than the raw motor PID shaft coordinate. Keeping both streams on the
-         * same source prevents a false rotor-position jump in VESC Tool. */
+        /* VESC Tool position remains standard 0..360. LEFT maps that public
+         * actuator coordinate onto the calibrated steering travel. */
         *out = !second ? steering_vesc_position_deg() : mc_interface_get_pid_pos_now_motor(second);
         return true;
     case DISP_POS_MODE_PID_POS_ERROR: {
@@ -880,11 +879,8 @@ static void send_values_packet(bool second, bool selective, uint32_t mask) {
         if(mask&(1u<<15)) b[i++]=v.fault;
         if(mask&(1u<<16)) {
             uint32_t pv2=DWT->CYCCNT;
-            /* LEFT public PID position is always the logical steering coordinate
-             * 0..360 (center=180), even before span calibration. This prevents
-             * fallback to the circular raw shaft angle and therefore prevents
-             * apparent 359->0 wrap spikes in VESC Tool/ROS. Encoder/Observer
-             * display modes remain circular by upstream VESC definition. */
+            /* Keep the standard VESC position field in its public 0..360 actuator
+             * coordinate. LEFT steering adapts physical travel into that domain. */
             const float pos = !second ? steering_vesc_position_deg() :
                 mc_interface_get_pid_pos_now_motor(second);
             buffer_append_float32(b, pos, 1e6f, &i);
@@ -2842,9 +2838,9 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     }
     if (op == HB_CUSTOM_SET_STEERING_DEG) {
         /* ROS/Web runtime path: signed mechanical steering degrees with 0=center.
-         * Keep this separate from stock COMM_SET_POS, whose VESC Tool widget is
-         * intentionally mapped 0..360 -> -30..+30 on LEFT. No per-cycle ACK is
-         * emitted; normal GET_VALUES telemetry is the feedback/health channel. */
+         * Keep this separate from stock COMM_SET_POS, which remains the upstream
+         * single-turn PID-position command. No per-cycle ACK is emitted; custom
+         * steering calibration telemetry is the mechanical feedback channel. */
         if (second || n < 4u) return;
         int32_t mdeg=buffer_get_int32(d,&k);
         if(mdeg>30000)mdeg=30000;
@@ -3538,11 +3534,12 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
         if (hall_detect_motor_locked(second)) break;
         if(n>=4u){
             float pos=(float)buffer_get_int32(d,&k)/1000000.0f;
+            /* Wire-compatible VESC Tool position command. LEFT exposes a raw
+             * normalized 0..360 steering-actuator coordinate and maps it to the
+             * calibrated encoder-count span. Vehicle physical degrees are not
+             * defined here; ROS/ROS Web owns that calibration. RIGHT retains the
+             * stock single-turn PID-position path. */
             if(!second){
-                /* VESC Tool exposes SET_POS as 0..360 deg. For the physical
-                 * LEFT steering axis map that UI range linearly onto the
-                 * signed mechanical envelope: 0 -> -30, 180 -> 0, 360 -> +30.
-                 * Values outside the widget range are clamped, never wrapped. */
                 if(pos<0.0f)pos=0.0f;
                 if(pos>360.0f)pos=360.0f;
                 pos=MCCONF_STEERING_POS_MIN_DEG +

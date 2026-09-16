@@ -34,51 +34,35 @@ static float norm_pos_deg(float v) {
     return v;
 }
 
-static float signed_pos_deg(float v) {
-    while (v >= 180.0f) v -= 360.0f;
-    while (v < -180.0f) v += 360.0f;
-    return v;
-}
-
-static float steering_user_clamp(float v) {
-    v=signed_pos_deg(v);
-    if(v>MCCONF_STEERING_POS_MAX_DEG)v=MCCONF_STEERING_POS_MAX_DEG;
-    if(v<MCCONF_STEERING_POS_MIN_DEG)v=MCCONF_STEERING_POS_MIN_DEG;
-    return v;
-}
-
 static float direction_mult(bool second) {
     const mc_configuration *c=(const mc_configuration *)mcpwm_foc_get_configuration(second);
     return (c && c->m_invert_direction) ? -1.0f : 1.0f;
 }
 
-static bool encoder_position_active(bool second) {
+static bool encoder_position_configured(bool second) {
     const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(second);
-    return !second && m && m->m_encoder_configured &&
-           m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_ABI;
+    return m && m->m_encoder_configured;
 }
 
+/* Keep the public PID-position API identical to upstream VESC mc_interface:
+ * p_pid_offset, direction and encoder inversion are applied around a normalized
+ * single-turn 0..360 degree coordinate. Project steering mechanics live only in
+ * mc_interface_{set,get}_steering_deg() and never alter COMM_SET_POS semantics. */
 static float pid_pos_raw_to_user(float raw, bool second) {
     const mc_configuration *c=(const mc_configuration *)mcpwm_foc_get_configuration(second);
     if (!c) return norm_pos_deg(raw);
-    const bool steering=encoder_position_active(second);
-    if (steering && c->foc_encoder_inverted) raw=-raw;
+    if (encoder_position_configured(second) && c->foc_encoder_inverted) raw=-raw;
     raw*=direction_mult(second);
     raw-=c->p_pid_offset;
-    /* LEFT ABI steering is a signed mechanical coordinate around center.
-     * Report real signed feedback (including small overshoot) rather than
-     * folding -5 deg into 355 deg. RIGHT keeps stock single-turn semantics. */
-    return steering?signed_pos_deg(raw):norm_pos_deg(raw);
+    return norm_pos_deg(raw);
 }
 
 static float pid_pos_user_to_raw(float user, bool second) {
     const mc_configuration *c=(const mc_configuration *)mcpwm_foc_get_configuration(second);
     if (!c) return norm_pos_deg(user);
-    const bool steering=encoder_position_active(second);
-    if(steering)user=steering_user_clamp(user);
     float raw=user+c->p_pid_offset;
     raw*=direction_mult(second);
-    if (steering && c->foc_encoder_inverted) raw=-raw;
+    if (encoder_position_configured(second) && c->foc_encoder_inverted) raw=-raw;
     return norm_pos_deg(raw);
 }
 
