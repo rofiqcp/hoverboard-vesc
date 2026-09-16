@@ -222,8 +222,9 @@ void MX_GPIO_Init(void) {
   GPIO_InitStruct.Pin = DCLINK_PIN;
   HAL_GPIO_Init(DCLINK_PORT, &GPIO_InitStruct);
 
-  /* PA2/PA3 are VESC App-ADC inputs only in the USART3 build. In USART2
-   * mode they are TX/RX and must never be configured as analog inputs. */
+  /* PA2/PA3 are application-visible ADC inputs only in the USART3 build.
+   * USART2 owns their GPIO mode as TX/RX; ADC2 still keeps CH2/CH3 in scan
+   * ranks 4/5 to match the upstream conversion sequence (see MX_ADC2_Init). */
 #if defined(F103_CONTROL_USART3)
   GPIO_InitStruct.Pin = GPIO_PIN_3;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -495,29 +496,20 @@ bool MX_ADC2_Init(void) {
   sConfig.Rank    = 3;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
-#if defined(F103_CONTROL_USART3)
-  /* USART3 uses PB10/PB11, therefore PA2/PA3 remain available to App-ADC. */
-  sConfig.Channel = ADC_CHANNEL_2;  // PA2 App ADC input
+/* Keep the ADC2 scan layout identical to upstream EFeru firmware in both
+ * control-UART modes:
+ *   rank1 PC0/DCL, rank2 PC3/RLB, rank3 PC5/RRC, rank4 PA2, rank5 PA3.
+ * This is deliberate even for USART2. In that build PA2/PA3 GPIO ownership is
+ * transferred to UART TX/RX by HAL_UART_MspInit(), and App-ADC is compile-time
+ * disabled, but preserving CH2/CH3 as ranks 4/5 keeps ADC2 scan timing and the
+ * sample/hold charge history identical to the proven upstream sequence. */
+  sConfig.Channel = ADC_CHANNEL_2;  // PA2: App-ADC on USART3, USART2_TX otherwise
   sConfig.Rank    = 4;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
 
-  sConfig.Channel = ADC_CHANNEL_3;  // PA3 App ADC input
+  sConfig.Channel = ADC_CHANNEL_3;  // PA3: App-ADC on USART3, USART2_RX otherwise
   sConfig.Rank    = 5;
   HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
-#elif defined(F103_CONTROL_USART2)
-  /* USART2 owns PA2/PA3. Never put ADC2 CH2/CH3 in the conversion sequence.
-   * Dual regular simultaneous mode still requires five ADC2 ranks to match
-   * ADC1, so ranks 4/5 use existing current-sense pins only as dummy slots. */
-  sConfig.Channel = ADC_CHANNEL_10; // PC0 duplicate/dummy
-  sConfig.Rank    = 4;
-  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
-
-  sConfig.Channel = ADC_CHANNEL_13; // PC3 duplicate/dummy
-  sConfig.Rank    = 5;
-  HAL_OK_OR_RETURN(HAL_ADC_ConfigChannel(&hadc2, &sConfig));
-#else
-#error "Control UART must be selected before ADC2 configuration"
-#endif
 
   hadc2.Instance->CR2 |= ADC_CR2_DMA;
   __HAL_ADC_ENABLE(&hadc2);

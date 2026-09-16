@@ -17,6 +17,8 @@ typedef struct {
     mc_configuration m_conf;
     volatile mc_state m_state;
     volatile mc_control_mode m_control_mode;
+    /* Normal STOP/zero-current state: bridge remains driven at exact centered
+     * zero vector, but current PI is bypassed so ADC noise is never chased. */
     volatile mc_fault_code m_fault;
     /* Main-context MC config publication can span many float/cache calculations.
      * While this flag is set the ADC ISR must never read the partially published

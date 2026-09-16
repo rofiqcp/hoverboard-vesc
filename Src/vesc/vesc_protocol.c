@@ -253,7 +253,8 @@ typedef enum {
     DETECT_ALL_RL_HIGH,
     DETECT_ALL_FLUX_RAMP,
     DETECT_ALL_FLUX_SAMPLE,
-    DETECT_ALL_FLUX_RETURN
+    DETECT_ALL_FLUX_RETURN,
+    DETECT_ALL_WAIT_STOP
 } detect_all_stage_t;
 
 typedef struct {
@@ -270,8 +271,12 @@ typedef struct {
     float sl_erpm;
     float current_low;
     float current_high;
+    float rl_max_current;
+    uint8_t rl_sweep_count;
     float flux_current;
     float flux_target_erpm;
+    float flux_target_duty;
+    float flux_ramp_erpm_s;
     float sum_i;
     float sum_v;
     float sum_i_raw;
@@ -1081,6 +1086,11 @@ static void reply_values_setup(bool second, bool selective, const uint8_t *data,
 static bool hall_detect_motor_locked(bool second);
 
 static void touch_motor(bool second) { mcpwm_foc_vesc_override_touch(second); }
+static void standby_motor(bool second) {
+    mc_interface_select_motor_thread(second ? 2 : 1);
+    touch_motor(second);
+    mc_interface_set_current(0.0f);
+}
 
 static void reply_mcconf(bool second, COMM_PACKET_ID id) {
     mc_configuration *const c=&s_mc_txn_next[0];
@@ -1640,7 +1650,7 @@ static bool mcpwm_foc_measure_res_ind_f103_start(bool second) {
 }
 
 static bool conf_general_measure_flux_linkage_f103_worker_start(bool second, COMM_PACKET_ID cmd,
-                                          float current,float rpm_or_ramp,
+                                          float current,float rpm_or_ramp,float duty,
                                           float resistance,float inductance) {
     if(s_hall_detect.active || s_detect_all.active)return false;
     if(!(resistance>0.0f && resistance<=2.0f))return false;
@@ -1654,7 +1664,10 @@ static bool conf_general_measure_flux_linkage_f103_worker_start(bool second, COM
         inductance=(live && live->foc_motor_l>0.0f)?live->foc_motor_l:0.0f;
     }
     s_detect_all.standalone_flux_current=fabsf(current);
-    s_detect_all.standalone_flux_ramp_erpm_s=(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP)?fabsf(rpm_or_ramp):600.0f;
+    s_detect_all.standalone_flux_ramp_erpm_s=(cmd==COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP)?fabsf(rpm_or_ramp):1800.0f;
+    s_detect_all.flux_target_duty=fabsf(duty);
+    if(s_detect_all.flux_target_duty<0.02f)s_detect_all.flux_target_duty=0.30f;
+    if(s_detect_all.flux_target_duty>0.90f)s_detect_all.flux_target_duty=0.90f;
     for(uint8_t mi=0u;mi<2u;++mi){
         s_detect_all.backup[mi]=*mc_interface_get_configuration_motor(mi!=0u);
         s_detect_all.result[mi]=s_detect_all.backup[mi];
@@ -1702,6 +1715,7 @@ static bool conf_general_measure_flux_linkage_f103_worker_start(bool second, COM
     }
     if(s_detect_all.standalone_flux_ramp_erpm_s<50.0f)s_detect_all.standalone_flux_ramp_erpm_s=50.0f;
     if(s_detect_all.standalone_flux_ramp_erpm_s>20000.0f)s_detect_all.standalone_flux_ramp_erpm_s=20000.0f;
+    s_detect_all.flux_ramp_erpm_s=s_detect_all.standalone_flux_ramp_erpm_s;
     detect_all_apply_runtime(mi);
     app_vesc_disable_output(60000);
     detect_all_reset_sample();
@@ -1714,40 +1728,28 @@ static bool conf_general_measure_flux_linkage_f103_worker_start(bool second, COM
 static inline bool conf_general_measure_flux_linkage_start(bool second, float current,
                                                         float duty, float min_erpm,
                                                         float resistance) {
-    (void)duty;
     /* COMM_DETECT_MOTOR_FLUX_LINKAGE (26) in upstream uses the legacy BLDC
      * sensorless commutator. This F103 firmware is FOC-only, so this wrapper is
      * a protocol-compatible adapter onto the FOC commissioning worker. */
     return conf_general_measure_flux_linkage_f103_worker_start(second,
-        COMM_DETECT_MOTOR_FLUX_LINKAGE,current,min_erpm,resistance,0.0f);
+        COMM_DETECT_MOTOR_FLUX_LINKAGE,current,min_erpm,duty,resistance,0.0f);
 }
 
 static inline bool conf_general_measure_flux_linkage_openloop_start(bool second, float current,
                                                                  float duty, float erpm_per_sec,
                                                                  float resistance, float inductance) {
-    (void)duty;
     /* Same command/method family as upstream conf_general_measure_flux_linkage_openloop;
      * cooperative suffix is required because this bare-metal target has no worker thread. */
     return conf_general_measure_flux_linkage_f103_worker_start(second,
-        COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,current,erpm_per_sec,resistance,inductance);
+        COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,current,erpm_per_sec,duty,resistance,inductance);
 }
 
-static void measure_r_l_imax_f103_start(uint8_t mi, uint32_t now_time) {
-    s_detect_all.motor_index=mi;
-    detect_all_apply_runtime(mi);
+static void detect_all_rl_command_pair(uint8_t mi, float lo, float hi, uint32_t now_time) {
     const bool second=mi!=0u;
-    const float max_i=s_detect_all.result[mi].l_current_max>0.5f ? s_detect_all.result[mi].l_current_max : (float)I_MOT_MAX;
-    /* R/L identification also starts at a useful 3-A Id level on this
-     * low-side-shunt board. The old 0.6-A point was below reliable driven
-     * current observability and produced lowI=0 even though the detector later
-     * surfaced the generic flux-linkage error in VESC Tool. */
-    float lo=MCCONF_STEERING_DETECT_CURRENT_START_A;
-    float hi=lo+2.0f;
-    if(lo>max_i*0.60f)lo=max_i*0.60f;
-    if(hi>max_i*0.85f)hi=max_i*0.85f;
-    if(hi>(float)I_MOT_MAX)hi=(float)I_MOT_MAX;
-    if(lo<0.50f)lo=0.50f;
-    if(hi<lo+0.50f)hi=lo+0.50f;
+    const float max_i=s_detect_all.rl_max_current>0.0f?s_detect_all.rl_max_current:(float)I_MOT_MAX;
+    if(lo<0.50f)lo=0.50f; /* F103 low-side-shunt observability floor. */
+    if(lo>max_i)lo=max_i;
+    if(hi<lo+0.25f)hi=lo+0.25f;
     if(hi>max_i)hi=max_i;
     s_detect_all.current_low=lo; s_detect_all.current_high=hi;
     mcpwm_foc_set_openloop_phase(lo,0.0f,second);
@@ -1756,6 +1758,38 @@ static void measure_r_l_imax_f103_start(uint8_t mi, uint32_t now_time) {
     s_detect_all.stage_start_time=now_time;
     s_detect_all.next_sample_time=now_time;
     detect_all_reset_sample();
+}
+
+static void measure_r_l_imax_f103_start(uint8_t mi, uint32_t now_time) {
+    s_detect_all.motor_index=mi;
+    detect_all_apply_runtime(mi);
+    mc_configuration *c=&s_detect_all.result[mi];
+    float max_i=c->l_current_max*c->l_current_max_scale;
+    if(!(max_i>0.0f))max_i=c->l_current_max;
+    if(!(max_i>0.5f))max_i=(float)I_MOT_MAX;
+    if(max_i>(float)I_MOT_MAX)max_i=(float)I_MOT_MAX;
+    s_detect_all.rl_max_current=max_i;
+    s_detect_all.rl_sweep_count=0u;
+
+    /* Follow bldc/conf_general.c current selection. Detect-All starts at
+     * max_current/50 but never below cc_min_current*1.1, then grows by 1.5x
+     * until the max-power-loss criterion is reached. Standalone COMM 25 follows
+     * mcpwm_foc_measure_res_ind() and starts at 2 A. The F103 adaptation keeps
+     * a 0.5-A minimum because this two-low-side-shunt board is not observably
+     * linear below that powered current. */
+    float lo;
+    if(s_detect_all.standalone_cmd==COMM_DETECT_MOTOR_R_L){
+        lo=2.0f;
+    }else{
+        lo=max_i/50.0f;
+        const float cc=(c->cc_min_current>0.0f)?c->cc_min_current:MCCONF_CC_MIN_CURRENT;
+        if(lo<cc*1.1f)lo=cc*1.1f;
+    }
+    if(lo<0.50f)lo=0.50f;
+    if(lo>max_i*0.75f)lo=max_i*0.75f;
+    float hi=lo*1.5f;
+    if(hi<lo+0.50f)hi=lo+0.50f;
+    detect_all_rl_command_pair(mi,lo,hi,now_time);
 }
 
 static float detect_all_sensor_current(uint8_t mi) {
@@ -2053,6 +2087,22 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
         return;
     }
     if(s_detect_all.stage==DETECT_ALL_HALL) return;
+    if(s_detect_all.stage==DETECT_ALL_WAIT_STOP){
+        /* bldc/conf_general_detect_apply_all_foc waits for both motors to be
+         * below 100 ERPM before sensor commissioning. This matters after the
+         * standard duty=0.3 flux spin: starting Hall detect on a coasting rotor
+         * produces an invalid/missing-sector table even though the sensor is OK. */
+        detect_all_release_all();
+        const float e0=fabsf(mcpwm_foc_get_erpm_motor(false));
+        const float e1=fabsf(mcpwm_foc_get_erpm_motor(true));
+        const uint32_t wait_ms=detect_time_elapsed_ms(s_detect_all.stage_start_time,now_time);
+        if(e0<100.0f && e1<100.0f){
+            conf_general_autodetect_apply_sensors_foc_start(now_time);
+        }else if(wait_ms>=5000u){
+            s_detect_all_last_detail=16; conf_general_detect_worker_finish(-10);
+        }
+        return;
+    }
     if(!detect_time_due(now_time,s_detect_all.next_sample_time)) return;
     s_detect_all.next_sample_time=detect_time_after_ms(now_time,1u);
     const uint8_t mi=s_detect_all.motor_index;
@@ -2064,13 +2114,28 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
     const uint32_t elapsed=detect_time_elapsed_ms(s_detect_all.stage_start_time,now_time);
 
     switch(s_detect_all.stage){
-    case DETECT_ALL_RL_ALIGN:
-        if(elapsed>=400u){
+    case DETECT_ALL_RL_ALIGN: {
+        /* Reassert the commissioning D-axis request while the bridge performs
+         * its powered-offset transition. A one-shot request here is fragile when
+         * switching LEFT -> RIGHT: configuration/offset finalization can clear
+         * the control state after measure_r_l_imax_f103_start() has issued it.
+         * Do not sample R/L until the selected bridge is genuinely current-ready
+         * and the requested current is physically observable. */
+        mcpwm_foc_set_openloop_phase(s_detect_all.current_low,0.0f,second);
+        mcpwm_foc_vesc_override_touch(second);
+        const bool current_ready=m->m_current_offset_valid && m->m_driven_offset_valid &&
+            !m->m_driven_offset_calibrating && m->m_bridge_settle_ticks==0u;
+        const float id_abs=fabsf((float)m->m_id_q4/(float)FOC_CURRENT_Q4_PER_A);
+        if(elapsed>=2000u && (!current_ready || id_abs<0.20f)){
+            s_detect_all_last_detail=15; conf_general_detect_worker_finish(-10); return;
+        }
+        if(elapsed>=400u && current_ready && id_abs>=0.20f){
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_RL_LOW;
             s_detect_all.stage_start_time=now_time;
         }
         break;
+    }
     case DETECT_ALL_RL_LOW:
         /* Commissioning must use the regulator-owned instantaneous current.
          * GET_VALUES telemetry is deliberately filtered/qualified and can be
@@ -2127,19 +2192,50 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
         s_detect_all.sum_i_raw+=m->m_id_q4;
         s_detect_all.sum_v_raw+=m->m_vd;
         s_detect_all.sample_n++;
-        if(elapsed>=250u && s_detect_all.sample_n>=20u){
+        if(elapsed>=250u && s_detect_all.sample_n>=100u){
             const float n=(float)s_detect_all.sample_n;
             s_detect_all.high_i[mi]=(float)(s_detect_all.sum_i/n);
             s_detect_all.high_v[mi]=(float)(s_detect_all.sum_v/n);
             s_detect_all.high_i_raw[mi]=(float)(s_detect_all.sum_i_raw/n);
             s_detect_all.high_v_raw[mi]=(float)(s_detect_all.sum_v_raw/n);
             if(!measure_r_l_imax_f103_finish(mi)){s_detect_all_last_detail=4;conf_general_detect_worker_finish(-10);return;}
+
+            /* Upstream chooses the final R/L measurement current with a 1.5x
+             * sweep. Detect-All stops when I^2*R*1.5 reaches Pmax/5; standalone
+             * COMM 25 stops around 1/R or half the configured current limit.
+             * Re-run the same powered two-point/transient measurement at each
+             * level so this cooperative F103 worker preserves the reference
+             * current-selection semantics without blocking the UART main loop. */
+            bool repeat_rl=false;
+            const float probe=s_detect_all.current_high;
+            const float rnow=s_detect_all.r[mi];
+            if(s_detect_all.rl_sweep_count<7u){
+                if(s_detect_all.standalone_cmd==COMM_DETECT_MOTOR_R_L){
+                    const float standalone_cap=s_detect_all.rl_max_current*0.50f;
+                    repeat_rl=(probe<standalone_cap-0.10f) && (probe<=1.0f/rnow);
+                }else{
+                    const float loss=probe*probe*rnow*1.5f;
+                    repeat_rl=(loss<s_detect_all.max_power_loss/5.0f) &&
+                              (probe<s_detect_all.rl_max_current-0.10f);
+                }
+            }
+            if(repeat_rl){
+                float lo=probe;
+                float hi=lo*1.5f;
+                if(hi>s_detect_all.rl_max_current)hi=s_detect_all.rl_max_current;
+                if(hi>lo+0.20f){
+                    s_detect_all.rl_sweep_count++;
+                    detect_all_rl_command_pair(mi,lo,hi,now_time);
+                    break;
+                }
+            }
+
             if(s_detect_all.standalone_cmd==COMM_DETECT_MOTOR_R_L){
                 conf_general_detect_worker_finish(0);
                 return;
             }
-            /* Match VESC Detect-All: flux open-loop current is Imax / 2.5.
-             * Keep only the board safety clamps around that upstream choice. */
+            /* Exact Detect-All commissioning constants from bldc/conf_general.c:
+             * flux current=Imax/2.5, target duty=0.3, acceleration=1800 ERPM/s. */
             s_detect_all.flux_current=s_detect_all.standalone_cmd ?
                 s_detect_all.standalone_flux_current : s_detect_all.imax[mi]/2.5f;
             {
@@ -2149,11 +2245,13 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
                 if(s_detect_all.flux_current>fmax)s_detect_all.flux_current=fmax;
             }
             if(s_detect_all.flux_current<0.50f)s_detect_all.flux_current=0.50f;
-            s_detect_all.flux_target_erpm=600.0f;
+            s_detect_all.flux_target_duty=0.30f;
+            s_detect_all.flux_ramp_erpm_s=1800.0f;
+            s_detect_all.flux_target_erpm=0.0f;
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_FLUX_RAMP;
             s_detect_all.stage_start_time=now_time;
-        } else if(elapsed>=2000u && s_detect_all.sample_n<20u){
+        } else if(elapsed>=10000u && s_detect_all.sample_n<100u){
             s_detect_all_last_detail=3; conf_general_detect_worker_finish(-10); return;
         }
         break;
@@ -2179,30 +2277,37 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
             }
             break;
         }
-        float ramp_rate=s_detect_all.standalone_cmd ? s_detect_all.standalone_flux_ramp_erpm_s : 1800.0f;
+        /* VESC open-loop flux measurement first ramps current into a stationary
+         * lock (~200 ms), lets the bridge settle (~1 s), then accelerates at the
+         * requested ERPM/s until the requested duty is reached. Detect-All uses
+         * duty=0.3 and 1800 ERPM/s. This replaces the old fixed-600-ERPM shortcut. */
+        float ramp_rate=s_detect_all.standalone_cmd ? s_detect_all.standalone_flux_ramp_erpm_s : s_detect_all.flux_ramp_erpm_s;
         if(ramp_rate<50.0f)ramp_rate=50.0f;
-        float ramp_ms=(s_detect_all.flux_target_erpm-80.0f)*1000.0f/ramp_rate;
-        if(ramp_ms<100.0f)ramp_ms=100.0f;
-        if(ramp_ms>5000.0f)ramp_ms=5000.0f;
-        float f=(float)elapsed/ramp_ms; if(f>1.0f)f=1.0f;
-        const float erpm=80.0f+(s_detect_all.flux_target_erpm-80.0f)*f;
+        if(ramp_rate>20000.0f)ramp_rate=20000.0f;
+        if(elapsed<200u){
+            const float f=(float)elapsed/200.0f;
+            mcpwm_foc_set_openloop_current(s_detect_all.flux_current*f,0.0f,second);
+            mcpwm_foc_vesc_override_touch(second);
+            break;
+        }
+        if(elapsed<1200u){
+            mcpwm_foc_set_openloop_current(s_detect_all.flux_current,0.0f,second);
+            mcpwm_foc_vesc_override_touch(second);
+            break;
+        }
+        const uint32_t spin_ms=elapsed-1200u;
+        float erpm=ramp_rate*(float)spin_ms/1000.0f;
+        if(erpm>12000.0f)erpm=12000.0f;
         mcpwm_foc_set_openloop_current(s_detect_all.flux_current,erpm,second);
         mcpwm_foc_vesc_override_touch(second);
-        if((float)elapsed>=ramp_ms){
-            const float actual_erpm=fabsf(mcpwm_foc_get_erpm_motor(second));
-            float fmax=s_detect_all.result[mi].l_current_max*s_detect_all.result[mi].l_current_max_scale;
-            if(!(fmax>0.0f))fmax=s_detect_all.result[mi].l_current_max;
-            if(fmax>(float)I_MOT_MAX)fmax=(float)I_MOT_MAX;
-            /* If the rotor still has not broken away, increase torque current in
-             * 1-A steps and retry the speed ramp. Stop increasing immediately
-             * once motion is established. */
-            if(actual_erpm<s_detect_all.flux_target_erpm*0.20f &&
-               s_detect_all.flux_current<fmax-0.01f){
-                s_detect_all.flux_current+=MCCONF_STEERING_DETECT_CURRENT_STEP_A;
-                if(s_detect_all.flux_current>fmax)s_detect_all.flux_current=fmax;
-                s_detect_all.stage_start_time=now_time;
-                break;
-            }
+        float target_duty=s_detect_all.flux_target_duty;
+        if(!(target_duty>0.0f))target_duty=0.30f;
+        const float max_duty=s_detect_all.result[mi].l_max_duty*0.90f;
+        if(max_duty>0.02f && target_duty>max_duty)target_duty=max_duty;
+        const float duty=fabsf(mcpwm_foc_get_duty_cycle_motor(second));
+        if(duty>=target_duty || erpm>=12000.0f || spin_ms>=15000u){
+            if(erpm<80.0f)erpm=80.0f;
+            s_detect_all.flux_target_erpm=erpm;
             detect_all_reset_sample();
             s_detect_all.stage=DETECT_ALL_FLUX_SAMPLE;
             s_detect_all.stage_start_time=now_time;
@@ -2255,7 +2360,12 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
             s_detect_all.sample_n++;
         }
         const uint32_t min_elapsed=s_detect_all.flux_bounded_left?bounded_done_ms:800u;
-        const uint32_t max_elapsed=s_detect_all.flux_bounded_left?(bounded_done_ms+800u):3000u;
+        /* RIGHT is an unbounded low-speed flux spin. Require the same 40 real
+         * samples as before, but allow enough wall time for a busy bare-metal
+         * main loop to deliver them. At 600 electrical RPM this is only about
+         * 40 mechanical RPM on the 15-pole-pair traction motor; protections and
+         * current limits remain active throughout. */
+        const uint32_t max_elapsed=s_detect_all.flux_bounded_left?(bounded_done_ms+800u):10000u;
         const uint32_t min_samples=s_detect_all.flux_bounded_left?200u:40u;
         if(elapsed>=min_elapsed && s_detect_all.sample_n>=min_samples){
             const float n=(float)s_detect_all.sample_n;
@@ -2288,7 +2398,11 @@ static void conf_general_detect_apply_all_foc_process(uint32_t now_time) {
             mc_interface_select_motor_thread(second?2:1); mc_interface_release_motor();
             mcpwm_foc_vesc_override_clear(second); mc_interface_select_motor_thread(1);
             if(mi==0u){measure_r_l_imax_f103_start(1u,now_time);}
-            else conf_general_autodetect_apply_sensors_foc_start(now_time);
+            else {
+                detect_all_release_all();
+                s_detect_all.stage=DETECT_ALL_WAIT_STOP;
+                s_detect_all.stage_start_time=now_time;
+            }
         } else if(elapsed>=max_elapsed && s_detect_all.sample_n<min_samples){
             s_detect_all_last_detail=s_detect_all.flux_bounded_left?13:5;
             conf_general_detect_worker_finish(-10); return;
@@ -3123,7 +3237,7 @@ static bool terminal_float(const char *s,float *out){
 static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)(*s-'A'+'a');}
 
 static void terminal_help(void){
-    terminal_send_text("Commands:\nREAD help fw status values encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all]\n");
+    terminal_send_text("Commands:\nREAD help fw status values model encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all|hard] | release [all]\n");
     terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
     terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
@@ -3188,6 +3302,18 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
     mc_interface_select_motor_thread(second?2:1);mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);const mc_configuration *cc=(const mc_configuration *)mc_interface_get_configuration_motor(second);char o[420];
 
     if(!strcmp(a[0],"help")||!strcmp(a[0],"?")){terminal_help();return;}
+    if(!strcmp(a[0],"model")){
+        const mc_configuration *cm=(const mc_configuration *)mc_interface_get_configuration_motor(second);
+        snprintf(o,sizeof(o),"model id=%u R_uOhm=%lu L_nH=%lu LdLq_nH=%ld flux_nWb=%lu sensor=%u/%u hall=%u,%u,%u,%u,%u,%u,%u,%u\n",
+            second?2u:1u,(unsigned long)(cm->foc_motor_r*1000000.0f+0.5f),
+            (unsigned long)(cm->foc_motor_l*1000000000.0f+0.5f),
+            (long)(cm->foc_motor_ld_lq_diff*1000000000.0f),
+            (unsigned long)(cm->foc_motor_flux_linkage*1000000000.0f+0.5f),
+            (unsigned)cm->m_sensor_port_mode,(unsigned)cm->foc_sensor_mode,
+            cm->foc_hall_table[0],cm->foc_hall_table[1],cm->foc_hall_table[2],cm->foc_hall_table[3],
+            cm->foc_hall_table[4],cm->foc_hall_table[5],cm->foc_hall_table[6],cm->foc_hall_table[7]);
+        terminal_send_text(o);return;
+    }
     if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"%s FW6.00 id=%u role=%s sensor=%s\n",second?"motor_right":"motor_left",second?2u:1u,second?"drive":"steer",second?"Hall":(cc->m_sensor_port_mode==SENSOR_PORT_MODE_ABI?"ABI":"Hall"));terminal_send_text(o);return;}
     if(!strcmp(a[0],"faults_clear")||!strcmp(a[0],"faults_reset")||!strcmp(a[0],"reset_faults")||
        (!strcmp(a[0],"reset")&&ac>1&&!strcmp(a[1],"faults"))||
@@ -3269,7 +3395,8 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         terminal_send_text("ERR detect status|hall|encoder|all|cancel\n");return;
     }
     if(!strcmp(a[0],"home")){if(second||cc->m_sensor_port_mode!=SENSOR_PORT_MODE_ABI){terminal_send_text("ERR LEFT encoder only\n");return;}terminal_send_text(mc_interface_steering_boot_home()?"PASS home\n":"FAIL home\n");return;}
-    if(!strcmp(a[0],"stop")){if(ac>1&&!strcmp(a[1],"all")){mc_interface_select_motor_thread(1);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(false);mc_interface_select_motor_thread(2);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(true);mc_interface_select_motor_thread(second?2:1);}else{mc_interface_release_motor();mcpwm_foc_vesc_override_clear(second);}terminal_send_text("OK stopped\n");return;}
+    if(!strcmp(a[0],"release")){if(ac>1&&!strcmp(a[1],"all")){mc_interface_select_motor_thread(1);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(false);mc_interface_select_motor_thread(2);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(true);mc_interface_select_motor_thread(second?2:1);}else{mc_interface_release_motor();mcpwm_foc_vesc_override_clear(second);}terminal_send_text("OK hard released\n");return;}
+    if(!strcmp(a[0],"stop")){if(ac>1&&!strcmp(a[1],"hard")){mc_interface_release_motor();mcpwm_foc_vesc_override_clear(second);terminal_send_text("OK hard released\n");return;}if(ac>1&&!strcmp(a[1],"all")){standby_motor(false);standby_motor(true);mc_interface_select_motor_thread(second?2:1);}else{standby_motor(second);}terminal_send_text("OK standby Id=Iq=0\n");return;}
     if(!strcmp(a[0],"save")&&ac>1){if(!strcmp(a[1],"mcconf")){terminal_send_text(mc_interface_store_configuration_motor(second)?"OK saved\n":"ERR save\n");return;}if(!second&&!strcmp(a[1],"steering")){terminal_send_text(mc_interface_store_steering_calibration()?"OK saved\n":"ERR steering\n");return;}}
     if(!strcmp(a[0],"load")&&ac>1&&!strcmp(a[1],"mcconf")){terminal_send_text(mc_interface_load_configuration_motor(second)?"OK loaded\n":"ERR load\n");return;}
     if(!strcmp(a[0],"defaults")){bool sv=ac>1&&!strcmp(a[1],"save");mc_interface_restore_default_motor(second,sv);terminal_send_text(sv?"OK defaults saved\n":"OK defaults RAM\n");return;}

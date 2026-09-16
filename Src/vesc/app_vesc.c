@@ -254,9 +254,9 @@ bool app_vesc_set_configuration(bool second, const app_configuration *conf) {
 #endif
     if (c.app_adc_conf.throttle_exp_mode != THR_EXP_POLY) c.app_adc_conf.throttle_exp_mode = THR_EXP_POLY;
     if (c.app_adc_conf.update_rate_hz == 0u) c.app_adc_conf.update_rate_hz = 1u;
-    /* Fail-closed production policy: App Config tidak boleh menonaktifkan atau
-     * memperpanjang timeout aktuator lokal melewati 500 ms. Nilai 0 dari VESC
-     * Tool dikembalikan ke default aman 300 ms. */
+    /* Match upstream VESC's 1000-ms default watchdog while still failing closed:
+     * timeout=0 is mapped back to the safe default and this F103 target does not
+     * allow a host App Config to extend the actuator deadline beyond 1000 ms. */
     if (c.timeout_msec == 0u) c.timeout_msec = VESC_RUNTIME_TIMEOUT_DEFAULT_MS;
     else if (c.timeout_msec < VESC_RUNTIME_TIMEOUT_MIN_MS) c.timeout_msec = VESC_RUNTIME_TIMEOUT_MIN_MS;
     else if (c.timeout_msec > VESC_RUNTIME_TIMEOUT_MAX_MS) c.timeout_msec = VESC_RUNTIME_TIMEOUT_MAX_MS;

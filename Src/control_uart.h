@@ -48,8 +48,9 @@
 #endif
 
 /* PA2/PA3 are physically multiplexed between USART2 and the VESC App-ADC.
- * Keep this relationship compile-time and fail closed if a future edit makes
- * the two feature definitions inconsistent. */
+ * "APP_ADC_AVAILABLE" controls whether their ADC results may be used by the
+ * application; it does not remove ADC2 CH2/CH3 from scan ranks 4/5. Keeping
+ * those tail ranks in both UART modes matches upstream EFeru ADC sequencing. */
 #if defined(F103_CONTROL_USART2) && CONTROL_UART_APP_ADC_AVAILABLE
 #error "USART2 owns PA2/PA3: App-ADC must be disabled"
 #endif

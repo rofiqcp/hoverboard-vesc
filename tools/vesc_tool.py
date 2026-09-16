@@ -85,11 +85,14 @@ def enc_setpoint(mode: str, value: float) -> bytes:
 
 
 class LiveWorker:
-    def __init__(self, link: VescDual, command_hz: float = 50.0, telemetry_hz: float = 5.0):
+    def __init__(self, link: VescDual, command_hz: float = 50.0, telemetry_hz: float = 50.0, app_data_hz: float = 20.0):
         self.link = link
         self.command_hz = max(1.0, min(100.0, command_hz))
         self.telemetry_hz = max(0.0, min(50.0, telemetry_hz))
         self.telemetry_enabled = self.telemetry_hz > 0
+        self.app_data_hz = max(0.0, min(50.0, app_data_hz))
+        self.app_data_enabled = self.app_data_hz > 0
+        self.latest_app = {"ppm": None, "adc": None, "chuk": None}
         self.active: dict[bool, tuple[str, float] | None] = {False: None, True: None}
         self.latest = {False: None, True: None}
         self.status_text = "Telemetry waiting..."
@@ -164,10 +167,15 @@ class LiveWorker:
     def telemetry_once(self, spec: str = "both", emit: bool = True) -> None:
         selected = motors(spec)
         values = {}
-        for _label, right in selected:
-            v = self.link.values(right)
-            self.latest[right] = v
-            values[right] = v
+        if len(selected)==2:
+            left,right_v=self.link.values_pair()
+            self.latest[False]=left; self.latest[True]=right_v
+            values[False]=left; values[True]=right_v
+        else:
+            for _label, right in selected:
+                v = self.link.values(right)
+                self.latest[right] = v
+                values[right] = v
 
         if spec == "both" or len(selected) == 2:
             left = values.get(False)
@@ -213,16 +221,24 @@ class LiveWorker:
         if emit:
             print(line, flush=True)
 
+    def app_data_once(self) -> None:
+        # VESC Tool queues these three fields together. Batch them on the wire so
+        # Python does not impose three USB request/wait round trips per App tick.
+        ppm,adc,chuk=self.link.decoded_app_triplet()
+        self.latest_app["ppm"] = ppm
+        self.latest_app["adc"] = adc
+        self.latest_app["chuk"] = chuk
+
     def status_line(self) -> str:
         with self.lock:
             return self.status_text
 
     def _run(self) -> None:
-        next_cmd = next_tel = next_alive = next_burst = time.monotonic()
+        next_cmd = next_tel = next_app = next_alive = next_burst = time.monotonic()
         while not self.stop_evt.is_set():
             if self.pause_evt.is_set():
                 self.stop_evt.wait(0.01)
-                next_cmd = next_tel = next_alive = next_burst = time.monotonic()
+                next_cmd = next_tel = next_app = next_alive = next_burst = time.monotonic()
                 continue
             now = time.monotonic()
             try:
@@ -231,10 +247,17 @@ class LiveWorker:
                     next_alive = now + 1.0 / self.alive_hz
                 if now >= next_cmd:
                     self._send_active(); next_cmd = now + 1.0 / self.command_hz
-                with self.lock: tel_on, tel_hz = self.telemetry_enabled, self.telemetry_hz
+                with self.lock:
+                    tel_on, tel_hz = self.telemetry_enabled, self.telemetry_hz
+                    app_on, app_hz = self.app_data_enabled, self.app_data_hz
                 if tel_on and tel_hz > 0 and now >= next_tel:
                     self.telemetry_once("both", emit=False)
-                    next_tel = time.monotonic() + 1.0 / tel_hz
+                    next_tel += 1.0 / tel_hz
+                    if next_tel < time.monotonic() - 1.0 / tel_hz: next_tel = time.monotonic()
+                if app_on and app_hz > 0 and time.monotonic() >= next_app:
+                    self.app_data_once()
+                    next_app += 1.0 / app_hz
+                    if next_app < time.monotonic() - 1.0 / app_hz: next_app = time.monotonic()
                 if tel_on and self.burst_hz > 0 and now >= next_burst:
                     # Print the latest already-polled snapshot above prompt_toolkit.
                     # Do not re-poll here: one UART telemetry transaction cadence stays authoritative.
@@ -689,11 +712,12 @@ def selftest() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap=argparse.ArgumentParser(description="single VESC Tool-like CLI for LEFT encoder + RIGHT Hall F103")
+    ap=argparse.ArgumentParser(description="single VESC Tool-like CLI for dual Hall F103")
     ap.add_argument("port",nargs="?",default="/dev/ttyUSB0", help="serial port (default: /dev/ttyUSB0)")
     ap.add_argument("--baud",type=int,default=DEFAULT_BAUD)
     ap.add_argument("--command-hz",type=float,default=50.0)
-    ap.add_argument("--telemetry-hz",type=float,default=5.0)
+    ap.add_argument("--telemetry-hz",type=float,default=50.0, help="VESC RT motor data rate (default: 50 Hz)")
+    ap.add_argument("--app-data-hz",type=float,default=20.0, help="VESC RT App Data PPM/ADC/CHUK rate (default: 20 Hz)")
     ap.add_argument("--burst-hz",type=float,default=1.0, help="copyable telemetry lines above prompt (default: 1 Hz, 0=off)")
     ap.add_argument("--no-telemetry",action="store_true")
     ap.add_argument("--exec",dest="one_command",help="jalankan satu command lalu keluar")
@@ -701,7 +725,9 @@ def main(argv: list[str] | None = None) -> int:
     args=ap.parse_args(argv)
     if args.selftest: return selftest()
     link=VescDual(args.port,args.baud,timeout=0.35)
-    worker=LiveWorker(link,args.command_hz,0.0 if args.no_telemetry or args.one_command else args.telemetry_hz)
+    worker=LiveWorker(link,args.command_hz,
+                      0.0 if args.no_telemetry or args.one_command else args.telemetry_hz,
+                      0.0 if args.no_telemetry or args.one_command else args.app_data_hz)
     worker.burst_hz = 0.0 if args.no_telemetry or args.one_command else max(0.0, min(50.0, args.burst_hz))
     console=Console(link,worker)
     try:

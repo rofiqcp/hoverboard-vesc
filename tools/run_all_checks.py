@@ -196,7 +196,7 @@ def check_static():
     assert 'ADC_CTRL_TYPE_NONE is telemetry-only' in appv and 'if (c->ctrl_type == ADC_CTRL_TYPE_NONE)' in appv, 'ADC NONE must not energize/touch motor'
     assert 'c.app_adc_conf.throttle_exp_mode != THR_EXP_POLY' in appv and 'powf(' not in appv and 'expf(' not in appv, 'F103 App ADC must canonicalize heavy EXPO/NATURAL curves to standard POLY'
     assert 'a->timeout_msec = VESC_RUNTIME_TIMEOUT_DEFAULT_MS;' in appv, 'VESC App Config default must use local hard watchdog'
-    assert 'VESC_RUNTIME_TIMEOUT_DEFAULT_MS  300u' in cfg and 'VESC_RUNTIME_TIMEOUT_MAX_MS      500u' in cfg, 'F103 hard watchdog bounds missing'
+    assert 'VESC_RUNTIME_TIMEOUT_DEFAULT_MS 1000u' in cfg and 'VESC_RUNTIME_TIMEOUT_MAX_MS     1000u' in cfg, 'F103 hard watchdog bounds missing'
     assert 'c.timeout_msec == 0u' in appv and 'VESC_RUNTIME_TIMEOUT_MAX_MS' in appv, 'App Config must not disable/extend actuator watchdog'
     assert 'mcpwm_foc_vesc_timeout_configure(second, c.timeout_msec, c.timeout_brake_current)' in appv, 'App Config timeout/brake must drive motor watchdog'
     assert 'mc_interface_set_current_rel(rel)' in appv and 'mc_interface_set_brake_current_rel(rel)' in appv, 'App ADC current modes must use upstream VESC relative-current helpers'

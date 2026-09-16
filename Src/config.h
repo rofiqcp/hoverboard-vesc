@@ -150,9 +150,12 @@
 
 /* Batas watchdog aktuator lokal. host command layer boleh lebih ketat, tetapi F103 adalah
  * otoritas terakhir yang benar-benar mematikan PWM bila command stream hilang. */
-#define VESC_RUNTIME_TIMEOUT_DEFAULT_MS  300u
+/* Upstream VESC appconf_default.h uses 1000 ms. Keep the same default so the
+ * standard 200-ms COMM_ALIVE cadence has ample scheduling margin on F103.
+ * The hard realtime watchdog still disables MOE on a genuinely lost link. */
+#define VESC_RUNTIME_TIMEOUT_DEFAULT_MS 1000u
 #define VESC_RUNTIME_TIMEOUT_MIN_MS       50u
-#define VESC_RUNTIME_TIMEOUT_MAX_MS      500u
+#define VESC_RUNTIME_TIMEOUT_MAX_MS     1000u
 
 #define SERIAL_STATUS_ENABLED    (1u << 0)
 #define SERIAL_STATUS_TIMEOUT    (1u << 1)

@@ -20,7 +20,7 @@ def main():
     ap.add_argument('--arm',action='store_true',help='required: measurements energize/spin the selected motor')
     ap.add_argument('--motor',choices=('left','right','both'),default='both')
     ap.add_argument('--repeat',type=int,default=5)
-    ap.add_argument('--flux-current',type=float,default=1.0)
+    ap.add_argument('--max-power-loss',type=float,default=50.0)
     ap.add_argument('--flux-ramp-erpm-s',type=float,default=1800.0)
     ap.add_argument('--max-cv-r',type=float,default=0.08); ap.add_argument('--max-cv-l',type=float,default=0.10); ap.add_argument('--max-cv-flux',type=float,default=0.10)
     ap.add_argument('--output',default=str(TOOLS_DIR.parent.parent / 'data/esc/model_qualification_latest.json'))
@@ -37,11 +37,16 @@ def main():
                 x=link.measure_r_l(right); rl.append(x); print(f'MODEL_RL {name} {i+1}/{a.repeat} {x}',flush=True); time.sleep(.15)
             sr=stat([x['r_ohm'] for x in rl]); sl=stat([x['l_h'] for x in rl]); sld=stat([x['ld_lq_h'] for x in rl])
             r,l=sr['median'],sl['median']; flux=[]
+            # Match bldc Detect-All exactly: Imax=sqrt(P/(1.5R)), flux current=Imax/2.5,
+            # duty target=0.30 and open-loop acceleration=1800 ERPM/s.
+            imax=min(15.0,(a.max_power_loss/(1.5*r))**0.5); flux_current=imax/2.5
             for i in range(a.repeat):
-                # Wire command retains a duty field for VESC compatibility, but this F103 worker intentionally
-                # identifies at a bounded 600-ERPM operating point. Keep the protocol placeholder fixed.
-                f=link.measure_flux_openloop(a.flux_current,a.flux_ramp_erpm_s,0.35,r,l,right)
-                flux.append(f); print(f'MODEL_FLUX {name} {i+1}/{a.repeat} {f:.9g}',flush=True); time.sleep(.2)
+                f=link.measure_flux_openloop(flux_current,a.flux_ramp_erpm_s,0.30,r,l,right)
+                flux.append(f); print(f'MODEL_FLUX {name} {i+1}/{a.repeat} {f:.9g} I={flux_current:.3f}A',flush=True)
+                # Upstream waits for the motor to stop before sensor/next commissioning step.
+                for _ in range(60):
+                    if abs(link.diag(right).erpm)<100: break
+                    time.sleep(.1)
             sf=stat(flux)
             passed=(0.0<r<=2.0 and 5e-6<=l<=0.02 and 1e-4<=sf['median']<=1.0 and sr['cv']<=a.max_cv_r and sl['cv']<=a.max_cv_l and sf['cv']<=a.max_cv_flux)
             result['motors'][name]={"r_ohm":sr,"l_h":sl,"ld_lq_h":sld,"flux_wb":sf,"raw_rl":rl,"raw_flux":flux,

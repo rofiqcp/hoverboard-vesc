@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VESC-standard USART3 client for the bare-metal STM32F103 dual hoverboard port.
+"""VESC-standard USART2/USART3 client for the bare-metal STM32F103 dual hoverboard port.
 
 Motor mapping:
   Left  = local VESC serial controller
@@ -53,7 +53,9 @@ COMM_DETECT_ENCODER = 27
 COMM_REBOOT = 29
 COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
+COMM_GET_DECODED_PPM = 31
 COMM_GET_DECODED_ADC = 32
+COMM_GET_DECODED_CHUK = 33
 COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
 COMM_GET_VALUES_SETUP = 47
@@ -639,7 +641,10 @@ def _unpack_float32_auto(data: bytes, offset: int) -> tuple[float, int]:
 
 class VescDual:
     def __init__(self, port: str, baud: int = DEFAULT_BAUD, timeout: float = 0.15):
-        self.ser = open_transport(port, baud, timeout=0.01)
+        # Use a 1-ms host read quantum. All VESC transactions below enforce their
+        # own monotonic deadlines, so a 10-ms tty read timeout only adds avoidable
+        # jitter to 50-Hz RT polling (especially when App-Data batches interleave).
+        self.ser = open_transport(port, baud, timeout=0.001)
         # A software reboot can leave an incomplete pre-reset VESC frame in the
         # USB-UART driver's RX queue. Start each new host session at a packet
         # boundary; otherwise the fresh PacketDecoder can prepend stale bytes to
@@ -696,6 +701,50 @@ class VescDual:
         with self.io_lock:
             self.send(payload)
             return self.recv(expected_cmd, timeout)
+
+    def transact_many(self, payloads: list[bytes], expected_counts: dict[int, int],
+                      timeout: float | None = None) -> list[bytes]:
+        """Send several VESC requests in one UART burst and drain their replies.
+
+        This mirrors VESC Tool's queued PollManager rather than serializing every
+        realtime field as a full request/wait round trip. ``io_lock`` still gives
+        interactive/configuration transactions exclusive ownership of the reply
+        decoder, while ``tx_lock`` keeps ALIVE/setpoint writes frame-atomic.
+        """
+        if not payloads:
+            return []
+        need={int(k):int(v) for k,v in expected_counts.items() if int(v)>0}
+        if not need:
+            raise ValueError('transact_many requires at least one expected reply')
+        end=time.monotonic()+(self.timeout if timeout is None else timeout)
+        out=[]
+        with self.io_lock:
+            wire=b''.join(frame(bytes(q)) for q in payloads)
+            with self.tx_lock:
+                written=self.ser.write(wire)
+                if written!=len(wire):
+                    raise IOError(f'short serial batch write {written}/{len(wire)}')
+                self.ser.flush()
+            while need and time.monotonic()<end:
+                chunk=self.ser.read(512)
+                if not chunk:
+                    continue
+                for packet in self.dec.feed(chunk):
+                    if not packet:
+                        continue
+                    cmd=int(packet[0])
+                    left=need.get(cmd,0)
+                    if left<=0:
+                        continue
+                    out.append(packet)
+                    if left==1:
+                        del need[cmd]
+                    else:
+                        need[cmd]=left-1
+            if need:
+                pending=', '.join(f'COMM {k} x{v}' for k,v in sorted(need.items()))
+                raise TimeoutError(f'batch replies missing: {pending}')
+        return out
 
     @staticmethod
     def fwd(payload: bytes) -> bytes:
@@ -777,12 +826,42 @@ class VescDual:
         if p != bytes((cmd,)):
             raise ValueError("invalid App Config ACK")
 
+    def decoded_app_triplet(self) -> tuple[tuple[float, float], tuple[float, float, float, float], float]:
+        """Poll PPM+ADC+CHUK RT App Data in one VESC-compatible batch."""
+        packets=self.transact_many(
+            [bytes((COMM_GET_DECODED_PPM,)),bytes((COMM_GET_DECODED_ADC,)),bytes((COMM_GET_DECODED_CHUK,))],
+            {COMM_GET_DECODED_PPM:1,COMM_GET_DECODED_ADC:1,COMM_GET_DECODED_CHUK:1},0.08)
+        by={int(q[0]):q for q in packets}
+        pp=by[COMM_GET_DECODED_PPM]; ad=by[COMM_GET_DECODED_ADC]; ch=by[COMM_GET_DECODED_CHUK]
+        if len(pp)!=9 or len(ad)!=17 or len(ch)!=5:
+            raise ValueError(f'bad RT App batch lengths {len(pp)}/{len(ad)}/{len(ch)}')
+        ppm=(struct.unpack_from(">i",pp,1)[0]/1_000_000.0,
+             struct.unpack_from(">i",pp,5)[0]/1_000_000.0)
+        adc=tuple(struct.unpack_from(">i",ad,1+4*i)[0]/1_000_000.0 for i in range(4))
+        chuk=struct.unpack_from(">i",ch,1)[0]/1_000_000.0
+        return ppm,adc,chuk
+
+    def decoded_ppm(self) -> tuple[float, float]:
+        """COMM_GET_DECODED_PPM exactly as VESC Tool RT App Data."""
+        p = self.transact(bytes((COMM_GET_DECODED_PPM,)), COMM_GET_DECODED_PPM, 0.5)
+        if len(p) != 9:
+            raise ValueError(f"unexpected decoded PPM reply length {len(p)}")
+        return (struct.unpack_from(">i", p, 1)[0] / 1_000_000.0,
+                struct.unpack_from(">i", p, 5)[0] / 1_000_000.0)
+
     def decoded_adc(self) -> tuple[float, float, float, float]:
-        """Baca ADC1/ADC2 seperti tab Realtime ADC VESC Tool."""
+        """COMM_GET_DECODED_ADC exactly as VESC Tool RT App Data."""
         p = self.transact(bytes((COMM_GET_DECODED_ADC,)), COMM_GET_DECODED_ADC, 0.5)
         if len(p) != 17:
             raise ValueError(f"unexpected decoded ADC reply length {len(p)}")
         return tuple(struct.unpack_from(">i", p, 1 + 4 * i)[0] / 1_000_000.0 for i in range(4))
+
+    def decoded_chuk(self) -> float:
+        """COMM_GET_DECODED_CHUK exactly as VESC Tool RT App Data."""
+        p = self.transact(bytes((COMM_GET_DECODED_CHUK,)), COMM_GET_DECODED_CHUK, 0.5)
+        if len(p) != 5:
+            raise ValueError(f"unexpected decoded CHUK reply length {len(p)}")
+        return struct.unpack_from(">i", p, 1)[0] / 1_000_000.0
 
     def setup_values(self, right: bool = False) -> SetupValues:
         """Baca COMM_GET_VALUES_SETUP dan parse dengan urutan Commands::getValuesSetup VESC 6.00."""
@@ -840,7 +919,7 @@ class VescDual:
     def measure_r_l(self, right: bool = False) -> dict[str, float]:
         """Non-persistent VESC R/L measurement. Firmware restores MC config after reply."""
         req=bytes((COMM_DETECT_MOTOR_R_L,))
-        p=self.transact(self.fwd(req) if right else req,COMM_DETECT_MOTOR_R_L,12.0)
+        p=self.transact(self.fwd(req) if right else req,COMM_DETECT_MOTOR_R_L,60.0)
         if len(p)!=13: raise RuntimeError(f"measure_r_l unexpected length {len(p)}")
         r_raw,l_raw,ld_raw=struct.unpack_from(">iii",p,1)
         r=r_raw/1_000_000.0; l=l_raw/1_000_000_000.0; ld_lq=ld_raw/1_000_000_000.0
@@ -857,7 +936,7 @@ class VescDual:
         req=bytearray((COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,))
         req+=struct.pack(">iiiii",round(current_a*1e3),round(erpm_per_sec*1e3),round(duty*1e3),
                          round(resistance_ohm*1e6),round(inductance_h*1e8))
-        p=self.transact(self.fwd(bytes(req)) if right else bytes(req),COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,15.0)
+        p=self.transact(self.fwd(bytes(req)) if right else bytes(req),COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,45.0)
         if len(p)!=14: raise RuntimeError(f"measure_flux_openloop unexpected length {len(p)}")
         flux=struct.unpack_from(">i",p,1)[0]/1e7
         if not (0.0001<=flux<=1.0): raise RuntimeError(f"measure_flux_openloop invalid flux={flux}")
@@ -1000,6 +1079,20 @@ class VescDual:
         r = bytes((COMM_SET_HANDBRAKE,)) + struct.pack(">i", round(right_a * 1000))
         with self.io_lock:
             self.send(l); self.send(self.fwd(r))
+
+    def values_pair(self) -> tuple[Values, Values]:
+        """Poll LEFT+RIGHT selective values concurrently in one UART batch."""
+        req=bytes((COMM_GET_VALUES_SELECTIVE,))+struct.pack(">I",VALUE_MASK)
+        packets=self.transact_many([req,self.fwd(req)],{COMM_GET_VALUES_SELECTIVE:2},0.08)
+        found={}
+        for packet in packets:
+            value=parse_selective(packet)
+            if value.vesc_id not in (1,RIGHT_ID):
+                raise ValueError(f'unexpected VESC id {value.vesc_id} in values_pair')
+            found[value.vesc_id]=value
+        if 1 not in found or RIGHT_ID not in found:
+            raise TimeoutError('values_pair missing LEFT or RIGHT reply')
+        return found[1],found[RIGHT_ID]
 
     def values(self, right=False) -> Values:
         req = bytes((COMM_GET_VALUES_SELECTIVE,)) + struct.pack(">I", VALUE_MASK)
