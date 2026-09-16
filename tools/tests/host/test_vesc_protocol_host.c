@@ -888,6 +888,14 @@ int main(void){
         const unsigned hw_before=steering_span_hw_calls;
         const unsigned enc_before=encoder_detect_calls;
         uint8_t de[5]={COMM_DETECT_ENCODER,0,0,0,0}; int32_t ei=1; buffer_append_int32(de,3000,&ei);
+        /* A running RIGHT/velocity motor must hard-interlock LEFT span sweep. */
+        diag_motors[1].m_control_mode=CONTROL_MODE_SPEED;
+        diag_motors[1].m_rpm=100;
+        if(!transact(de,sizeof(de),r,&rn)||rn!=10u||r[0]!=COMM_DETECT_ENCODER)return fail("busy encoder detect reply");
+        if(encoder_detect_calls!=enc_before || steering_span_hw_calls!=hw_before)return fail("encoder detect must be blocked while RIGHT drive active");
+        /* Explicit commissioning is allowed only after RIGHT is released/stopped. */
+        diag_motors[1].m_control_mode=CONTROL_MODE_NONE;
+        diag_motors[1].m_rpm=0;
         if(!transact(de,sizeof(de),r,&rn)||rn!=10u||r[0]!=COMM_DETECT_ENCODER)return fail("standalone encoder detect reply");
         if(encoder_detect_calls!=enc_before+1u)return fail("standalone encoder must run electrical ABI detect first");
         if(steering_span_hw_calls!=hw_before+1u || mock_steering_span!=683)return fail("standalone encoder must measure hardware span after electrical detect");

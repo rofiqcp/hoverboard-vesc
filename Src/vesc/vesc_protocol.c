@@ -3677,6 +3677,22 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
 #ifdef STM32F103xE
         *(volatile uint32_t *)F103_RESET_STAGE_ADDR = 0xC100001Bu;
 #endif
+        /* Full LEFT encoder/span detection is a commissioning-only operation.
+         * Never allow a drive/joystick session to turn a malformed or stale
+         * packet into a mechanical hard-stop sweep. */
+        const mcpwm_foc_motor_t *drive=mcpwm_foc_get_motor_const(true);
+        float drive_erpm=mcpwm_foc_get_erpm_motor(true);
+        if(drive_erpm<0.0f)drive_erpm=-drive_erpm;
+        const bool drive_busy=(drive && drive->m_control_mode!=CONTROL_MODE_NONE) ||
+                              drive_erpm>(float)MCCONF_FAULT_RECOVERY_SAFE_ERPM;
+        if(second || drive_busy){
+            uint8_t reply[10]; int32_t ri=0; reply[ri++]=COMM_DETECT_ENCODER;
+            buffer_append_float32(reply,1001.0f,1e6f,&ri);
+            buffer_append_float32(reply,0.0f,1e6f,&ri);
+            reply[ri++]=0u;
+            uart_send_payload(reply,(uint16_t)ri);
+            break;
+        }
         float off=1001.0f, ratio=0.0f; bool inv=false;
         float current=MCCONF_STEERING_HOME_CURRENT_A;
         if(n>=4u) current=(float)buffer_get_int32(d,&k)/1000.0f;

@@ -41,6 +41,12 @@
 #define MCCONF_L_MIN_DUTY                     0.0f
 #define MCCONF_L_MAX_DUTY                    1.00f
 #define MCCONF_FAULT_STOP_TIME_MS             500u
+/* Automatic fault recovery is deliberately stricter than the fault-stop timer.
+ * A transient fault may clear only after the bridge has remained electrically
+ * quiet and all basic health inputs are valid for this additional dwell. */
+#define MCCONF_FAULT_RECOVERY_SAFE_CURRENT_MA     1000u
+#define MCCONF_FAULT_RECOVERY_SAFE_ERPM             75u
+#define MCCONF_FAULT_RECOVERY_SAFE_DWELL_MS        300u
 #define MCCONF_FOC_DUTY_DOWNRAMP_KP            20.0f
 #define MCCONF_FOC_DUTY_DOWNRAMP_KI           400.0f
 #define MCCONF_DUTY_RAMP_STEP_DEFAULT            0.02f /* VESC m_duty_ramp_step */
