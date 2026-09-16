@@ -175,7 +175,19 @@ int main(void) {
   mcpwm_foc_release_motor(false);
   if(mc_interface_steering_calibration_valid()){
     for(uint32_t t=0u;t<2500u && !mcpwm_foc_dc_cal_done();++t)HAL_Delay(1u);
-    if(mcpwm_foc_dc_cal_done())(void)mc_interface_steering_boot_home();
+    if(mcpwm_foc_dc_cal_done()){
+      /* A cold power-up can catch the steering rack/current estimator in a
+       * transient high-stiction state even though a manual HOME a moment later
+       * succeeds. One bounded retry keeps the fail-closed homing policy while
+       * avoiding a permanently unsynced LEFT after a single transient miss.
+       * Never retry through a motor fault; the align helper already releases
+       * PWM on every failure path. */
+      bool home_ok=mc_interface_steering_boot_home();
+      if(!home_ok && mc_interface_get_fault_motor(false)==FAULT_CODE_NONE){
+        HAL_Delay(250u);
+        (void)mc_interface_steering_boot_home();
+      }
+    }
   }
 
   poweronMelody();
