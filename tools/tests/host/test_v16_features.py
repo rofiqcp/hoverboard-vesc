@@ -170,5 +170,6 @@ assert 'mcpwm_foc_steering_rebase_center()' in mci, 'successful detect must reba
 print('V16_FEATURE_STATIC_PASS names=1 hall_midpoint=1 hall_rate_limit=1 hall_debounce=1 reversal_warmup=1 detect_1deg_6sweep=1 current_off_live=1 rx_fifo16=1 vesc_request_reply=1 hidden_brake_removed=1 std_pos=1 custom_count_cap=1 std_openloop=1')
 
 assert 'MCCONF_STEERING_POS_MIN_DEG' in (R/'Src/motor/mcconf_default.h').read_text()
-assert '0 -> -30, 180 -> 0, 360 -> +30' in vp
+assert 'normalized 0..360 steering-actuator coordinate' in vp
+assert 'ROS/ROS Web owns that calibration' in vp
 assert 'HB_CUSTOM_SET_STEERING_DEG' in vp

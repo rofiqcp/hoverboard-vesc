@@ -23,6 +23,7 @@ typedef struct {
      * configuration or re-arm MOE. */
     volatile uint8_t m_config_update_active;
     volatile uint32_t m_fault_recovery_ticks;
+    volatile uint32_t m_fault_safe_ticks; /* safe-condition dwell before automatic clear */
     uint32_t m_fault_stop_ticks; /* m_fault_stop_time_ms -> tick PWM, dihitung di slow path */
     /* Safety runtime per motor. Semua threshold mahal dihitung saat config
      * berubah; ISR hanya melakukan compare/counter integer. */

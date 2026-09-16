@@ -1328,6 +1328,7 @@ static void motor_fault_set(mcpwm_foc_motor_t *m, mc_fault_code code) {
     /* Timeout telah dikonversi saat config berubah. Fault path ISR sekarang
      * O(1), tanpa software divide 64-bit pada kondisi yang justru kritis. */
     m->m_fault_recovery_ticks=m->m_fault_stop_ticks?m->m_fault_stop_ticks:1u;
+    m->m_fault_safe_ticks=0u;
 }
 
 
@@ -2613,6 +2614,7 @@ void mcpwm_foc_clear_fault(bool second) {
      * condition still exists, the normal safety checks will fault again. */
     mcpwm_foc_release_motor(second);
     m->m_fault_recovery_ticks=0u;
+    m->m_fault_safe_ticks=0u;
     m->m_wrong_voltage_integrator=0u;
     m->m_overspeed_streak=0u;
     m->m_phase_overcurrent_streak=0u;
@@ -2639,6 +2641,7 @@ void mcpwm_foc_report_watchdog_reset_fault(void) {
         mcpwm_foc_motor_t *m = motors[i];
         m->m_fault = FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET;
         m->m_fault_recovery_ticks = m->m_fault_stop_ticks ? m->m_fault_stop_ticks : 1u;
+        m->m_fault_safe_ticks = 0u;
         m->m_state = MC_STATE_OFF;
     }
 }
@@ -2802,6 +2805,51 @@ static bool hall_feedback_valid(const mcpwm_foc_motor_t *m) {
      * adjacent state. This turns the sequence-reject counter into a real
      * fail-safe instead of merely diagnostic bookkeeping. */
     return angle<200u && angle==m->m_hall_pos_prev;
+}
+
+static bool fault_code_auto_recoverable(mc_fault_code code) {
+    /* Configuration/flash corruption is not a transient electrical event and
+     * must never be hidden by an automatic reset. Everything else still has to
+     * pass fault_recovery_conditions_safe() continuously before clearing. */
+    switch(code){
+    case FAULT_CODE_FLASH_CORRUPTION:
+    case FAULT_CODE_FLASH_CORRUPTION_APP_CFG:
+    case FAULT_CODE_FLASH_CORRUPTION_MC_CFG:
+        return false;
+    default:
+        return code!=FAULT_CODE_NONE;
+    }
+}
+
+static bool fault_recovery_conditions_safe(const mcpwm_foc_motor_t *m, bool second) {
+    if(!m || !fault_code_auto_recoverable(m->m_fault))return false;
+
+    /* Hardware bridge is forced OFF by the ISR while m_fault is latched.  Do
+     * not clear until measured D/Q and DC-link current are genuinely quiet. */
+    const int32_t iq_lim=((int32_t)MCCONF_FAULT_RECOVERY_SAFE_CURRENT_MA*
+                          (int32_t)FOC_CURRENT_Q4_PER_A)/1000;
+    const int32_t dc_lim=((int32_t)MCCONF_FAULT_RECOVERY_SAFE_CURRENT_MA*
+                          (int32_t)A2BIT_CONV)/1000;
+    if(ABS((int32_t)m->m_id_q4)>iq_lim || ABS((int32_t)m->m_iq_q4)>iq_lim ||
+       ABS((int32_t)m->m_id_telem_q4)>iq_lim || ABS((int32_t)m->m_iq_telem_q4)>iq_lim ||
+       ABS((int32_t)m->m_current_in_counts)>dc_lim ||
+       ABS((int32_t)m->m_current_in_telem_counts)>dc_lim)return false;
+
+    if(motor_abs_erpm_for_fault(m,second)>MCCONF_FAULT_RECOVERY_SAFE_ERPM)return false;
+    if(batVoltage<(int32_t)m->m_vin_min_adc || batVoltage>(int32_t)m->m_vin_max_adc)return false;
+    if(m->m_temp_fet_end_x10>m->m_temp_fet_start_x10 &&
+       s_board_temperature_x10>=m->m_temp_fet_start_x10)return false;
+    if(!m->m_current_offset_valid)return false;
+
+    /* Sensor faults may clear only when the configured feedback source is back
+     * and coherent.  This also prevents a recovered fault from immediately
+     * re-arming a bridge onto an invalid Hall/ABI state. */
+    if(encoder_feedback_selected(m,second)){
+        if(!m->m_encoder_configured || !m->m_encoder_synced)return false;
+    }else if(!hall_feedback_valid(m)){
+        return false;
+    }
+    return true;
 }
 
 
@@ -4867,9 +4915,33 @@ void mcpwm_foc_housekeeping_non_isr(uint32_t now_ms) {
         mcpwm_foc_motor_t *m=motors[i];
         if(m->m_fault!=FAULT_CODE_NONE){
             uint32_t t=m->m_fault_recovery_ticks;
-            if(t<=pwm_ticks)t=0u; else t-=pwm_ticks;
-            m->m_fault_recovery_ticks=t;
-            if(t==0u){m->m_fault=FAULT_CODE_NONE;m->m_state=MC_STATE_OFF;}
+            if(t>0u){
+                if(t<=pwm_ticks)t=0u; else t-=pwm_ticks;
+                m->m_fault_recovery_ticks=t;
+                m->m_fault_safe_ticks=0u;
+            }else if(fault_recovery_conditions_safe(m,i!=0u)){
+                const uint32_t dwell=((uint32_t)MCCONF_FAULT_RECOVERY_SAFE_DWELL_MS*(uint32_t)PWM_FREQ+999u)/1000u;
+                uint32_t q=m->m_fault_safe_ticks+pwm_ticks;
+                if(q<m->m_fault_safe_ticks || q>dwell)q=dwell;
+                m->m_fault_safe_ticks=q;
+                if(q>=dwell){
+                    /* Keep bridge OFF while clearing all command/integrator
+                     * state. A fresh post-recovery host command is required to
+                     * arm again; clearing a latch itself never produces torque. */
+                    mcpwm_foc_release_motor(i!=0u);
+                    m->m_wrong_voltage_integrator=0u;
+                    m->m_overspeed_streak=0u;
+                    m->m_phase_overcurrent_streak=0u;
+                    FOC_MEMORY_BARRIER();
+                    m->m_fault=FAULT_CODE_NONE;
+                    m->m_fault_safe_ticks=0u;
+                    m->m_state=MC_STATE_OFF;
+                }
+            }else{
+                m->m_fault_safe_ticks=0u;
+            }
+        }else{
+            m->m_fault_safe_ticks=0u;
         }
         if(s_vesc_owned[i] && s_vesc_timeout_expired[i]){
             /* Deadline itself is enforced by the 16-kHz ADC ISR so a stuck main
