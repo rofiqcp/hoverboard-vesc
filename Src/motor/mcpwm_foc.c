@@ -1966,7 +1966,7 @@ static void set_control_mode(mcpwm_foc_motor_t *m, mc_control_mode mode) {
     if (s_estop_ticks != 0u && mode != CONTROL_MODE_NONE) return;
     if (m->m_control_mode != mode) {
         reset_current_pi(m);
-        m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; m->m_speed_d_filter_q4=0; m->m_speed_zero_hold_quiet=0u; reset_position_pid(m);
+        m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; m->m_speed_d_filter_q4=0; m->m_speed_zero_hold_quiet=0u; m->m_speed_zero_hold_dir=0; reset_position_pid(m);
         m->m_duty_i_q15=0; m->m_duty_pi_active=0u;
         m->m_brake_vq_prev=0; m->m_brake_speed_dir_prev=0; m->m_brake_zero_duty_samples=0u;
         /* Never seed a new torque reference from measured Iq. With low-side
@@ -2718,7 +2718,7 @@ void mcpwm_foc_release_motor(bool second) {
     m->m_id_set_q4=0; m->m_openloop_id_target_q4=0;
     m->m_openloop_id_ramp_q16=0;
     m->m_speed_target_rpm=0; m->m_speed_target_rpm_q16=0; m->m_speed_set_rpm=0; m->m_speed_set_ramp_q16=0;
-    m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; m->m_speed_zero_hold_quiet=0u; reset_position_pid(m);
+    m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; m->m_speed_zero_hold_quiet=0u; m->m_speed_zero_hold_dir=0; reset_position_pid(m);
     m->m_state=MC_STATE_OFF;
 }
 
@@ -4010,10 +4010,63 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
     int32_t iq_cmd_q4=position_q15_to_iq_q4(out_q15,pos_lim_q4);
 
     if(encoder_count_mode){
-        /* Encoder/steering position is PID-only. No anti-stiction or minimum
-         * current pulse may modify the PID torque request. */
-        m->m_position_breakaway_ticks=0u;
-        m->m_position_no_motion_ticks=0u;
+        if(steering_count_mode){
+            /* Floor-loaded steering needs a finite static-friction breakaway
+             * torque, but keeping that torque near the target causes hunting.
+             * Apply a short current-limited kick only while the calibrated ABI
+             * encoder has not started moving. Once motion is seen, immediately
+             * return authority to the low-gain PID. If it stalls again more than
+             * 1 deg away, one new kick may re-arm after a 150-ms quiet dwell. */
+            const uint32_t ae=(uint32_t)(error_mdeg<0?-(int64_t)error_mdeg:error_mdeg);
+            const int32_t md=m->m_position_counts-m->m_position_last_motion_count;
+            const uint32_t am=(uint32_t)(md<0?-(int64_t)md:md);
+            const uint32_t step_ms=dt_ms?dt_ms:1u;
+
+            if(ae<=MCCONF_STEERING_BREAKAWAY_SETTLE_MDEG){
+                m->m_position_breakaway_ticks=0u;
+                m->m_position_no_motion_ticks=0u;
+                m->m_position_motion_seen=1u;
+                m->m_position_last_motion_count=m->m_position_counts;
+            }else{
+                if(am>=MCCONF_STEERING_BREAKAWAY_MOTION_COUNTS){
+                    m->m_position_last_motion_count=m->m_position_counts;
+                    m->m_position_no_motion_ticks=0u;
+                    if(m->m_position_breakaway_ticks>=MCCONF_STEERING_BREAKAWAY_MIN_MS)
+                        m->m_position_motion_seen=1u;
+                }else if(m->m_position_motion_seen){
+                    uint32_t n=(uint32_t)m->m_position_no_motion_ticks+step_ms;
+                    m->m_position_no_motion_ticks=(uint16_t)(n>65535u?65535u:n);
+                }
+
+                if(!m->m_position_motion_seen && ae>=MCCONF_STEERING_BREAKAWAY_ENTER_MDEG){
+                    uint32_t n=(uint32_t)m->m_position_breakaway_ticks+step_ms;
+                    m->m_position_breakaway_ticks=(uint16_t)(n>65535u?65535u:n);
+                    int32_t kick_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
+                        (int32_t)MCCONF_STEERING_BREAKAWAY_CURRENT_MA)/1000;
+                    /* Breakaway intentionally may use the full configured 12-A motor
+                     * limit; only the steady position PID is restricted by pos_lim_q4. */
+                    if(kick_q4>limit_q4)kick_q4=limit_q4;
+                    if(iq_cmd_q4<0){if(iq_cmd_q4>-kick_q4)iq_cmd_q4=-kick_q4;}
+                    else if(iq_cmd_q4>0){if(iq_cmd_q4<kick_q4)iq_cmd_q4=kick_q4;}
+                    else iq_cmd_q4=error_mdeg<0?-kick_q4:kick_q4;
+                    if(m->m_position_breakaway_ticks>=MCCONF_STEERING_BREAKAWAY_MAX_MS)
+                        m->m_position_motion_seen=1u;
+                }
+
+                if(m->m_position_motion_seen &&
+                   m->m_position_no_motion_ticks>=MCCONF_STEERING_BREAKAWAY_REARM_MS &&
+                   ae>=MCCONF_STEERING_BREAKAWAY_REARM_MDEG){
+                    m->m_position_motion_seen=0u;
+                    m->m_position_breakaway_ticks=0u;
+                    m->m_position_no_motion_ticks=0u;
+                    m->m_position_last_motion_count=m->m_position_counts;
+                }
+            }
+        }else{
+            m->m_position_breakaway_ticks=0u;
+            m->m_position_no_motion_ticks=0u;
+            m->m_position_motion_seen=0u;
+        }
         if(steering_count_mode && m->m_conf.m_invert_direction)
             iq_cmd_q4=-iq_cmd_q4;
         return (int16_t)iq_cmd_q4;
@@ -4054,13 +4107,40 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
 
     /* Hall feedback becomes coarse close to standstill. Without hysteresis a
      * zero-speed PI can alternate Iq sign on adjacent Hall estimates and buzz.
-     * Keep active braking, but enter a torque-quiet zone below ENTER and only
-     * re-arm braking after the wider EXIT threshold is crossed. */
+     * Remember the direction from which zero-hold started; if Hall reports the
+     * opposite direction, the rotor has crossed zero and braking must go quiet
+     * immediately instead of accelerating the reverse motion. A wider EXIT
+     * threshold then distinguishes a real external roll from one quantized edge. */
     if (zero_speed_hold) {
         const int64_t measured_abs_q16 = measured64 < 0 ? -measured64 : measured64;
         const int64_t enter_q16 = (int64_t)MCCONF_ZERO_HOLD_QUIET_ENTER_ERPM << 16;
         const int64_t exit_q16  = (int64_t)MCCONF_ZERO_HOLD_QUIET_EXIT_ERPM << 16;
-        if (m->m_speed_zero_hold_quiet) {
+        const int8_t measured_dir = measured64 > enter_q16 ? 1 :
+                                    (measured64 < -enter_q16 ? -1 : 0);
+        if (!encoder_feedback_selected(m,second) && m->m_speed_zero_hold_quiet==0u) {
+            if (m->m_speed_zero_hold_dir == 0 && measured_dir != 0) {
+                m->m_speed_zero_hold_dir = measured_dir;
+            } else if (measured_dir != 0 && m->m_speed_zero_hold_dir != 0 &&
+                       measured_dir != m->m_speed_zero_hold_dir) {
+                /* A Hall zero crossing is the stop point, not a request to drive
+                 * back toward zero. Latch torque off until the next nonzero speed
+                 * command. This removes the repeated +/- one-sector stop bounce. */
+                m->m_speed_zero_hold_quiet=2u;
+                m->m_speed_integrator=0;
+                m->m_speed_sat_hold=0u;
+                m->m_speed_d_filter_q4=0;
+                m->m_speed_prev_error=error_q16;
+                return 0;
+            }
+        }
+        if (m->m_speed_zero_hold_quiet==2u) {
+            m->m_speed_integrator=0;
+            m->m_speed_sat_hold=0u;
+            m->m_speed_d_filter_q4=0;
+            m->m_speed_prev_error=error_q16;
+            return 0;
+        }
+        if (m->m_speed_zero_hold_quiet==1u) {
             if (measured_abs_q16 < exit_q16) {
                 m->m_speed_integrator=0;
                 m->m_speed_sat_hold=0u;
@@ -4069,6 +4149,7 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
                 return 0;
             }
             m->m_speed_zero_hold_quiet=0u;
+            m->m_speed_zero_hold_dir=measured_dir;
         } else if (measured_abs_q16 <= enter_q16) {
             m->m_speed_zero_hold_quiet=1u;
             m->m_speed_integrator=0;
@@ -4079,6 +4160,7 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
         }
     } else {
         m->m_speed_zero_hold_quiet=0u;
+        m->m_speed_zero_hold_dir=0;
     }
 
     if (target_abs_q16 < min_erpm_q16 && !zero_speed_hold) {
@@ -4632,7 +4714,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     if (inactive) {
         m->m_state=MC_STATE_OFF;
         reset_current_pi(m); m->m_speed_integrator=0; m->m_speed_prev_error=0;
-        m->m_speed_sat_hold=0; m->m_speed_zero_hold_quiet=0u; reset_position_pid(m);
+        m->m_speed_sat_hold=0; m->m_speed_zero_hold_quiet=0u; m->m_speed_zero_hold_dir=0; reset_position_pid(m);
         m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
         m->m_id_set_q4=0; m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0;
         /* Keep the just-measured OFF-state alpha/beta, Id/Iq and DC-link
@@ -4740,6 +4822,24 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                  * vector. D-axis correction must therefore consume the same
                  * duty budget instead of retaining the full closed-loop rail. */
                 v.d=(int16_t)CLAMP((int32_t)v.d,-(int32_t)vector_limit,(int32_t)vector_limit);
+                q_lim=voltage_circle_q_limit(v.d,vector_limit);
+            }
+            /* Floor-loaded LEFT steering needs about 0.20 duty to break static
+             * tyre/linkage friction. Make that value the complete calibrated
+             * steering-position modulation ceiling, not only a kick ceiling:
+             * far from target the breakaway current can immediately reach 0.20,
+             * while close to target the low-gain position loop naturally asks
+             * for less. This also makes post-kick spikes structurally impossible. */
+            const bool steering_position_limited =
+                m->m_control_mode==CONTROL_MODE_POS && !second &&
+                m->m_pos_pid_phase_mode==0u && m->m_steering_calibrated;
+            if(steering_position_limited){
+                int32_t break_v=((int32_t)MCCONF_STEERING_BREAKAWAY_DUTY_PERMILLE*
+                                 (int32_t)MCCONF_FOC_DUTY_VOLTAGE_MAX)/1000;
+                if(break_v<1)break_v=1;
+                if(break_v>v_closed)break_v=v_closed;
+                vector_limit=(int16_t)break_v;
+                v.d=(int16_t)CLAMP((int32_t)v.d,-break_v,break_v);
                 q_lim=voltage_circle_q_limit(v.d,vector_limit);
             }
             if (m->m_control_mode==CONTROL_MODE_SPEED) {

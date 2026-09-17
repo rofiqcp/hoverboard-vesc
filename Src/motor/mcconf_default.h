@@ -76,6 +76,19 @@
 #define MCCONF_STEERING_RUNTIME_SPAN_NUM             8u
 #define MCCONF_STEERING_RUNTIME_SPAN_DEN             9u
 #define MCCONF_STEERING_POSITION_CURRENT_MAX_MA  10000u
+/* Calibrated LEFT steering static-friction assist. Hardware floor test on
+ * 2026-09-17 showed that ~10 A Iq target produces the ~0.20 duty needed to
+ * break tyre/linkage stiction on the floor. This is a short position-only kick;
+ * the normal motor hard limit remains independently configured (12 A deployed). */
+#define MCCONF_STEERING_BREAKAWAY_CURRENT_MA     12000u
+#define MCCONF_STEERING_BREAKAWAY_DUTY_PERMILLE   200u
+#define MCCONF_STEERING_BREAKAWAY_ENTER_MDEG       800u
+#define MCCONF_STEERING_BREAKAWAY_REARM_MDEG      1000u
+#define MCCONF_STEERING_BREAKAWAY_SETTLE_MDEG      350u
+#define MCCONF_STEERING_BREAKAWAY_MIN_MS            10u
+#define MCCONF_STEERING_BREAKAWAY_MAX_MS            18u
+#define MCCONF_STEERING_BREAKAWAY_REARM_MS         150u
+#define MCCONF_STEERING_BREAKAWAY_MOTION_COUNTS      4u
 #define MCCONF_STEERING_MOTION_PROGRESS_COUNTS       32u /* commissioning motion threshold; not a torque assist */
 #define MCCONF_STEERING_CENTER_CURRENT_A           2.00f /* commissioning return-to-midpoint */
 #define MCCONF_STEERING_CENTER_TOL_COUNTS           24u /* ~0.32 deg on measured ~4500-count span */
@@ -137,11 +150,12 @@
  * hardware steps as the best response/stability compromise; still configurable. */
 #define MCCONF_SPEED_RAMP_ERPMS_S            20000u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
-/* Zero-speed active-brake quiet zone. Entering below 60 eRPM suppresses PID
- * hunting/current chatter; braking re-arms only after measured speed exceeds
- * 120 eRPM. At the vehicle calibration this is ~0.014 / 0.027 m/s. */
-#define MCCONF_ZERO_HOLD_QUIET_ENTER_ERPM       60u
-#define MCCONF_ZERO_HOLD_QUIET_EXIT_ERPM       120u
+/* Zero-speed active-brake quiet zone. Hall feedback is quantized near standstill:
+ * one reverse edge after crossing zero can still report ~150 eRPM. Enter quiet
+ * below 100 eRPM and only re-arm above 250 eRPM so a stop cannot chatter between
+ * adjacent Hall sectors, while a genuine external roll still re-enables braking. */
+#define MCCONF_ZERO_HOLD_QUIET_ENTER_ERPM      100u
+#define MCCONF_ZERO_HOLD_QUIET_EXIT_ERPM       250u
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               30.0f /* absolute hard phase-current ceiling; VESC Tool motor limit <=30A */
