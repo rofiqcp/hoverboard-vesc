@@ -459,6 +459,9 @@ const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool is_second_motor);
 
 void mcpwm_foc_set_configuration(const mc_configuration *conf, bool is_second_motor);
 const volatile mc_configuration *mcpwm_foc_get_configuration(bool is_second_motor);
+/* Hot speed-PID source selector. All estimators run in parallel, so changing
+ * PLL/FAST/FASTER does not require bridge release or regulator reset. */
+bool mcpwm_foc_set_speed_pid_source(S_PID_SPEED_SRC source, bool is_second_motor);
 
 void mcpwm_foc_set_duty(float duty, bool is_second_motor);
 void mcpwm_foc_set_pid_speed(float rpm, bool is_second_motor);
@@ -515,6 +518,8 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor);
 float mcpwm_foc_get_tot_current_in_motor(bool is_second_motor);
 float mcpwm_foc_get_erpm_motor(bool is_second_motor);  /* VESC electrical RPM */
+float mcpwm_foc_get_erpm_fast_motor(bool is_second_motor);
+float mcpwm_foc_get_erpm_faster_motor(bool is_second_motor);
 float mcpwm_foc_get_motor_mechanical_rpm(bool is_second_motor);
 float mcpwm_foc_get_output_rpm(bool is_second_motor); /* after si_gear_ratio */
 uint16_t mcpwm_foc_get_pole_pairs(bool is_second_motor);

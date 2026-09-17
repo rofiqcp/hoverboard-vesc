@@ -301,7 +301,7 @@ int main(void){
     if(fabsf(m_motor_1.m_conf.foc_pll_kp-MCCONF_FOC_PLL_KP_DEFAULT)>0.001f ||
        fabsf(m_motor_2.m_conf.foc_pll_ki-MCCONF_FOC_PLL_KI_DEFAULT)>0.001f ||
        m_motor_1.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_DISABLED ||
-       m_motor_1.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FAST ||
+       m_motor_1.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_PLL ||
        fabsf(m_motor_1.m_conf.foc_dt_us-MCCONF_FOC_DT_US_DEFAULT)>0.000001f ||
        fabsf(m_motor_2.m_conf.foc_dt_us-MCCONF_FOC_DT_US_DEFAULT)>0.000001f)
         return fail("V35 PLL/decoupling/deadtime migration defaults");
