@@ -378,6 +378,7 @@ typedef struct {
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;
+    uint8_t m_speed_zero_hold_quiet; /* hysteretic quiet-zone latch for target 0 eRPM */
     /* Brake current is stored as a magnitude. CONTROL_MODE_CURRENT_BRAKE
      * recomputes its sign from fresh Hall speed every control update, matching
      * VESC's -SIGN(speed)*abs(current) semantics without reverse run-away. */

@@ -29,8 +29,8 @@
 #define MCCONF_L_BATTERY_REGEN_CUT_END         49.5f
 #define MCCONF_L_MIN_VIN                      30.0f
 #define MCCONF_L_MAX_VIN                      50.0f
-#define MCCONF_L_TEMP_FET_START                60.0f
-#define MCCONF_L_TEMP_FET_END                  65.0f
+#define MCCONF_L_TEMP_FET_START                70.0f
+#define MCCONF_L_TEMP_FET_END                  80.0f
 #define MCCONF_L_TEMP_MOTOR_START              80.0f
 #define MCCONF_L_TEMP_MOTOR_END               100.0f
 #define MCCONF_L_WATT_MAX                1500000.0f
@@ -75,7 +75,7 @@
  * VESC Tool / ROS / Web commands and feedback. 320/360 = 8/9 runtime span. */
 #define MCCONF_STEERING_RUNTIME_SPAN_NUM             8u
 #define MCCONF_STEERING_RUNTIME_SPAN_DEN             9u
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   8000u
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA  10000u
 #define MCCONF_STEERING_MOTION_PROGRESS_COUNTS       32u /* commissioning motion threshold; not a torque assist */
 #define MCCONF_STEERING_CENTER_CURRENT_A           2.00f /* commissioning return-to-midpoint */
 #define MCCONF_STEERING_CENTER_TOL_COUNTS           24u /* ~0.32 deg on measured ~4500-count span */
@@ -137,6 +137,11 @@
  * hardware steps as the best response/stability compromise; still configurable. */
 #define MCCONF_SPEED_RAMP_ERPMS_S            20000u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
+/* Zero-speed active-brake quiet zone. Entering below 60 eRPM suppresses PID
+ * hunting/current chatter; braking re-arms only after measured speed exceeds
+ * 120 eRPM. At the vehicle calibration this is ~0.014 / 0.027 m/s. */
+#define MCCONF_ZERO_HOLD_QUIET_ENTER_ERPM       60u
+#define MCCONF_ZERO_HOLD_QUIET_EXIT_ERPM       120u
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               30.0f /* absolute hard phase-current ceiling; VESC Tool motor limit <=30A */
