@@ -15,7 +15,7 @@ halltest=(R/'tools/tests/host/test_hall_detect_algorithm.c').read_text()
 # 50 ERPM must survive Hall timeout and retain fractional mechanical target.
 assert re.search(r'#define\s+MCCONF_HALL_TIMEOUT_TICKS\s+8000u',mcc)
 assert 'm_speed_target_rpm_q16' in mch and 'erpm_to_mech_rpm_q16' in mc
-assert 'speed_pid_mech_rpm_q16' in mc and 'measured_mech_rpm_public_q16' in mc
+assert 'measured_mech_rpm_q16' in mc
 motor_step_start=mc.index('static void motor_control_step')
 motor_step=mc[motor_step_start:mc.index('static int16_t duty_permille_from_vdq',motor_step_start)]
 # VESC-style outer PID scheduler: fresh feedback at 1 kHz, current ISR only
@@ -26,7 +26,7 @@ assert 'm->m_iq_target_q4=speed_pid_iq_target_step' in outer
 assert 'm->m_iq_target_q4=position_pid_iq_target_step' in outer
 assert 'speed_pid_iq_target_step' not in motor_step and 'position_pid_iq_target_step' not in motor_step
 assert 'motor_outer_loop_virtual_steps' not in mc
-assert re.search(r'speed_pid_mech_rpm_q16\(m,\s*second\)\s*\*\s*pp',mc)
+assert re.search(r'measured_mech_rpm_q16\(m,\s*second\)\s*\*\s*pp',mc)
 assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
 
 # VESC OPENLOOP_PHASE is fixed phase/direct Id. Hall/encoder detect performs

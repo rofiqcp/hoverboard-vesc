@@ -27,7 +27,7 @@ assert 'position_pid_iq_target_step' in mc, 'position PID must feed Iq target'
 assert 'm_current_kpq_v_q16' in mc and 'm_current_kiq_dt_v_q16' in mc and 'm_current_kpd_v_q16' in mc and 'm_current_kid_dt_v_q16' in mc
 assert 'm->m_kps_q11' in mc and 'm->m_kis_q16' in mc and 'm->m_kds_q11' in mc and 'speed_pid_iq_target_step' in mc
 assert 'm->m_kpp_q11' in mc and 'm->m_kip_q16' in mc and 'm->m_kdp_q11' in mc
-assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA  10000u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling regression must match the active 10.0 A steering runtime limit; global hard current remains 15 A'
+assert 'MCCONF_STEERING_POSITION_CURRENT_MAX_MA   8000u' in (R/'Src/motor/mcconf_default.h').read_text(), 'steering current ceiling regression must match the active 8.0 A runtime safety limit'
 assert 'MCCONF_STEERING_POSITION_KP_MULTIPLIER' not in (R/'Src/motor/mcconf_default.h').read_text(), 'hidden steering Kp multiplier must stay removed'
 assert 'const int32_t dc_foc=m->m_conf.foc_encoder_inverted?-dc:dc;' in mc, 'ABI RPM estimator must apply encoder inversion exactly once'
 assert 'encoder_count_mode && m->m_conf.foc_encoder_inverted' not in mc, 'process-D must not double-apply encoder inversion after RPM correction'

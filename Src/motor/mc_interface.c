@@ -1446,7 +1446,7 @@ bool mc_interface_load_configuration_motor(bool second) {
         m->m_conf.foc_pll_kp=MCCONF_FOC_PLL_KP_DEFAULT;
         m->m_conf.foc_pll_ki=MCCONF_FOC_PLL_KI_DEFAULT;
         m->m_conf.foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
-        m->m_conf.s_pid_speed_source=S_PID_SPEED_SRC_PLL;
+        m->m_conf.s_pid_speed_source=S_PID_SPEED_SRC_FAST;
         m->m_conf.foc_dt_us=MCCONF_FOC_DT_US_DEFAULT;
     }
     m->m_conf.s_pid_ramp_erpms_s = (float)((uint32_t)m->m_speed_ramp_rpm_s * pp);

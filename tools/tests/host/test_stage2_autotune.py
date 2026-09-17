@@ -6,7 +6,7 @@ assert 'MCPWM_FOC_RELAY_SPEED = 1u' in mh and 'MCPWM_FOC_RELAY_POSITION = 2u' in
 outer=mc[mc.index('void mcpwm_foc_outer_control_non_isr'):mc.index('void mcpwm_foc_housekeeping_non_isr')]
 assert 'relay_process(now_ms);' in outer and outer.index('relay_process(now_ms);') < outer.index('mcpwm_foc_motor_t *motors[2]')
 relay=mc[mc.index('static int32_t relay_speed_erpm_now'):mc.index('void mcpwm_foc_outer_control_non_isr')]
-assert 'measured_mech_rpm_public_q16' in relay
+assert 'measured_mech_rpm_q16' in relay
 assert 'relay_steering_mdeg_now' in relay and 'relay_steering_iq_sign' in relay
 assert 'relay_hall_position_active' in relay and 'relay_hall_position_mdeg_now' in relay and 'relay_angle_delta_mdeg' in relay
 assert 'if(relay_hall_position_active(m))' in relay and 'target=relay_hall_position_mdeg_now(m,second);' in relay

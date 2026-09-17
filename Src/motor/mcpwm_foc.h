@@ -17,11 +17,8 @@ typedef struct {
     mc_configuration m_conf;
     volatile mc_state m_state;
     volatile mc_control_mode m_control_mode;
-    /* Normal user STOP / zero-command sensing standby. Unlike a safety release,
-     * FOC remains powered with Id*=Iq*=0 so phase-current sensing stays valid
-     * during rotor coast. The current PI can generate Vd/Vq to cancel BEMF; once
-     * stationary its zero-current equilibrium returns close to centered PWM. */
-    volatile uint8_t m_standby_sense;
+    /* Normal STOP/zero-current state: bridge remains driven at exact centered
+     * zero vector, but current PI is bypassed so ADC noise is never chased. */
     volatile mc_fault_code m_fault;
     /* Main-context MC config publication can span many float/cache calculations.
      * While this flag is set the ADC ISR must never read the partially published
@@ -40,20 +37,6 @@ typedef struct {
     volatile int16_t m_iq_set_q4;       /* slewed/active Iq reference */
     volatile int16_t m_iq_target_q4;    /* requested Iq reference */
     volatile int16_t m_id_set_q4;
-    /* VESC field-weakening state. m_i_fw_set_q4 is a positive magnitude;
-     * the closed-loop D-axis target is -m_i_fw_set_q4. Coefficients are
-     * precomputed outside the ISR from standard foc_fw_* MC configuration. */
-    volatile int16_t m_i_fw_set_q4;
-    /* VESC m_current_off_delay equivalent in milliseconds. FW refreshes this
-     * to 1000 ms while active; normal outer-loop ticks count it down. It keeps
-     * zero-current modulation alive after leaving FW so BEMF/body-diode
-     * transients cannot abruptly collapse the switching state. */
-    volatile uint16_t m_current_off_delay_ms;
-    int16_t m_fw_current_max_q4;
-    uint16_t m_fw_duty_start_permille;
-    uint16_t m_fw_q_current_factor_q15;
-    uint32_t m_fw_backoff_q15;
-    uint32_t m_fw_ramp_time_ms;
     volatile int16_t m_speed_set_rpm;       /* active/slewed mechanical RPM */
     volatile int16_t m_speed_target_rpm;    /* requested mechanical RPM, integer view */
     volatile int32_t m_speed_target_rpm_q16; /* authoritative requested mechanical RPM Q16 */
@@ -147,8 +130,7 @@ typedef struct {
     volatile int16_t m_temp_fet_accel_end_x10;    /* batas suhu akselerasi akhir */
     uint16_t m_in_current_map_start_q15;           /* l_in_current_map_start */
     uint16_t m_in_current_map_filter_q16;          /* alpha LPF measured Iin */
-    int32_t m_in_current_map_lpf_q20;              /* measured Iin Q4 disimpan Q20 */
-    volatile int16_t m_input_map_current_limit_q4; /* measured-Iin mapped positive motor-current ceiling */
+    int32_t m_in_current_map_lpf_q20;              /* Iin Q4 disimpan Q20 */
 
     /* Current state, same Q4 current-count unit as the legacy generated FOC. */
     volatile int16_t m_i_alpha_q4;
@@ -236,13 +218,6 @@ typedef struct {
     int32_t m_pll_speed_step_q32;
     volatile int32_t m_pll_erpm_q16;
     volatile int32_t m_pll_mech_rpm_q16;
-    /* VESC speed-PID low-latency estimators. Both are derived from corrected
-     * electrical phase delta at the real current-control cadence. FAST uses
-     * alpha=0.01; FASTER uses alpha=0.20, matching upstream foc_math. */
-    volatile int32_t m_speed_fast_erpm_q16;
-    volatile int32_t m_speed_faster_erpm_q16;
-    uint16_t m_speed_est_phase_prev;
-    volatile uint8_t m_speed_est_valid;
     uint32_t m_pll_kp_dt_q16;
     uint32_t m_pll_ki_dt2_q16;
     int32_t m_pll_speed_limit_step_q32;
@@ -372,23 +347,12 @@ typedef struct {
     uint8_t m_position_sat_hold;
     int8_t m_position_drive_direction;
     uint16_t m_position_settle_ticks;
-    /* Calibrated LEFT steering cascade state. Units are mechanical mdeg/s and
-     * Iq-q4 Q16 so the 1-kHz outer loop remains integer-only. */
-    int32_t m_steering_velocity_mdeg_s;
-    int32_t m_steering_velocity_cmd_mdeg_s;
-    int32_t m_steering_velocity_i_q16;
-    uint32_t m_steering_progress_error_mdeg;
-    uint16_t m_steering_velocity_dt_ms;
-    uint8_t m_steering_control_state; /* 0 breakaway, 1 track, 2 approach, 3 hold */
-    uint8_t m_steering_hold_latched;
     int32_t m_speed_set_ramp_q16;
     uint16_t m_speed_ramp_rpm_s;
     uint32_t m_speed_release_erpm_q16; /* exact VESC s_pid_min_erpm runtime threshold */
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;
-    uint8_t m_speed_zero_hold_quiet; /* 0=brake, 1=quiet hysteresis, 2=zero-cross latched */
-    int8_t m_speed_zero_hold_dir;   /* initial braking direction; catches Hall zero crossing */
     /* Brake current is stored as a magnitude. CONTROL_MODE_CURRENT_BRAKE
      * recomputes its sign from fresh Hall speed every control update, matching
      * VESC's -SIGN(speed)*abs(current) semantics without reverse run-away. */
@@ -470,9 +434,6 @@ const mcpwm_foc_motor_t *mcpwm_foc_get_motor_const(bool is_second_motor);
 
 void mcpwm_foc_set_configuration(const mc_configuration *conf, bool is_second_motor);
 const volatile mc_configuration *mcpwm_foc_get_configuration(bool is_second_motor);
-/* Hot speed-PID source selector. All estimators run in parallel, so changing
- * PLL/FAST/FASTER does not require bridge release or regulator reset. */
-bool mcpwm_foc_set_speed_pid_source(S_PID_SPEED_SRC source, bool is_second_motor);
 
 void mcpwm_foc_set_duty(float duty, bool is_second_motor);
 void mcpwm_foc_set_pid_speed(float rpm, bool is_second_motor);
@@ -492,9 +453,6 @@ void mcpwm_foc_set_brake_current(float current, bool is_second_motor);
 void mcpwm_foc_set_handbrake(float current, bool is_second_motor);
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool is_second_motor);
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool is_second_motor);
-/* User STOP/zero command: keep zero-vector PWM and current sensing alive while
- * the VESC command link is healthy. Fault/E-stop/watchdog still use hard release. */
-void mcpwm_foc_enter_standby(bool is_second_motor);
 bool mcpwm_foc_encoder_startup_align(bool is_second_motor);
 bool mcpwm_foc_encoder_is_synced(bool is_second_motor);
 bool mcpwm_foc_encoder_detect(float current, bool is_second_motor, float *offset, float *ratio, bool *inverted);
@@ -529,8 +487,6 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
 float mcpwm_foc_get_tot_current_motor(bool is_second_motor);
 float mcpwm_foc_get_tot_current_in_motor(bool is_second_motor);
 float mcpwm_foc_get_erpm_motor(bool is_second_motor);  /* VESC electrical RPM */
-float mcpwm_foc_get_erpm_fast_motor(bool is_second_motor);
-float mcpwm_foc_get_erpm_faster_motor(bool is_second_motor);
 float mcpwm_foc_get_motor_mechanical_rpm(bool is_second_motor);
 float mcpwm_foc_get_output_rpm(bool is_second_motor); /* after si_gear_ratio */
 uint16_t mcpwm_foc_get_pole_pairs(bool is_second_motor);

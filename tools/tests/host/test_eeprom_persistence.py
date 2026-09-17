@@ -6,9 +6,7 @@ ccs=[c for c in ('gcc','clang') if shutil.which(c)]
 for cc in ccs:
     with tempfile.TemporaryDirectory(prefix='eeprom-v14-') as td:
         exe=Path(td)/'t'
-        fw=Path.home()/'.platformio/packages/framework-stm32cubef1'
-        inc=[fw/'Drivers/STM32F1xx_HAL_Driver/Inc',fw/'Drivers/CMSIS/Device/ST/STM32F1xx/Include',fw/'Drivers/CMSIS/Include']
-        cmd=[cc,'-std=c11','-O2','-Wall','-Wextra','-Werror',f'-I{R}',f'-I{R/"Src"}',f'-I{R/"tools/support/host_stubs"}',*[f'-I{x}' for x in inc],
+        cmd=[cc,'-std=c11','-O2','-Wall','-Wextra','-Werror',f'-I{R}',f'-I{R/"Src"}',f'-I{R/"tools/support/host_stubs"}',
              str(R/'tools/tests/host/test_eeprom_persistence.c'),str(R/'Src/motor/mcpwm_foc.c'),str(R/'Src/motor/foc_math.c'),str(R/'Src/encoder/encoder.c'),str(R/'Src/encoder/enc_abi.c'),str(R/'Src/encoder/encoder_cfg.c'),str(R/'Src/motor/mc_interface.c'),'-lm','-o',str(exe)]
         x=subprocess.run(cmd,text=True,capture_output=True)
         if x.returncode:

@@ -138,16 +138,7 @@ class LiveWorker:
 
     @contextmanager
     def suspended(self, stop_motion: bool = False):
-        if stop_motion:
-            # Commissioning/detect must see both endpoints fully released.
-            # COMM_SET_CURRENT(0) leaves CONTROL_MODE_CURRENT active and makes
-            # the firmware's cross-motor safety interlock correctly reject detect.
-            with self.lock:
-                self.active[False] = None
-                self.active[True] = None
-            self.link.shutdown_safe(False)
-            self.link.shutdown_safe(True)
-            time.sleep(0.05)
+        if stop_motion: self.stop("both")
         self.pause_evt.set(); time.sleep(0.03)
         try: yield
         finally: self.pause_evt.clear()
@@ -278,17 +269,8 @@ class LiveWorker:
             self.stop_evt.wait(0.002)
 
     def close(self) -> None:
-        # Closing the host tool must not leave either endpoint in CURRENT=0 mode.
-        # Release both bridges explicitly so a following commissioning command
-        # sees CONTROL_MODE_NONE and cannot be blocked by our own previous CLI.
-        with self.lock:
-            self.active[False] = None
-            self.active[True] = None
-        try:
-            self.link.shutdown_safe(False)
-            self.link.shutdown_safe(True)
-        except Exception:
-            pass
+        try: self.stop("both")
+        except Exception: pass
         self.stop_evt.set(); self.thread.join(timeout=1.0)
 
 

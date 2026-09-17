@@ -3234,7 +3234,7 @@ static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)
 
 static void terminal_help(void){
     terminal_send_text("Commands:\nREAD help fw status values model encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all|hard] | release [all]\n");
-    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST|2FASTER | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V | fw_current A | fw_duty 0..1 | fw_ramp S | fw_q 0..1 | fw_backoff 0..10. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
+    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
     terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
 
@@ -3285,15 +3285,8 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
     }
     if(!strncmp(k,"speed_k",7)){if(v<0||v>65535.0f/MCCONF_SPEED_GAIN_SCALE||k[8])return -1;if(k[7]=='p')c->s_pid_kp=v;else if(k[7]=='i')c->s_pid_ki=v;else if(k[7]=='d')c->s_pid_kd=v;else return -1;return 1;}
     if(!strcmp(k,"speed_ramp")){if(v<100.0f||v>75000.0f)return -1;c->s_pid_ramp_erpms_s=v;return 1;}
-    if(!strcmp(k,"speed_src")){if(v!=(float)i||i<0||i>2)return -1;c->s_pid_speed_source=(S_PID_SPEED_SRC)i;return 1;}
+    if(!strcmp(k,"speed_src")){if(v!=(float)i||i<0||i>1)return -1;c->s_pid_speed_source=(S_PID_SPEED_SRC)i;return 1;}
     if(!strcmp(k,"decoupling")){if(v!=(float)i||i<0||i>3)return -1;c->foc_cc_decoupling=(mc_foc_cc_decoupling_mode)i;return 1;}
-    if(!strcmp(k,"fw_current")){if(v<0.0f||v>I_MOT_MAX)return -1;c->foc_fw_current_max=v;return 1;}
-    if(!strcmp(k,"fw_duty")){if(v<0.0f||v>1.0f)return -1;c->foc_fw_duty_start=v;return 1;}
-    if(!strcmp(k,"fw_ramp")){if(v<0.0f||v>60.0f)return -1;c->foc_fw_ramp_time=v;return 1;}
-    if(!strcmp(k,"fw_q")){if(v<0.0f||v>1.0f)return -1;c->foc_fw_q_current_factor=v;return 1;}
-    if(!strcmp(k,"fw_backoff")){if(v<0.0f||v>10.0f)return -1;c->foc_fw_backoff=v;return 1;}
-    if(!strcmp(k,"in_map_start")){if(v<0.0f||v>1.0f)return -1;c->l_in_current_map_start=v;return 1;}
-    if(!strcmp(k,"in_map_filter")){if(v<0.00001f||v>1.0f)return -1;c->l_in_current_map_filter=v;return 1;}
     if(!strncmp(k,"current_k",9)){if(k[10]||v<0)return -1;if(k[9]=='p'){if(v>65535.0f/1536.0f)return -1;c->foc_current_kp=v;}else if(k[9]=='i'){if(v>65535.0f/4.608f)return -1;c->foc_current_ki=v;}else return -1;return 1;}
     return 0;
 }
@@ -3317,33 +3310,12 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
             cm->foc_hall_table[4],cm->foc_hall_table[5],cm->foc_hall_table[6],cm->foc_hall_table[7]);
         terminal_send_text(o);return;
     }
-    if(!strcmp(a[0],"ilim")){
-        const int32_t filt_q4=m->m_in_current_map_lpf_q20>>16;
-        snprintf(o,sizeof(o),"ILIM id=%u raw_mA=%ld filt_mA=%ld inmax_mA=%ld regen_mA=%ld map_start_q15=%u map_filter_q16=%u map_motor_mA=%ld base_motor_mA=%ld\n",
-            second?2u:1u,(long)(-(int32_t)m->m_current_in_counts*1000/A2BIT_CONV),
-            (long)(filt_q4*1000/FOC_CURRENT_Q4_PER_A),
-            (long)((int32_t)m->m_input_current_max_q4*1000/FOC_CURRENT_Q4_PER_A),
-            (long)((int32_t)m->m_input_current_regen_q4*1000/FOC_CURRENT_Q4_PER_A),
-            (unsigned)m->m_in_current_map_start_q15,(unsigned)m->m_in_current_map_filter_q16,
-            (long)((int32_t)m->m_input_map_current_limit_q4*1000/FOC_CURRENT_Q4_PER_A),
-            (long)((int32_t)m->m_current_limit_q4*1000/FOC_CURRENT_Q4_PER_A));
-        terminal_send_text(o);return;
-    }
-    if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"FW id=%u max_mA=%ld start_pm=%u ramp_ms=%lu qfac_q15=%u backoff_q15=%u active_mA=%ld idset_mA=%ld iqtar_mA=%ld iqset_mA=%ld iq_mA=%ld duty_pm=%d off_ms=%u\n",second?2u:1u,(long)((int32_t)m->m_fw_current_max_q4*1000/FOC_CURRENT_Q4_PER_A),(unsigned)m->m_fw_duty_start_permille,(unsigned long)m->m_fw_ramp_time_ms,(unsigned)m->m_fw_q_current_factor_q15,(unsigned)m->m_fw_backoff_q15,(long)((int32_t)m->m_i_fw_set_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_id_set_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_iq_target_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_iq_set_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_iq_q4*1000/FOC_CURRENT_Q4_PER_A),(int)m->m_duty_now_permille,(unsigned)m->m_current_off_delay_ms);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"%s FW6.00 id=%u role=%s sensor=%s\n",second?"motor_right":"motor_left",second?2u:1u,second?"drive":"steer",second?"Hall":(cc->m_sensor_port_mode==SENSOR_PORT_MODE_ABI?"ABI":"Hall"));terminal_send_text(o);return;}
     if(!strcmp(a[0],"faults_clear")||!strcmp(a[0],"faults_reset")||!strcmp(a[0],"reset_faults")||
        (!strcmp(a[0],"reset")&&ac>1&&!strcmp(a[1],"faults"))||
        (!strcmp(a[0],"faults")&&ac>1&&(!strcmp(a[1],"clear")||!strcmp(a[1],"reset")))){
         mcpwm_foc_clear_faults();
-        const mc_fault_code lf=mc_interface_get_fault_motor(false);
-        const mc_fault_code rf=mc_interface_get_fault_motor(true);
-        char msg[160];
-        if(lf==FAULT_CODE_NONE && rf==FAULT_CODE_NONE){
-            terminal_send_text("OK all motor faults reset; bridges remain released\n");
-        }else{
-            snprintf(msg,sizeof(msg),"BLOCKED fault reset unsafe: left=%d(%s) right=%d(%s); bridges remain released\n",
-                     (int)lf,vesc_fault_name(lf),(int)rf,vesc_fault_name(rf));
-            terminal_send_text(msg);
-        }
+        terminal_send_text("OK all motor faults reset; bridges remain released\n");
         return;
     }
     if(!strcmp(a[0],"status")||!strcmp(a[0],"values")||!strcmp(a[0],"faults")){terminal_values(second);return;}
@@ -3365,40 +3337,8 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(sub,"invert")&&ac>2){float x=0.0f;if(!terminal_float(a[2],&x)||(x!=0.0f&&x!=1.0f)){terminal_send_text("ERR steering invert 0|1\n");return;}terminal_send_text(mc_interface_set_steering_logical_inverted(x>0.5f)?"OK steering logical mapping saved\n":"ERR steering invert requires valid span\n");return;}
         terminal_send_text("ERR steering status|center|zero|reset|invert 0|1\n");return;
     }
-    if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){
-        snprintf(o,sizeof(o),"CONFIG sensor=%u/%u inv=%u poles=%u gear_milli=%ld I_mA=%ld/%ld Iin_mA=%ld/%ld erpm=%ld/%ld R_uOhm=%lu L_nH=%lu flux_nWb=%lu dec=%u speed_src=%u\n",
-            (unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,
-            (long)(cc->si_gear_ratio*1000.0f),(long)(cc->l_current_min*1000.0f),(long)(cc->l_current_max*1000.0f),
-            (long)(cc->l_in_current_min*1000.0f),(long)(cc->l_in_current_max*1000.0f),(long)cc->l_min_erpm,(long)cc->l_max_erpm,
-            (unsigned long)(cc->foc_motor_r*1000000.0f+0.5f),(unsigned long)(cc->foc_motor_l*1000000000.0f+0.5f),
-            (unsigned long)(cc->foc_motor_flux_linkage*1000000000.0f+0.5f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);
-        terminal_send_text(o);return;}
-    if(!strcmp(a[0],"speed_est")){
-        const int32_t pp=(int32_t)(mcpwm_foc_get_pole_pairs(second)?mcpwm_foc_get_pole_pairs(second):1u);
-        const bool enc_raw=!second && m->m_encoder_configured &&
-            (m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER || m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB);
-        const int32_t raw_erpm=enc_raw?(m->m_encoder_erpm_q16/65536):(int32_t)((int64_t)m->m_rpm*pp);
-        int32_t pid_erpm=raw_erpm;
-        if(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_PLL && m->m_pll_valid)pid_erpm=m->m_pll_erpm_q16/65536;
-        else if(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_FAST && m->m_speed_est_valid)pid_erpm=m->m_speed_fast_erpm_q16/65536;
-        else if(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_FASTER && m->m_speed_est_valid)pid_erpm=m->m_speed_faster_erpm_q16/65536;
-        const int32_t dir=m->m_conf.m_invert_direction?-1:1;
-        const int32_t vesc_public_erpm=dir*(int32_t)mcpwm_foc_get_erpm_motor(second);
-        snprintf(o,sizeof(o),"SPEED_EST id=%u src=%u valid=%u pll_valid=%u raw_internal=%ld vesc_erpm=%ld pll_internal=%ld fast_internal=%ld faster_internal=%ld pid_internal=%ld\n",
-            second?2u:1u,(unsigned)m->m_conf.s_pid_speed_source,(unsigned)m->m_speed_est_valid,(unsigned)m->m_pll_valid,
-            (long)raw_erpm,(long)vesc_public_erpm,(long)(m->m_pll_erpm_q16/65536),
-            (long)(m->m_speed_fast_erpm_q16/65536),(long)(m->m_speed_faster_erpm_q16/65536),(long)pid_erpm);
-        terminal_send_text(o);return;
-    }
-    if(!strcmp(a[0],"tuning")){
-        snprintf(o,sizeof(o),"TUNING cur_kp_u=%ld cur_ki_m=%ld speed_kp_u=%ld speed_ki_u=%ld speed_kd_u=%ld speed_kdf_q16=%u min_erpm=%ld ramp_erpm_s=%ld src=%u pos_kp_u=%ld pos_ki_u=%ld pos_kd_u=%ld pos_kdproc_u=%ld pos_kdf_q16=%u angdiv_m=%ld gaindec_mdeg=%ld offset_mdeg=%ld\n",
-            (long)(cc->foc_current_kp*1000000.0f),(long)(cc->foc_current_ki*1000.0f),
-            (long)(cc->s_pid_kp*1000000.0f),(long)(cc->s_pid_ki*1000000.0f),(long)(cc->s_pid_kd*1000000.0f),
-            (unsigned)(cc->s_pid_kd_filter*65535.0f+0.5f),(long)cc->s_pid_min_erpm,(long)cc->s_pid_ramp_erpms_s,(unsigned)cc->s_pid_speed_source,
-            (long)(cc->p_pid_kp*1000000.0f),(long)(cc->p_pid_ki*1000000.0f),(long)(cc->p_pid_kd*1000000.0f),(long)(cc->p_pid_kd_proc*1000000.0f),
-            (unsigned)(cc->p_pid_kd_filter*65535.0f+0.5f),(long)(cc->p_pid_ang_div*1000.0f),
-            (long)(cc->p_pid_gain_dec_angle*1000.0f),(long)(cc->p_pid_offset*1000.0f));
-        terminal_send_text(o);return;}
+    if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb dec=%u speed_src=%u\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
     if(!strcmp(a[0],"perf")){
         if(ac>1&&!strcmp(a[1],"reset")){
             foc_isr_cycles_max=0u; foc_isr_deadline_miss_count=0u;
@@ -3452,7 +3392,7 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
     }
     if(!strcmp(a[0],"home")){if(second||cc->m_sensor_port_mode!=SENSOR_PORT_MODE_ABI){terminal_send_text("ERR LEFT encoder only\n");return;}terminal_send_text(mc_interface_steering_boot_home()?"PASS home\n":"FAIL home\n");return;}
     if(!strcmp(a[0],"release")){if(ac>1&&!strcmp(a[1],"all")){mc_interface_select_motor_thread(1);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(false);mc_interface_select_motor_thread(2);mc_interface_release_motor();mcpwm_foc_vesc_override_clear(true);mc_interface_select_motor_thread(second?2:1);}else{mc_interface_release_motor();mcpwm_foc_vesc_override_clear(second);}terminal_send_text("OK hard released\n");return;}
-    if(!strcmp(a[0],"stop")){if(ac>1&&!strcmp(a[1],"hard")){mc_interface_release_motor();mcpwm_foc_vesc_override_clear(second);terminal_send_text("OK hard released\n");return;}if(ac>1&&!strcmp(a[1],"all")){standby_motor(false);standby_motor(true);mc_interface_select_motor_thread(second?2:1);}else{standby_motor(second);}terminal_send_text("OK sensing standby PWM=center\n");return;}
+    if(!strcmp(a[0],"stop")){if(ac>1&&!strcmp(a[1],"hard")){mc_interface_release_motor();mcpwm_foc_vesc_override_clear(second);terminal_send_text("OK hard released\n");return;}if(ac>1&&!strcmp(a[1],"all")){standby_motor(false);standby_motor(true);mc_interface_select_motor_thread(second?2:1);}else{standby_motor(second);}terminal_send_text("OK standby Id=Iq=0\n");return;}
     if(!strcmp(a[0],"save")&&ac>1){if(!strcmp(a[1],"mcconf")){terminal_send_text(mc_interface_store_configuration_motor(second)?"OK saved\n":"ERR save\n");return;}if(!second&&!strcmp(a[1],"steering")){terminal_send_text(mc_interface_store_steering_calibration()?"OK saved\n":"ERR steering\n");return;}}
     if(!strcmp(a[0],"load")&&ac>1&&!strcmp(a[1],"mcconf")){terminal_send_text(mc_interface_load_configuration_motor(second)?"OK loaded\n":"ERR load\n");return;}
     if(!strcmp(a[0],"defaults")){bool sv=ac>1&&!strcmp(a[1],"save");mc_interface_restore_default_motor(second,sv);terminal_send_text(sv?"OK defaults saved\n":"OK defaults RAM\n");return;}
@@ -3470,11 +3410,6 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(a[1],"openloop")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&fabsf(x)<=I_MOT_MAX&&fabsf(y)<=MCCONF_L_MAX_ERPM){touch_motor(second);mc_interface_set_openloop_current(x,y);goto setok;}
         if(!strcmp(a[1],"input_current")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&x<=-0.1f&&x>=-I_DC_MAX&&y>=0.1f&&y<=I_DC_MAX){mc_configuration c=*cc;c.l_in_current_min=x;c.l_in_current_max=y;mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}
         if(!strcmp(a[1],"erpm_limit")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&x<0&&y>0&&x>=MCCONF_L_MIN_ERPM&&y<=MCCONF_L_MAX_ERPM){mc_configuration c=*cc;c.l_min_erpm=x;c.l_max_erpm=y;mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}
-        if(!strcmp(a[1],"speed_src")&&terminal_float(a[2],&x)){
-            int src=(int)x;
-            if(x!=(float)src||src<0||src>2||!mcpwm_foc_set_speed_pid_source((S_PID_SPEED_SRC)src,second))goto setbad;
-            terminal_send_text("OK RAM hot speed source; save mcconf\n");return;
-        }
         {mc_configuration c=*cc;int r=terminal_cfg_one(&c,second,a[1],a[2]);if(r==1){mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}if(r<0)goto setbad;}
 setbad: terminal_send_text("ERR set value/syntax; type help\n");return;
 setok: terminal_send_text("OK set\n");return;
@@ -3746,18 +3681,10 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
          * Never allow a drive/joystick session to turn a malformed or stale
          * packet into a mechanical hard-stop sweep. */
         const mcpwm_foc_motor_t *drive=mcpwm_foc_get_motor_const(true);
-        /* Commissioning interlock must use authoritative RIGHT Hall motion, not
-         * the PLL display value which can remain valid/stale after release. RIGHT
-         * is Hall-only on this board, so an expired/no-edge Hall estimator means
-         * true zero speed for this mechanical-safety gate. */
-        uint32_t drive_erpm=0u;
-        if(drive && drive->m_hall_initialized && drive->m_hall_direction!=0 &&
-           drive->m_hall_period>0u && drive->m_hall_period<MCCONF_HALL_TIMEOUT_TICKS &&
-           drive->m_hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS){
-            drive_erpm=((uint32_t)PWM_FREQ*10u)/(uint32_t)drive->m_hall_period;
-        }
+        float drive_erpm=mcpwm_foc_get_erpm_motor(true);
+        if(drive_erpm<0.0f)drive_erpm=-drive_erpm;
         const bool drive_busy=(drive && drive->m_control_mode!=CONTROL_MODE_NONE) ||
-                              drive_erpm>(uint32_t)MCCONF_FAULT_RECOVERY_SAFE_ERPM;
+                              drive_erpm>(float)MCCONF_FAULT_RECOVERY_SAFE_ERPM;
         if(second || drive_busy){
             uint8_t reply[10]; int32_t ri=0; reply[ri++]=COMM_DETECT_ENCODER;
             buffer_append_float32(reply,1001.0f,1e6f,&ri);
