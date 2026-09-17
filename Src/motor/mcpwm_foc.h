@@ -44,6 +44,11 @@ typedef struct {
      * the closed-loop D-axis target is -m_i_fw_set_q4. Coefficients are
      * precomputed outside the ISR from standard foc_fw_* MC configuration. */
     volatile int16_t m_i_fw_set_q4;
+    /* VESC m_current_off_delay equivalent in milliseconds. FW refreshes this
+     * to 1000 ms while active; normal outer-loop ticks count it down. It keeps
+     * zero-current modulation alive after leaving FW so BEMF/body-diode
+     * transients cannot abruptly collapse the switching state. */
+    volatile uint16_t m_current_off_delay_ms;
     int16_t m_fw_current_max_q4;
     uint16_t m_fw_duty_start_permille;
     uint16_t m_fw_q_current_factor_q15;

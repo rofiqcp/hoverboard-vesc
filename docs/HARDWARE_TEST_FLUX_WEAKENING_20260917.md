@@ -179,3 +179,34 @@ Compared with the clean pre-optimization stress run, protocol responsiveness imp
 Profiler caveat: peak current-control slots still exceed the nominal 4000-cycle 16-kHz frame budget (`slot0 ≈ 4948`, `slot1 ≈ 5599` maximum in this run), so `deadline_miss` remains non-zero. The staggered scheduler makes the other slots approximately `3130..3220` cycles, providing sufficient CPU recovery margin for deterministic communications. This report therefore qualifies the observed dual-6000 control and VESC realtime workload, but does not claim zero ISR deadline misses.
 
 Final result for this addendum: `DUAL_6000_FW_RT50_APP20_PASS`.
+
+## Stage 3 Qualification — Q-current factor, backoff, and current-off delay
+Stage 3 closes the remaining VESC `foc_run_fw()` parity around FW transitions. Firmware under test: USART2 921600 baud, candidate CRC16 `0x1196`. The implementation adds the VESC-style 1000 ms current-off delay and makes normal speed-zero enter sensing standby rather than hard release; electrical faults, E-stop, watchdog, reboot, and bootloader still bypass the delay and hard-release immediately.
+
+### Q-current factor
+LEFT was tested at 6000 ERPM with `foc_fw_current_max=1.0 A`, `foc_fw_duty_start=0.55`, `foc_fw_ramp_time=0.2 s`, and backoff disabled. With `foc_fw_q_current_factor=0`, mean active FW was `527.4 mA` and mean `Iq_target - Iq_set` was exactly `0 mA`.
+
+With `foc_fw_q_current_factor=0.5`, mean active FW was `516.4 mA`. Mean `Iq_target - Iq_set` became `258.5 mA`; the expected value `0.5 × I_fw` was `258.2 mA`. This verifies the VESC equation `Iq_set = Iq_target - SIGN(mod_q) × I_fw × q_factor` within integer quantization.
+
+RIGHT was independently checked with `q_factor=0.5`: mean active FW `462.6 mA`; measured magnitude `|Iq_target-Iq_set| = 231.9 mA`; expected `0.5 × I_fw = 231.3 mA`. The sign reversed correctly with RIGHT direction/modulation inversion.
+
+### FW backoff
+To create a controlled positive Iq error, LEFT was stabilized near 6000 ERPM with FW active and then changed to a small reverse-current request while the rotor remained forward. At nearly equal duty (`~0.57`), `foc_fw_backoff=0` produced active FW around `320 mA`; `foc_fw_backoff=2.0` reduced active FW to about `257 mA`. The result verifies that positive `SIGN(speed) × (Iq-Iq_target)` reduces the available FW current instead of allowing D-axis voltage demand to run away.
+### Current-off delay
+After steady 6000 ERPM operation, LEFT was commanded to zero speed while `COMM_ALIVE` remained active. The FW duty region initially refreshed `off_ms=1000`. Once duty dropped below the FW threshold, the delay counted down monotonically: `1000 → 909 → 815 → 722 → 629 → 536 → 443 → 350 → 257 → 164 → 71 → 0 ms`. It reached zero at approximately `1.12 s` from the zero-speed transition. During this interval the current regulator remained active, rotor speed and `Id/Iq/Imotor/Ibat` stayed observable, and no fault occurred.
+
+RIGHT independently showed the same result: `off_ms` maximum `1000 ms`, reaching zero at approximately `1.12 s`, with fault `0`. The delay therefore exists per motor, not as a shared/global timer.
+
+### Dual-motor + realtime stress
+Both motors were then tested together at 6000 ERPM using temporary RAM-only FW settings `1.0 A / 0.55 duty / 0.5 s ramp / q=0.05 / backoff=0.2`. Simultaneously the VESC Tool traffic pattern was applied: motor realtime values at 50 Hz per motor and App Data PPM/ADC/CHUK at 20 Hz.
+
+Results: LEFT `400/400` replies at `49.99 Hz`; RIGHT `400/400` replies at `49.99 Hz`; PPM/ADC/CHUK each `160/160` at `20.00 Hz`. Parser errors `0`, RX queue drops `0`, TX queue drops `0`, fault LEFT/RIGHT `0/0`, and current trips `0/0`. End-of-run measured values were approximately LEFT `duty=0.777, Id=-0.49 A, Iq=+0.22 A`, RIGHT `duty=0.758, Id=-0.44 A, Iq=+0.17 A`.
+
+At roughly 0.3 s after the dual zero-speed command, FW current had already decayed to zero while the post-FW delay remained active at `683 ms` LEFT and `663 ms` RIGHT. This is consistent with the independent ~1 s countdown tests and confirms the delay survives a dual-motor transition under full telemetry load.
+
+### Stage 3 result
+PASS. Q-current sharing matches the upstream VESC equation, FW backoff reduces requested negative-D current under positive Iq tracking error, and the one-second current-off delay now preserves active zero-current modulation after leaving the FW region. Normal zero-speed uses sensing standby; hard safety releases remain immediate. Temporary FW test parameters were restored to the safe defaults (`current_max=0 A`, `duty_start=0.8`, `ramp=0`, `q_factor=0.05`, `backoff=2.0`) after testing.
+### Hard-release safety check
+A separate LEFT test used `FW max=0.5 A`, `duty_start=0.4`, `ramp=0.2 s`, `q=0.05`, `backoff=0.2` at approximately 4444 ERPM. Immediately before the safety command, active FW was about `162 mA`, measured `Id=-0.17 A`, `Iq=+0.23 A`, duty about `0.61`, and `off_ms=1000`.
+
+`stop hard` was then issued. Within approximately 80 ms the motor reported `CONTROL_MODE_NONE / MC_STATE_OFF`, active FW `0`, `Id_set=0`, duty `0`, and `off_ms=0`; fault/trip remained `0/0`. This verifies that FW current-off delay never blocks the fail-safe hard-release path.

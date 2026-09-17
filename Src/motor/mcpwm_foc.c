@@ -2682,6 +2682,7 @@ void mcpwm_foc_release_motor(bool second) {
     m->m_telem_sum_id_q4=0; m->m_telem_sum_iq_q4=0; m->m_telem_sum_imotor_q4=0; m->m_telem_sum_ibus_counts=0; m->m_telem_avg_samples=0u;
     m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
     m->m_i_fw_set_q4=0;
+    m->m_current_off_delay_ms=0u;
     m->m_duty_set_permille=0;
     m->m_id_set_q4=0; m->m_openloop_id_target_q4=0;
     m->m_openloop_id_ramp_q16=0;
@@ -4561,8 +4562,8 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     const bool standby_current_hot=ABS((int32_t)m->m_id_q4)>standby_iq_thresh ||
                                    ABS((int32_t)m->m_iq_q4)>standby_iq_thresh;
     const bool standby_voltage_hot=ABS((int32_t)m->m_duty_now_permille)>60;
-    const bool standby_regulate=!m->m_standby_sense || standby_fast_hall ||
-                                 standby_current_hot || standby_voltage_hot;
+    const bool standby_regulate=!m->m_standby_sense || m->m_current_off_delay_ms>0u ||
+                                 standby_fast_hall || standby_current_hot || standby_voltage_hot;
     uint32_t profRegulatorStart=0u;
     if(foc_prof_detail_sample && control_update)profRegulatorStart=DWT->CYCCNT;
         if (control_update && standby_regulate) {
@@ -4982,6 +4983,15 @@ static int16_t field_weakening_apply_iq_q4(const mcpwm_foc_motor_t *m,int16_t iq
 
 static void field_weakening_update_non_isr(mcpwm_foc_motor_t *m,bool second,uint32_t dt_ms){
     if(!m)return;
+    /* Upstream foc_run_fw() owns a one-second current-off delay. Count it down
+     * on the same 1-kHz-ish outer scheduler, then refresh to 1000 ms whenever
+     * the motor is inside the FW duty region. Fault/hard-release clears it
+     * immediately elsewhere. */
+    if(m->m_current_off_delay_ms>0u){
+        const uint32_t dec=dt_ms?dt_ms:1u;
+        m->m_current_off_delay_ms=(uint16_t)(dec>=m->m_current_off_delay_ms?0u:
+                                            (uint32_t)m->m_current_off_delay_ms-dec);
+    }
     const int32_t max0=m->m_fw_current_max_q4;
     const int32_t ccmin=m->m_cc_min_current_q4>0?m->m_cc_min_current_q4:1;
     const bool mode_ok=m->m_state==MC_STATE_RUNNING &&
@@ -4995,6 +5005,11 @@ static void field_weakening_update_non_isr(mcpwm_foc_motor_t *m,bool second,uint
         int32_t dmax=m->m_duty_limit_permille>0?m->m_duty_limit_permille:1000;
         int32_t dstart=m->m_fw_duty_start_permille;
         if(duty>dstart && dmax>dstart){
+            /* VESC foc_run_fw(): keep modulation alive for one second after
+             * leaving the FW region. Our STOP-SENSE never needs to fake data;
+             * this delay specifically forces the real zero-current regulator
+             * to remain active before the low-CPU centered-PWM path is allowed. */
+            m->m_current_off_delay_ms=1000u;
             int32_t maxeff=max0;
             if(m->m_fw_backoff_q15){
                 const int32_t pp=(int32_t)motor_pole_pairs(second);
@@ -5071,7 +5086,7 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
     for(uint8_t i=0u;i<2u;++i){
         mcpwm_foc_motor_t *m=motors[i];
         const bool second=i!=0u;
-        if(m->m_fault!=FAULT_CODE_NONE){m->m_i_fw_set_q4=0;continue;}
+        if(m->m_fault!=FAULT_CODE_NONE){m->m_i_fw_set_q4=0;m->m_current_off_delay_ms=0u;continue;}
         field_weakening_update_non_isr(m,second,dt_ms);
         if(m->m_control_mode==CONTROL_MODE_SPEED){
             const uint32_t profSpeedStart=DWT->CYCCNT;
@@ -5083,7 +5098,11 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
             if(m->m_speed_target_rpm_q16==0 && abs_set<min_set){
                 m->m_speed_integrator=0; m->m_speed_prev_error=0;
                 m->m_speed_sat_hold=0; m->m_speed_d_filter_q4=0;
-                mcpwm_foc_release_motor(second);
+                /* Normal zero-speed is sensing standby, not a safety release.
+                 * Preserve FW decay/current_off_delay and the active current
+                 * regulator exactly as release_motor() does upstream before its
+                 * eventual OFF decision. Fault/watchdog paths still hard-OFF. */
+                mcpwm_foc_enter_standby(second);
             }else{
                 m->m_iq_target_q4=speed_pid_iq_target_step(m,second,dt_ms);
             }
