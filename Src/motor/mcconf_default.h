@@ -75,7 +75,7 @@
  * VESC Tool / ROS / Web commands and feedback. 320/360 = 8/9 runtime span. */
 #define MCCONF_STEERING_RUNTIME_SPAN_NUM             8u
 #define MCCONF_STEERING_RUNTIME_SPAN_DEN             9u
-#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   8000u
+#define MCCONF_STEERING_POSITION_CURRENT_MAX_MA   15000u
 #define MCCONF_STEERING_MOTION_PROGRESS_COUNTS       32u /* commissioning motion threshold; not a torque assist */
 #define MCCONF_STEERING_CENTER_CURRENT_A           2.00f /* commissioning return-to-midpoint */
 #define MCCONF_STEERING_CENTER_TOL_COUNTS           24u /* ~0.32 deg on measured ~4500-count span */
