@@ -372,6 +372,15 @@ typedef struct {
     uint8_t m_position_sat_hold;
     int8_t m_position_drive_direction;
     uint16_t m_position_settle_ticks;
+    /* Calibrated LEFT steering cascade state. Units are mechanical mdeg/s and
+     * Iq-q4 Q16 so the 1-kHz outer loop remains integer-only. */
+    int32_t m_steering_velocity_mdeg_s;
+    int32_t m_steering_velocity_cmd_mdeg_s;
+    int32_t m_steering_velocity_i_q16;
+    uint32_t m_steering_progress_error_mdeg;
+    uint16_t m_steering_velocity_dt_ms;
+    uint8_t m_steering_control_state; /* 0 breakaway, 1 track, 2 approach, 3 hold */
+    uint8_t m_steering_hold_latched;
     int32_t m_speed_set_ramp_q16;
     uint16_t m_speed_ramp_rpm_s;
     uint32_t m_speed_release_erpm_q16; /* exact VESC s_pid_min_erpm runtime threshold */

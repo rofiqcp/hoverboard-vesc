@@ -279,6 +279,8 @@ static volatile int16_t s_board_temperature_x10 = 250; /* 25,0 C sampai housekee
 
 static bool encoder_port_active(const mcpwm_foc_motor_t *m, bool second);
 static bool encoder_feedback_selected(const mcpwm_foc_motor_t *m, bool second);
+static bool hall_drive_ready(const mcpwm_foc_motor_t *m);
+static bool hall_drive_ready(const mcpwm_foc_motor_t *m);
 static void encoder_feedback_update(mcpwm_foc_motor_t *m, bool second, uint16_t elapsed_pwm_ticks);
 
 /* VESC FOC Hall table: 0..199 = 0..360 electrical degrees, 255 = invalid.
@@ -458,7 +460,16 @@ static int32_t measured_mech_rpm_raw_q16(const mcpwm_foc_motor_t *m, bool second
     return (int32_t)m->m_rpm * 65536;
 }
 
-static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
+
+/* Public/general speed follows upstream FOC semantics: PLL when valid, with
+ * authoritative Hall/ABI feedback only as startup/invalid fallback. */
+static int32_t measured_mech_rpm_public_q16(const mcpwm_foc_motor_t *m, bool second) {
+    if(m && m->m_pll_valid)return m->m_pll_mech_rpm_q16;
+    return measured_mech_rpm_raw_q16(m,second);
+}
+
+/* The speed-source selector is intentionally isolated to the speed PID. */
+static int32_t speed_pid_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
     if(m){
         const int32_t pp=(int32_t)motor_pole_pairs(second);
         switch(m->m_conf.s_pid_speed_source){
@@ -475,7 +486,7 @@ static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
             break;
         }
     }
-    return measured_mech_rpm_raw_q16(m,second);
+    return measured_mech_rpm_public_q16(m,second);
 }
 
 static bool encoder_motion_fresh(const mcpwm_foc_motor_t *m, bool second) {
@@ -900,7 +911,7 @@ static void conf_defaults(mc_configuration *c, bool second) {
     c->s_pid_min_erpm = (float)MCCONF_SPEED_RELEASE_ERPM;
     c->s_pid_allow_braking = true;
     c->s_pid_kd_filter = MCCONF_SPEED_KD_FILTER_DEFAULT;
-    c->s_pid_speed_source = S_PID_SPEED_SRC_FAST;
+    c->s_pid_speed_source = S_PID_SPEED_SRC_PLL;
     c->s_pid_kp = (float)MCCONF_SPEED_KP_Q11 / (float)MCCONF_SPEED_GAIN_SCALE;
     c->s_pid_ki = (float)MCCONF_SPEED_KI_Q16 / (float)MCCONF_SPEED_GAIN_SCALE;
     c->s_pid_kd = (float)MCCONF_SPEED_KD_Q11 / (float)MCCONF_SPEED_GAIN_SCALE;
@@ -1577,6 +1588,13 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if (!(next.l_in_current_map_start >= 0.0f && next.l_in_current_map_start <= 1.0f)) next.l_in_current_map_start=MCCONF_L_IN_CURRENT_MAP_START;
     if (!(next.l_in_current_map_filter >= 0.00001f && next.l_in_current_map_filter <= 1.0f)) next.l_in_current_map_filter=MCCONF_L_IN_CURRENT_MAP_FILTER;
     if (!(next.s_pid_kd_filter >= 0.0f && next.s_pid_kd_filter <= 1.0f)) next.s_pid_kd_filter=MCCONF_SPEED_KD_FILTER_DEFAULT;
+    /* Runtime motor-current setting remains user configurable up to the board
+     * hard ceiling I_MOT_MAX (30 A). A VESC Tool value such as 12 A therefore
+     * remains 12 A; only values above 30 A are clamped by the board contract. */
+    if (!(next.l_current_max >= 0.1f)) next.l_current_max=MCCONF_L_CURRENT_MAX;
+    if (next.l_current_max > (float)I_MOT_MAX) next.l_current_max=(float)I_MOT_MAX;
+    if (!(next.l_current_min <= -0.1f)) next.l_current_min=MCCONF_L_CURRENT_MIN;
+    if (next.l_current_min < -(float)I_MOT_MAX) next.l_current_min=-(float)I_MOT_MAX;
     if (!(next.l_current_max_scale >= 0.0f && next.l_current_max_scale <= 1.0f)) next.l_current_max_scale=MCCONF_L_CURRENT_MAX_SCALE;
     if (!(next.l_current_min_scale >= 0.0f && next.l_current_min_scale <= 1.0f)) next.l_current_min_scale=MCCONF_L_CURRENT_MIN_SCALE;
     if (!(next.l_battery_cut_start > next.l_battery_cut_end && next.l_battery_cut_end >= 0.0f)) {
@@ -1613,7 +1631,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     if(!(next.foc_pll_ki>=0.0f && next.foc_pll_ki<=200000.0f))next.foc_pll_ki=MCCONF_FOC_PLL_KI_DEFAULT;
     /* VESC 6.00 exposes three speed-PID sources: PLL, FAST and FASTER. */
     if((uint8_t)next.s_pid_speed_source>(uint8_t)S_PID_SPEED_SRC_FASTER)
-        next.s_pid_speed_source=S_PID_SPEED_SRC_FAST;
+        next.s_pid_speed_source=S_PID_SPEED_SRC_PLL;
     if((uint8_t)next.foc_cc_decoupling>(uint8_t)FOC_CC_DECOUPLING_CROSS_BEMF)
         next.foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
     /* VESC 6.00 field-weakening configuration is supported at runtime.
@@ -1915,6 +1933,9 @@ static void reset_position_pid(mcpwm_foc_motor_t *m){
     m->m_position_step_braking=0u;m->m_position_brake_direction=0;
     m->m_position_last_motion_count=m->m_position_counts;
     m->m_position_drive_direction=0;m->m_position_settle_ticks=0;
+    m->m_steering_velocity_mdeg_s=0;m->m_steering_velocity_cmd_mdeg_s=0;
+    m->m_steering_velocity_i_q16=0;m->m_steering_progress_error_mdeg=0u;m->m_steering_velocity_dt_ms=0u;
+    m->m_steering_control_state=0u;m->m_steering_hold_latched=0u;
 }
 
 static void reset_current_pi(mcpwm_foc_motor_t *m) {
@@ -1950,7 +1971,7 @@ static void speed_setpoint_slew_step(mcpwm_foc_motor_t *m, uint32_t dt_ms) {
 static void speed_mode_enter(mcpwm_foc_motor_t *m) {
     if (m->m_control_mode != CONTROL_MODE_SPEED) {
         const bool second=(m==&m_motor_2);
-        const int32_t measured_q16=measured_mech_rpm_q16(m,second);
+        const int32_t measured_q16=measured_mech_rpm_public_q16(m,second);
         set_control_mode(m, CONTROL_MODE_SPEED);
         /* Upstream VESC seeds a ramped SPEED entry from live feedback. Keep the
          * Q16 estimator resolution here (Hall/ABI/PLL selectable) instead of
@@ -2056,7 +2077,10 @@ void mcpwm_foc_set_position_counts(int32_t pc,bool second){
     }
     if(target_changed && !branch_change){
         m->m_position_breakaway_ticks=0u; m->m_position_no_motion_ticks=0u;
-        m->m_position_last_motion_count=m->m_position_counts;
+        m->m_position_motion_seen=0u;m->m_position_last_motion_count=m->m_position_counts;
+        m->m_position_integrator=0;m->m_steering_velocity_i_q16=0;
+        m->m_steering_velocity_cmd_mdeg_s=0;m->m_steering_hold_latched=0u;
+        m->m_steering_control_state=0u;
     }
     m->m_pos_pid_phase_mode=0u;
     m->m_position_target_counts=pc;
@@ -2137,7 +2161,9 @@ bool mcpwm_foc_steering_rebase_left(void){
 
 bool mcpwm_foc_steering_rebase_center(void){
     mcpwm_foc_motor_t *m=&m_motor_1;
-    if(!m->m_steering_calibrated || m->m_steering_span_counts==0 || !m->m_encoder_synced)
+    const bool feedback_ready=encoder_feedback_selected(m,false)?
+        (m->m_encoder_configured && m->m_encoder_synced):hall_drive_ready(m);
+    if(!m->m_steering_calibrated || m->m_steering_span_counts==0 || !feedback_ready)
         return false;
     /* Only the calibrated span is persisted. The operator places the steering
      * physically at center before each power-on, so after ABI/electrical phase
@@ -2173,7 +2199,9 @@ float mcpwm_foc_get_steering_deg(void){
 bool mcpwm_foc_set_steering_deg(float deg){
     mcpwm_foc_motor_t *m=&m_motor_1;
     const int32_t safe_span=steering_runtime_span_from_measured(m->m_steering_span_counts);
-    if(!m->m_steering_calibrated || !m->m_steering_homed || !m->m_encoder_synced ||
+    const bool feedback_ready=encoder_feedback_selected(m,false)?
+        (m->m_encoder_configured && m->m_encoder_synced):hall_drive_ready(m);
+    if(!m->m_steering_calibrated || !m->m_steering_homed || !feedback_ready ||
        safe_span==0){mcpwm_foc_release_motor(false);return false;}
     if(deg<MCCONF_STEERING_POS_MIN_DEG)deg=MCCONF_STEERING_POS_MIN_DEG;
     if(deg>MCCONF_STEERING_POS_MAX_DEG)deg=MCCONF_STEERING_POS_MAX_DEG;
@@ -2966,6 +2994,24 @@ static bool fault_code_auto_recoverable(mc_fault_code code) {
     }
 }
 
+static bool fault_recovery_requires_feedback(mc_fault_code code) {
+    switch(code){
+    case FAULT_CODE_ENCODER_SPI:
+    case FAULT_CODE_ENCODER_SINCOS_BELOW_MIN_AMPLITUDE:
+    case FAULT_CODE_ENCODER_SINCOS_ABOVE_MAX_AMPLITUDE:
+    case FAULT_CODE_ENCODER_NO_MAGNET:
+    case FAULT_CODE_ENCODER_MAGNET_TOO_STRONG:
+    case FAULT_CODE_ENCODER_FAULT:
+    case FAULT_CODE_ENCODER_SLIP:
+    case FAULT_CODE_OVERSPEED:
+    case FAULT_CODE_UNDERSPEED:
+    case FAULT_CODE_ABS_OVERSPEED:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool fault_recovery_conditions_safe(const mcpwm_foc_motor_t *m, bool second) {
     if(!m || !fault_code_auto_recoverable(m->m_fault))return false;
 
@@ -2986,13 +3032,17 @@ static bool fault_recovery_conditions_safe(const mcpwm_foc_motor_t *m, bool seco
        s_board_temperature_x10>=m->m_temp_fet_start_x10)return false;
     if(!m->m_current_offset_valid)return false;
 
-    /* Sensor faults may clear only when the configured feedback source is back
-     * and coherent.  This also prevents a recovered fault from immediately
-     * re-arming a bridge onto an invalid Hall/ABI state. */
-    if(encoder_feedback_selected(m,second)){
-        if(!m->m_encoder_configured || !m->m_encoder_synced)return false;
-    }else if(!hall_feedback_valid(m)){
-        return false;
+    /* Only feedback-related faults require sensor coherence to clear. A transient
+     * ABS over-current is allowed to recover once electrical quantities are safe;
+     * the bridge remains released and the normal command gate re-checks sensor
+     * readiness before any later re-arm. This prevents a harmless current trip
+     * from leaving the buzzer latched forever after the motor is already safe. */
+    if(fault_recovery_requires_feedback(m->m_fault)){
+        if(encoder_feedback_selected(m,second)){
+            if(!m->m_encoder_configured || !m->m_encoder_synced)return false;
+        }else if(!hall_feedback_valid(m)){
+            return false;
+        }
     }
     return true;
 }
@@ -3783,6 +3833,227 @@ static int16_t position_q15_to_iq_q4(int32_t out_q15, int32_t limit_q4) {
     return (int16_t)(prod/32768);  /* constant power-of-two; compiler emits shift */
 }
 
+
+/* Calibrated LEFT steering hybrid cascade. This branch is intentionally separate
+ * from stock VESC phase-position and RIGHT Hall speed control. Static tyre/linkage
+ * friction is handled by a short breakaway state; once motion begins, position
+ * error commands steering velocity and a PI velocity servo commands Iq. A hold
+ * hysteresis removes limit-cycle chatter around the final steering angle. */
+static int16_t position_cascade_core_iq_step(mcpwm_foc_motor_t *m, bool second,
+        int32_t error_mdeg, int32_t vel_mdeg_s, int32_t motion_count,
+        uint32_t motion_threshold, int32_t limit_q4, uint32_t dt_ms,
+        uint32_t hold_enter_mdeg, uint32_t hold_exit_mdeg,
+        uint32_t approach_mdeg, uint32_t break_enter_mdeg,
+        uint32_t break_rearm_mdeg, bool apply_motor_invert) {
+    if(!m)return 0;
+    (void)second;
+    if(dt_ms==0u)dt_ms=1u;
+    if(motion_threshold==0u)motion_threshold=1u;
+    const uint32_t ae=(uint32_t)(error_mdeg<0?-(int64_t)error_mdeg:error_mdeg);
+
+    /* HOLD hysteresis is common to ABI and Hall. The caller expands the Hall
+     * thresholds to its actual sector resolution, so no sensor is asked to
+     * regulate below information it can physically observe. */
+    const int32_t prev_err=m->m_position_prev_error_mdeg;
+    const bool crossed=(prev_err>0 && error_mdeg<=0)||(prev_err<0 && error_mdeg>=0);
+    if(m->m_steering_hold_latched){
+        if(ae<=hold_exit_mdeg){
+            m->m_steering_control_state=3u;
+            m->m_steering_velocity_cmd_mdeg_s=0;
+            m->m_steering_velocity_i_q16=0;
+            m->m_position_integrator=0;
+            reset_current_pi(m);
+            m->m_position_prev_error_mdeg=error_mdeg;
+            return 0;
+        }
+        m->m_steering_hold_latched=0u;
+        m->m_position_motion_seen=0u;
+        m->m_position_breakaway_ticks=0u;
+        m->m_position_no_motion_ticks=0u;
+        m->m_position_last_motion_count=motion_count;
+        m->m_steering_velocity_i_q16=0;
+    }
+    if(ae<=hold_enter_mdeg || (crossed && ae<=hold_exit_mdeg)){
+        m->m_steering_hold_latched=1u;
+        m->m_steering_control_state=3u;
+        m->m_steering_velocity_cmd_mdeg_s=0;
+        m->m_steering_velocity_i_q16=0;
+        m->m_position_integrator=0;
+        reset_current_pi(m);
+        m->m_position_breakaway_ticks=0u;
+        m->m_position_no_motion_ticks=0u;
+        m->m_position_prev_error_mdeg=error_mdeg;
+        return 0;
+    }
+
+    /* Initial BREAKAWAY->TRACK transition still requires real sensor motion.
+     * Once tracking, stall detection is based on meaningful reduction in
+     * absolute position error, not raw count jitter or quantized velocity. */
+    const int32_t md=motion_count-m->m_position_last_motion_count;
+    const uint32_t am=(uint32_t)(md<0?-(int64_t)md:md);
+    if(!m->m_position_motion_seen){
+        if(am>=motion_threshold && m->m_position_breakaway_ticks>=MCCONF_STEERING_BREAKAWAY_MIN_MS){
+            m->m_position_motion_seen=1u;
+            m->m_position_last_motion_count=motion_count;
+            m->m_steering_progress_error_mdeg=ae;
+            m->m_position_no_motion_ticks=0u;
+        }
+    }else{
+        const uint32_t best=m->m_steering_progress_error_mdeg;
+        if(best==0u || ae+MCCONF_STEERING_PROGRESS_MDEG<=best){
+            m->m_steering_progress_error_mdeg=ae;
+            m->m_position_no_motion_ticks=0u;
+            m->m_position_last_motion_count=motion_count;
+        }else{
+            uint32_t n=(uint32_t)m->m_position_no_motion_ticks+dt_ms;
+            m->m_position_no_motion_ticks=(uint16_t)(n>65535u?65535u:n);
+        }
+    }
+    if(m->m_position_motion_seen &&
+       m->m_position_no_motion_ticks>=MCCONF_STEERING_BREAKAWAY_REARM_MS &&
+       ae>=break_rearm_mdeg){
+        m->m_position_motion_seen=0u;
+        m->m_position_breakaway_ticks=0u;
+        m->m_position_no_motion_ticks=0u;
+        m->m_position_last_motion_count=motion_count;
+        m->m_steering_velocity_i_q16=0;
+        m->m_steering_progress_error_mdeg=ae;
+    }
+
+    if(!m->m_position_motion_seen && ae>=break_enter_mdeg){
+        m->m_steering_control_state=0u; /* BREAKAWAY */
+        m->m_steering_velocity_cmd_mdeg_s=0;
+        m->m_steering_velocity_i_q16=0;
+        uint32_t n=(uint32_t)m->m_position_breakaway_ticks+dt_ms;
+        m->m_position_breakaway_ticks=(uint16_t)(n>65535u?65535u:n);
+        int32_t kick_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
+                         (int32_t)MCCONF_STEERING_BREAKAWAY_CURRENT_MA)/1000;
+        if(kick_q4>limit_q4)kick_q4=limit_q4;
+        if(m->m_position_breakaway_ticks>=MCCONF_STEERING_BREAKAWAY_MAX_MS){
+            m->m_position_motion_seen=1u;
+            m->m_steering_progress_error_mdeg=ae;
+            m->m_position_no_motion_ticks=0u;
+        }
+        m->m_position_prev_error_mdeg=error_mdeg;
+        int32_t out=error_mdeg<0?-kick_q4:kick_q4;
+        if(apply_motor_invert && m->m_conf.m_invert_direction)out=-out;
+        return (int16_t)out;
+    }
+    m->m_position_breakaway_ticks=0u;
+
+    /* Position P -> desired mechanical velocity. Saturation gives TRACK far
+     * away and a linear APPROACH/braking profile near the target. */
+    int64_t vc=(int64_t)error_mdeg*(int32_t)MCCONF_STEERING_POS_TO_VEL_KP;
+    const int32_t vmax=(int32_t)MCCONF_STEERING_VEL_MAX_MDEG_S;
+    if(vc>vmax)vc=vmax;else if(vc<-vmax)vc=-vmax;
+    const int32_t vel_cmd=(int32_t)vc;
+    m->m_steering_velocity_cmd_mdeg_s=vel_cmd;
+    m->m_steering_control_state=ae>approach_mdeg?1u:2u; /* TRACK / APPROACH */
+
+    const int32_t verr=vel_cmd-vel_mdeg_s;
+    int64_t p_q4=(int64_t)verr*(int32_t)MCCONF_STEERING_VEL_KP_NUM;
+    p_q4/=(int32_t)MCCONF_STEERING_VEL_KP_DEN;
+
+    int64_t istep=(int64_t)verr*(int32_t)MCCONF_STEERING_VEL_KI_Q16*(int32_t)dt_ms;
+    int64_t isum=(int64_t)m->m_steering_velocity_i_q16+istep;
+    const int32_t ilim_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
+                           (int32_t)MCCONF_STEERING_VEL_I_LIMIT_MA)/1000;
+    const int64_t ilim_q16=(int64_t)ilim_q4*65536LL;
+    if(isum>ilim_q16)isum=ilim_q16;else if(isum<-ilim_q16)isum=-ilim_q16;
+    m->m_steering_velocity_i_q16=(int32_t)isum;
+    const int32_t i_q4=m->m_steering_velocity_i_q16>>16;
+
+    const int32_t ff_full_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
+                              (int32_t)MCCONF_STEERING_FRICTION_CURRENT_MA)/1000;
+    uint32_t ff_scale=ae<approach_mdeg?ae:approach_mdeg;
+    int32_t ff_mag=approach_mdeg?
+        (int32_t)(((int64_t)ff_full_q4*ff_scale)/(int64_t)approach_mdeg):ff_full_q4;
+    const int32_t ff=vel_cmd>0?ff_mag:(vel_cmd<0?-ff_mag:0);
+    int64_t out64=p_q4+(int64_t)i_q4+(int64_t)ff;
+    const uint32_t current_cap_ma=ae<=approach_mdeg?
+        MCCONF_STEERING_APPROACH_CURRENT_MAX_MA:MCCONF_STEERING_TRACK_CURRENT_MAX_MA;
+    int32_t track_lim=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)current_cap_ma)/1000;
+    if(track_lim>limit_q4)track_lim=limit_q4;
+    if(out64>track_lim)out64=track_lim;else if(out64<-track_lim)out64=-track_lim;
+    int32_t out=(int32_t)out64;
+    if(apply_motor_invert && m->m_conf.m_invert_direction)out=-out;
+    m->m_position_prev_error_mdeg=error_mdeg;
+    return (int16_t)out;
+}
+
+static int16_t steering_cascade_iq_target_step(mcpwm_foc_motor_t *m, bool sensor_hall,
+                                                int32_t error_mdeg, int32_t limit_q4,
+                                                uint32_t dt_ms) {
+    if(!m || m->m_steering_span_counts==0)return 0;
+    if(dt_ms==0u)dt_ms=1u;
+    const int32_t safe_span=steering_runtime_span_from_measured(m->m_steering_span_counts);
+    const int32_t span_abs=safe_span<0?-safe_span:safe_span;
+    if(span_abs==0)return 0;
+
+    /* Edge-timed steering velocity from the active sensor accumulator. For ABI
+     * this is quadrature count motion; for Hall it is accepted Hall-edge motion. */
+    uint32_t vdt=(uint32_t)m->m_steering_velocity_dt_ms+dt_ms;
+    if(vdt>65535u)vdt=65535u;
+    m->m_steering_velocity_dt_ms=(uint16_t)vdt;
+    const int32_t proc_delta=m->m_position_counts-m->m_position_prev_proc_count;
+    if(proc_delta!=0){
+        int64_t inst=(int64_t)proc_delta*60000000LL;
+        inst/=(int64_t)span_abs*(int64_t)(m->m_steering_velocity_dt_ms?m->m_steering_velocity_dt_ms:1u);
+        inst*=position_error_sign(m,false);
+        if(inst>200000)inst=200000;else if(inst<-200000)inst=-200000;
+        const int32_t dv=(int32_t)inst-m->m_steering_velocity_mdeg_s;
+        m->m_steering_velocity_mdeg_s += dv >> MCCONF_STEERING_VEL_FILTER_SHIFT;
+        m->m_position_prev_proc_count=m->m_position_counts;
+        m->m_steering_velocity_dt_ms=0u;
+    }else if(m->m_steering_velocity_dt_ms>=50u){
+        m->m_steering_velocity_mdeg_s=0;
+    }
+
+    /* A Hall count may represent noticeably more steering travel than one ABI
+     * count. Target itself is quantized to that count, so HOLD can still be zero
+     * error; motion detection only needs one accepted Hall edge. */
+    const uint32_t motion_threshold=sensor_hall?1u:MCCONF_STEERING_BREAKAWAY_MOTION_COUNTS;
+    return position_cascade_core_iq_step(m,false,error_mdeg,m->m_steering_velocity_mdeg_s,
+        m->m_position_counts,motion_threshold,limit_q4,dt_ms,
+        MCCONF_STEERING_HOLD_ENTER_MDEG,MCCONF_STEERING_HOLD_EXIT_MDEG,
+        MCCONF_STEERING_APPROACH_MDEG,MCCONF_STEERING_BREAKAWAY_ENTER_MDEG,
+        MCCONF_STEERING_BREAKAWAY_REARM_MDEG,true);
+}
+
+static int16_t hall_phase_cascade_iq_target_step(mcpwm_foc_motor_t *m, bool second,
+                                                  int32_t electrical_error_mdeg,
+                                                  int32_t limit_q4, uint32_t dt_ms) {
+    const int32_t pp=(int32_t)motor_pole_pairs(second);
+    const int32_t div=pp>0?pp:1;
+    /* Standard VESC SET_POS is electrical phase. Convert the shortest phase
+     * error and Hall speed into mechanical units before entering the shared
+     * cascade so LEFT-Hall and RIGHT-Hall use the same physical tuning law. */
+    const int32_t error_mdeg=electrical_error_mdeg/div;
+    const int32_t mech_rpm_q16=measured_mech_rpm_raw_q16(m,second);
+    int64_t vel64=((int64_t)mech_rpm_q16*6000LL)>>16;
+    if(vel64>INT32_MAX)vel64=INT32_MAX;else if(vel64<INT32_MIN)vel64=INT32_MIN;
+    const int32_t vel_mdeg_s=(int32_t)vel64;
+
+    /* One Hall edge is 60 electrical degrees. Expand HOLD and re-arm windows to
+     * sensor resolution so a Hall servo never chases an unobservable sub-sector
+     * angle. Encoder steering keeps the tighter calibrated thresholds above. */
+    const uint32_t sector_mdeg=(uint32_t)(60000/div);
+    uint32_t hold_enter=sector_mdeg/2u;
+    if(hold_enter<MCCONF_STEERING_HOLD_ENTER_MDEG)hold_enter=MCCONF_STEERING_HOLD_ENTER_MDEG;
+    uint32_t hold_exit=sector_mdeg;
+    if(hold_exit<MCCONF_STEERING_HOLD_EXIT_MDEG)hold_exit=MCCONF_STEERING_HOLD_EXIT_MDEG;
+    uint32_t approach=sector_mdeg*2u;
+    if(approach<MCCONF_STEERING_APPROACH_MDEG)approach=MCCONF_STEERING_APPROACH_MDEG;
+    uint32_t break_enter=sector_mdeg/2u;
+    if(break_enter<MCCONF_STEERING_BREAKAWAY_ENTER_MDEG)break_enter=MCCONF_STEERING_BREAKAWAY_ENTER_MDEG;
+    uint32_t break_rearm=sector_mdeg;
+    if(break_rearm<MCCONF_STEERING_BREAKAWAY_REARM_MDEG)break_rearm=MCCONF_STEERING_BREAKAWAY_REARM_MDEG;
+
+    return position_cascade_core_iq_step(m,second,error_mdeg,vel_mdeg_s,
+        m->m_position_counts,1u,limit_q4,dt_ms,hold_enter,hold_exit,approach,
+        break_enter,break_rearm,false);
+}
+
 static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, uint32_t dt_ms) {
     /* Stock COMM_SET_POS remains VESC-compatible in electrical degrees. On
      * this Hall-only hoverboard, direct position->Iq is under-damped because one
@@ -3809,6 +4080,11 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
         const uint16_t pos_now=position_feedback_phase_u16(m,second);
         const int16_t phase_err=(int16_t)(m->m_pos_pid_set_phase-pos_now);
         error_mdeg=(int32_t)(((int64_t)phase_err*360000LL)>>16);
+        const bool hall_phase_mode=m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_HALL &&
+                                   m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_HALL;
+        if(hall_phase_mode){
+            return hall_phase_cascade_iq_target_step(m,second,error_mdeg,limit_q4,dt_ms);
+        }
         error_mdeg*=position_error_sign(m,second);
         const uint16_t gain_scale=position_gain_scale_q15(m,error_mdeg);
         const uint32_t kp_eff=((uint32_t)m->m_kpp_q11*gain_scale+16384u)>>15;
@@ -3883,41 +4159,66 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
     /* Count-position branch. Calibrated LEFT steering uses a slew-limited
      * internal PID target while preserving the final COMM_SET_POS target. */
     const int32_t pp=(int32_t)motor_pole_pairs(second);
-    const bool encoder_count_mode=encoder_port_active(m,second) && m->m_encoder_configured &&
+    const bool encoder_count_mode=encoder_feedback_selected(m,second) && m->m_encoder_configured &&
                                   m->m_encoder_counts>=4u;
-    const bool steering_count_mode=encoder_count_mode && !second && m->m_steering_calibrated;
+    const bool hall_count_mode=m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_HALL &&
+                               m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_HALL;
+    const bool steering_count_mode=!second && m->m_steering_calibrated &&
+                                   (encoder_count_mode || hall_count_mode);
     int32_t pid_target=m->m_position_target_counts;
     m->m_position_pid_target_counts=pid_target;
     m->m_position_target_ramp_q16=q16_from_i32_sat(pid_target);
     int64_t ec64=(int64_t)pid_target-(int64_t)m->m_position_counts;
     if(ec64>32767)ec64=32767; else if(ec64<-32768)ec64=-32768;
     count_error=(int32_t)ec64;
-    if(encoder_count_mode){
-        if(!second && m->m_steering_calibrated && m->m_steering_span_counts!=0){
+    if(encoder_count_mode || hall_count_mode){
+        if(steering_count_mode && m->m_steering_span_counts!=0){
             /* Steering user coordinates are calibrated independently from the
              * motor-shaft ABI CPR. The measured hard-stop span represents the
              * complete -30..+30 degree wheel envelope, so using 4096 CPR here
              * can understate steering error by the gearbox/linkage ratio and
              * leave the position loop below static breakaway torque. The signed
              * span already maps count direction to LEFT/RIGHT user direction. */
-            const int32_t steering_span_abs=m->m_steering_span_counts<0?
-                                            -m->m_steering_span_counts:m->m_steering_span_counts;
+            const int32_t steering_safe_span=steering_runtime_span_from_measured(m->m_steering_span_counts);
+            const int32_t steering_span_abs=steering_safe_span<0?-steering_safe_span:steering_safe_span;
             /* Logical span sign only swaps the VESC 0/360 endpoint labels.
              * Closed-loop torque direction is an electrical/ABI property and
              * must follow foc_encoder_inverted, exactly like generic ABI mode.
              * Otherwise a target toward center can drive farther into a stop. */
             error_mdeg=(count_error*60000)/steering_span_abs;
             error_mdeg*=position_error_sign(m,second);
-        }else{
+        }else if(encoder_count_mode){
             /* Generic ABI position: one custom count is one quadrature count. */
             error_mdeg=(int32_t)(((int64_t)count_error*(int32_t)m->m_encoder_mdeg_per_count_q12)>>12);
             error_mdeg*=position_error_sign(m,second);
+        }else{
+            /* Accepted Hall edge = 60 electrical degrees. Convert to mechanical
+             * degrees so Hall count-position uses the same physical cascade units. */
+            error_mdeg=(int32_t)(((int64_t)count_error*60000LL)/(pp?pp:1));
         }
     }else{
         const int32_t mdeg_per_count=360000/(6*pp);
         error_mdeg=count_error*mdeg_per_count;
     }
     m->m_position_prev_error=(int16_t)count_error;
+    if(steering_count_mode){
+        return steering_cascade_iq_target_step(m,hall_count_mode,error_mdeg,limit_q4,dt_ms);
+    }
+    if(hall_count_mode){
+        const uint32_t sector_mdeg=(uint32_t)(60000/(pp?pp:1));
+        uint32_t hold_enter=sector_mdeg/2u;
+        if(hold_enter<MCCONF_STEERING_HOLD_ENTER_MDEG)hold_enter=MCCONF_STEERING_HOLD_ENTER_MDEG;
+        uint32_t hold_exit=sector_mdeg;
+        if(hold_exit<MCCONF_STEERING_HOLD_EXIT_MDEG)hold_exit=MCCONF_STEERING_HOLD_EXIT_MDEG;
+        uint32_t approach=sector_mdeg*2u;
+        if(approach<MCCONF_STEERING_APPROACH_MDEG)approach=MCCONF_STEERING_APPROACH_MDEG;
+        const int32_t mech_rpm_q16=measured_mech_rpm_raw_q16(m,second);
+        int64_t v64=((int64_t)mech_rpm_q16*6000LL)>>16;
+        if(v64>INT32_MAX)v64=INT32_MAX;else if(v64<INT32_MIN)v64=INT32_MIN;
+        return position_cascade_core_iq_step(m,second,error_mdeg,(int32_t)v64,
+            m->m_position_counts,1u,limit_q4,dt_ms,hold_enter,hold_exit,approach,
+            hold_enter,hold_exit,false);
+    }
     const uint16_t gain_scale=position_gain_scale_q15(m,error_mdeg);
     const uint32_t kp_eff=((uint32_t)m->m_kpp_q11*gain_scale+16384u)>>15;
     const uint32_t ki_eff=((uint32_t)m->m_kip_q16*gain_scale+16384u)>>15;
@@ -4010,65 +4311,11 @@ static int16_t position_pid_iq_target_step(mcpwm_foc_motor_t *m, bool second, ui
     int32_t iq_cmd_q4=position_q15_to_iq_q4(out_q15,pos_lim_q4);
 
     if(encoder_count_mode){
-        if(steering_count_mode){
-            /* Floor-loaded steering needs a finite static-friction breakaway
-             * torque, but keeping that torque near the target causes hunting.
-             * Apply a short current-limited kick only while the calibrated ABI
-             * encoder has not started moving. Once motion is seen, immediately
-             * return authority to the low-gain PID. If it stalls again more than
-             * 1 deg away, one new kick may re-arm after a 150-ms quiet dwell. */
-            const uint32_t ae=(uint32_t)(error_mdeg<0?-(int64_t)error_mdeg:error_mdeg);
-            const int32_t md=m->m_position_counts-m->m_position_last_motion_count;
-            const uint32_t am=(uint32_t)(md<0?-(int64_t)md:md);
-            const uint32_t step_ms=dt_ms?dt_ms:1u;
-
-            if(ae<=MCCONF_STEERING_BREAKAWAY_SETTLE_MDEG){
-                m->m_position_breakaway_ticks=0u;
-                m->m_position_no_motion_ticks=0u;
-                m->m_position_motion_seen=1u;
-                m->m_position_last_motion_count=m->m_position_counts;
-            }else{
-                if(am>=MCCONF_STEERING_BREAKAWAY_MOTION_COUNTS){
-                    m->m_position_last_motion_count=m->m_position_counts;
-                    m->m_position_no_motion_ticks=0u;
-                    if(m->m_position_breakaway_ticks>=MCCONF_STEERING_BREAKAWAY_MIN_MS)
-                        m->m_position_motion_seen=1u;
-                }else if(m->m_position_motion_seen){
-                    uint32_t n=(uint32_t)m->m_position_no_motion_ticks+step_ms;
-                    m->m_position_no_motion_ticks=(uint16_t)(n>65535u?65535u:n);
-                }
-
-                if(!m->m_position_motion_seen && ae>=MCCONF_STEERING_BREAKAWAY_ENTER_MDEG){
-                    uint32_t n=(uint32_t)m->m_position_breakaway_ticks+step_ms;
-                    m->m_position_breakaway_ticks=(uint16_t)(n>65535u?65535u:n);
-                    int32_t kick_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
-                        (int32_t)MCCONF_STEERING_BREAKAWAY_CURRENT_MA)/1000;
-                    /* Breakaway intentionally may use the full configured 12-A motor
-                     * limit; only the steady position PID is restricted by pos_lim_q4. */
-                    if(kick_q4>limit_q4)kick_q4=limit_q4;
-                    if(iq_cmd_q4<0){if(iq_cmd_q4>-kick_q4)iq_cmd_q4=-kick_q4;}
-                    else if(iq_cmd_q4>0){if(iq_cmd_q4<kick_q4)iq_cmd_q4=kick_q4;}
-                    else iq_cmd_q4=error_mdeg<0?-kick_q4:kick_q4;
-                    if(m->m_position_breakaway_ticks>=MCCONF_STEERING_BREAKAWAY_MAX_MS)
-                        m->m_position_motion_seen=1u;
-                }
-
-                if(m->m_position_motion_seen &&
-                   m->m_position_no_motion_ticks>=MCCONF_STEERING_BREAKAWAY_REARM_MS &&
-                   ae>=MCCONF_STEERING_BREAKAWAY_REARM_MDEG){
-                    m->m_position_motion_seen=0u;
-                    m->m_position_breakaway_ticks=0u;
-                    m->m_position_no_motion_ticks=0u;
-                    m->m_position_last_motion_count=m->m_position_counts;
-                }
-            }
-        }else{
-            m->m_position_breakaway_ticks=0u;
-            m->m_position_no_motion_ticks=0u;
-            m->m_position_motion_seen=0u;
-        }
-        if(steering_count_mode && m->m_conf.m_invert_direction)
-            iq_cmd_q4=-iq_cmd_q4;
+        /* Calibrated LEFT steering has already returned through the shared
+         * hybrid cascade above. This branch is generic ABI count-position only. */
+        m->m_position_breakaway_ticks=0u;
+        m->m_position_no_motion_ticks=0u;
+        m->m_position_motion_seen=0u;
         return (int16_t)iq_cmd_q4;
     }
 
@@ -4091,7 +4338,7 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
     int32_t limit_q4=output_limit_q4;
     if(limit_q4<=0 || limit_q4>full_limit_q4)limit_q4=full_limit_q4;
     const int64_t target64=(int64_t)target_erpm_q16;
-    int64_t measured64=(int64_t)measured_mech_rpm_q16(m,second)*pp;
+    int64_t measured64=(int64_t)speed_pid_mech_rpm_q16(m,second)*pp;
     int64_t error64 = target64 - measured64;
     if (error64 > INT32_MAX) error64 = INT32_MAX;
     if (error64 < INT32_MIN) error64 = INT32_MIN;
@@ -4429,6 +4676,9 @@ static void foc_observer_update_diag(mcpwm_foc_motor_t *m, float dt) {
 }
 
 static int32_t motor_erpm_for_decoupling(const mcpwm_foc_motor_t *m, bool second) {
+    /* Upstream VESC current decoupling is deliberately tied to
+     * m_speed_est_fast, not the configurable speed-PID source and not PLL. */
+    if(m->m_speed_est_valid)return m->m_speed_fast_erpm_q16>>16;
     if(m->m_pll_valid)return m->m_pll_erpm_q16>>16;
     int64_t e=(int64_t)measured_mech_rpm_raw_q16(m,second)*(int64_t)motor_pole_pairs(second);
     e>>=16;
@@ -4603,21 +4853,15 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
 
     if(control_update){
         foc_speed_est_update_fixed(m,second,control_update);
-        const bool pll_needed=(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_PLL) ||
-                              (m->m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_DISABLED);
-        if(pll_needed){
-            uint32_t profStart=0u;
-            if(foc_prof_detail_sample)profStart=DWT->CYCCNT;
-            foc_pll_update_fixed(m,second,control_update);
-            if(foc_prof_detail_sample){
-                const uint32_t used=DWT->CYCCNT-profStart;
-                if(used>foc_prof_pll_max_cycles)foc_prof_pll_max_cycles=used;
-            }
-        }else if(m->m_pll_valid){
-            /* Default FAST sensor source does not consume the PLL. Clear stale
-             * state once instead of spending ~300 cycles on every regulator slot. */
-            m->m_pll_valid=0u; m->m_pll_speed_step_q32=0;
-            m->m_pll_erpm_q16=0; m->m_pll_mech_rpm_q16=0;
+        /* Upstream FOC keeps the PLL alive independent of the speed-PID source.
+         * FAST/FASTER are alternate speed-loop feedback only; public RPM,
+         * decoupling and diagnostics continue to have a continuously converged PLL. */
+        uint32_t profStart=0u;
+        if(foc_prof_detail_sample)profStart=DWT->CYCCNT;
+        foc_pll_update_fixed(m,second,control_update);
+        if(foc_prof_detail_sample){
+            const uint32_t used=DWT->CYCCNT-profStart;
+            if(used>foc_prof_pll_max_cycles)foc_prof_pll_max_cycles=used;
         }
     }
     const bool source_enabled = (enable != 0u) || mcpwm_foc_vesc_command_live(second);
@@ -4830,10 +5074,12 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
              * far from target the breakaway current can immediately reach 0.20,
              * while close to target the low-gain position loop naturally asks
              * for less. This also makes post-kick spikes structurally impossible. */
-            const bool steering_position_limited =
-                m->m_control_mode==CONTROL_MODE_POS && !second &&
-                m->m_pos_pid_phase_mode==0u && m->m_steering_calibrated;
-            if(steering_position_limited){
+            const bool hall_position_sensor =
+                m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_HALL &&
+                m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_HALL;
+            const bool position_servo_limited = m->m_control_mode==CONTROL_MODE_POS &&
+                (hall_position_sensor || (!second && m->m_steering_calibrated));
+            if(position_servo_limited){
                 int32_t break_v=((int32_t)MCCONF_STEERING_BREAKAWAY_DUTY_PERMILLE*
                                  (int32_t)MCCONF_FOC_DUTY_VOLTAGE_MAX)/1000;
                 if(break_v<1)break_v=1;
@@ -4997,7 +5243,7 @@ static void motor_telemetry_non_isr(mcpwm_foc_motor_t *m, bool second, uint32_t 
 }
 
 static int32_t relay_speed_erpm_now(const mcpwm_foc_motor_t *m, bool second) {
-    int64_t e=(int64_t)measured_mech_rpm_q16(m,second)*(int64_t)motor_pole_pairs(second);
+    int64_t e=(int64_t)measured_mech_rpm_public_q16(m,second)*(int64_t)motor_pole_pairs(second);
     e>>=16;
     if(e>INT32_MAX)e=INT32_MAX;
     if(e<INT32_MIN)e=INT32_MIN;
@@ -5270,10 +5516,11 @@ static void field_weakening_update_non_isr(mcpwm_foc_motor_t *m,bool second,uint
             m->m_current_off_delay_ms=1000u;
             int32_t maxeff=max0;
             if(m->m_fw_backoff_q15){
-                const int32_t pp=(int32_t)motor_pole_pairs(second);
-                int64_t erpm64=((int64_t)measured_mech_rpm_q16(m,second)*pp)>>16;
+                /* VESC foc_run_fw() uses SIGN(m_speed_est_fast) for backoff.
+                 * Keep this independent from s_pid_speed_source and PLL. */
+                const int32_t erpm_fast=motor_erpm_for_decoupling(m,second);
                 int32_t err=(int32_t)m->m_iq_q4-(int32_t)m->m_iq_target_q4;
-                if(erpm64<0)err=-err;
+                if(erpm_fast<0)err=-err;
                 if(err>0){
                     int32_t frac=(int32_t)(((int64_t)err*m->m_fw_backoff_q15)/max0);
                     if(frac>32768)frac=32768;
@@ -6389,6 +6636,9 @@ uint16_t mcpwm_foc_get_pole_pairs(bool s){return motor_pole_pairs(s);}
 float mcpwm_foc_get_gear_ratio(bool s){return motor_gear_ratio(s);}
 float mcpwm_foc_get_erpm_motor(bool s){
     const mcpwm_foc_motor_t*m=mcpwm_foc_get_motor_const(s);
+    /* Upstream mcpwm_foc_get_rpm() reports the FOC PLL speed. Sensor-derived
+     * speed remains the startup fallback until the PLL has one valid update. */
+    if(m->m_pll_valid)return (float)m->m_pll_erpm_q16/65536.0f;
     if(encoder_feedback_selected(m,s) && m->m_encoder_configured)
         return (float)m->m_encoder_erpm_q16/65536.0f;
     /* One Hall edge is 60 electrical degrees. Derive ERPM directly from edge
@@ -6480,10 +6730,10 @@ mc_state mcpwm_foc_get_state_motor(bool s){return mcpwm_foc_get_motor_const(s)->
 
 typedef struct {
     int16_t rpm,duty,vd,vq;
-    int32_t encoder_erpm_q16,tachometer;
+    int32_t pll_erpm_q16,encoder_erpm_q16,tachometer;
     uint32_t tachometer_abs;
     uint16_t phase,encoder_mech_phase,hall_period,hall_ticks,bridge_settle_ticks;
-    uint8_t hall_initialized,encoder_configured,driven_offset_valid,driven_offset_calibrating;
+    uint8_t pll_valid,hall_initialized,encoder_configured,driven_offset_valid,driven_offset_calibrating;
     int8_t hall_direction;
     mc_control_mode control_mode;
     mc_fault_code fault;
@@ -6497,6 +6747,7 @@ static void foc_telem_isr_snapshot(const mcpwm_foc_motor_t *m, foc_telem_isr_sna
         mcpwm_foc_get_irq_epoch(&e0,&x0);
         if(e0!=x0)continue;
         o->rpm=m->m_rpm; o->duty=m->m_duty_now_permille; o->vd=m->m_vd; o->vq=m->m_vq;
+        o->pll_erpm_q16=m->m_pll_erpm_q16; o->pll_valid=m->m_pll_valid;
         o->encoder_erpm_q16=m->m_encoder_erpm_q16; o->encoder_configured=m->m_encoder_configured;
         o->tachometer=m->m_tachometer; o->tachometer_abs=m->m_tachometer_abs;
         o->phase=m->m_phase; o->encoder_mech_phase=m->m_encoder_mech_phase;
@@ -6570,7 +6821,8 @@ void mcpwm_foc_get_values_scaled(mcpwm_foc_values_scaled_t *v,bool second){
         v->current_motor_x100=(im*100)/q4pa;
     }
     v->duty_x1000=is.duty;
-    if(encoder_feedback_selected(m,second)&&is.encoder_configured)v->erpm=is.encoder_erpm_q16/65536;
+    if(is.pll_valid)v->erpm=is.pll_erpm_q16/65536;
+    else if(encoder_feedback_selected(m,second)&&is.encoder_configured)v->erpm=is.encoder_erpm_q16/65536;
     else if(is.hall_initialized&&is.hall_direction!=0&&is.hall_period>0u&&is.hall_period<MCCONF_HALL_TIMEOUT_TICKS&&is.hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS)
         v->erpm=((int32_t)PWM_FREQ*10/(int32_t)is.hall_period)*(int32_t)hall_motion_direction(second,is.hall_direction);
     else v->erpm=(int32_t)is.rpm*(int32_t)motor_pole_pairs(second);
@@ -6630,7 +6882,9 @@ void mcpwm_foc_get_values(mc_values *v,bool second){
         if(ibus_counts>0)im=-im;
         v->current_motor=(float)im/(float)FOC_CURRENT_Q4_PER_A;
     }
-    if(encoder_feedback_selected(m,second) && is.encoder_configured)
+    if(is.pll_valid)
+        v->rpm=(float)is.pll_erpm_q16/65536.0f;
+    else if(encoder_feedback_selected(m,second) && is.encoder_configured)
         v->rpm=(float)is.encoder_erpm_q16/65536.0f;
     else if(is.hall_initialized && is.hall_direction!=0 && is.hall_period>0u && is.hall_period<MCCONF_HALL_TIMEOUT_TICKS && is.hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS)
         v->rpm=((float)PWM_FREQ*10.0f/(float)is.hall_period)*(float)hall_motion_direction(second,is.hall_direction);

@@ -3365,7 +3365,14 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(sub,"invert")&&ac>2){float x=0.0f;if(!terminal_float(a[2],&x)||(x!=0.0f&&x!=1.0f)){terminal_send_text("ERR steering invert 0|1\n");return;}terminal_send_text(mc_interface_set_steering_logical_inverted(x>0.5f)?"OK steering logical mapping saved\n":"ERR steering invert requires valid span\n");return;}
         terminal_send_text("ERR steering status|center|zero|reset|invert 0|1\n");return;
     }
-    if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb dec=%u speed_src=%u\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){
+        snprintf(o,sizeof(o),"CONFIG sensor=%u/%u inv=%u poles=%u gear_milli=%ld I_mA=%ld/%ld Iin_mA=%ld/%ld erpm=%ld/%ld R_uOhm=%lu L_nH=%lu flux_nWb=%lu dec=%u speed_src=%u\n",
+            (unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,
+            (long)(cc->si_gear_ratio*1000.0f),(long)(cc->l_current_min*1000.0f),(long)(cc->l_current_max*1000.0f),
+            (long)(cc->l_in_current_min*1000.0f),(long)(cc->l_in_current_max*1000.0f),(long)cc->l_min_erpm,(long)cc->l_max_erpm,
+            (unsigned long)(cc->foc_motor_r*1000000.0f+0.5f),(unsigned long)(cc->foc_motor_l*1000000000.0f+0.5f),
+            (unsigned long)(cc->foc_motor_flux_linkage*1000000000.0f+0.5f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);
+        terminal_send_text(o);return;}
     if(!strcmp(a[0],"speed_est")){
         const int32_t pp=(int32_t)(mcpwm_foc_get_pole_pairs(second)?mcpwm_foc_get_pole_pairs(second):1u);
         snprintf(o,sizeof(o),"SPEED_EST id=%u src=%u valid=%u pll_valid=%u raw_erpm=%ld pll_erpm=%ld fast_erpm=%ld faster_erpm=%ld pid_erpm=%ld\n",
@@ -3377,7 +3384,15 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
                    m->m_speed_fast_erpm_q16/65536));
         terminal_send_text(o);return;
     }
-    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"tuning")){
+        snprintf(o,sizeof(o),"TUNING cur_kp_u=%ld cur_ki_m=%ld speed_kp_u=%ld speed_ki_u=%ld speed_kd_u=%ld speed_kdf_q16=%u min_erpm=%ld ramp_erpm_s=%ld src=%u pos_kp_u=%ld pos_ki_u=%ld pos_kd_u=%ld pos_kdproc_u=%ld pos_kdf_q16=%u angdiv_m=%ld gaindec_mdeg=%ld offset_mdeg=%ld\n",
+            (long)(cc->foc_current_kp*1000000.0f),(long)(cc->foc_current_ki*1000.0f),
+            (long)(cc->s_pid_kp*1000000.0f),(long)(cc->s_pid_ki*1000000.0f),(long)(cc->s_pid_kd*1000000.0f),
+            (unsigned)(cc->s_pid_kd_filter*65535.0f+0.5f),(long)cc->s_pid_min_erpm,(long)cc->s_pid_ramp_erpms_s,(unsigned)cc->s_pid_speed_source,
+            (long)(cc->p_pid_kp*1000000.0f),(long)(cc->p_pid_ki*1000000.0f),(long)(cc->p_pid_kd*1000000.0f),(long)(cc->p_pid_kd_proc*1000000.0f),
+            (unsigned)(cc->p_pid_kd_filter*65535.0f+0.5f),(long)(cc->p_pid_ang_div*1000.0f),
+            (long)(cc->p_pid_gain_dec_angle*1000.0f),(long)(cc->p_pid_offset*1000.0f));
+        terminal_send_text(o);return;}
     if(!strcmp(a[0],"perf")){
         if(ac>1&&!strcmp(a[1],"reset")){
             foc_isr_cycles_max=0u; foc_isr_deadline_miss_count=0u;
@@ -3720,10 +3735,18 @@ static void process_command(const uint8_t *p, uint16_t len, bool second) {
          * Never allow a drive/joystick session to turn a malformed or stale
          * packet into a mechanical hard-stop sweep. */
         const mcpwm_foc_motor_t *drive=mcpwm_foc_get_motor_const(true);
-        float drive_erpm=mcpwm_foc_get_erpm_motor(true);
-        if(drive_erpm<0.0f)drive_erpm=-drive_erpm;
+        /* Commissioning interlock must use authoritative RIGHT Hall motion, not
+         * the PLL display value which can remain valid/stale after release. RIGHT
+         * is Hall-only on this board, so an expired/no-edge Hall estimator means
+         * true zero speed for this mechanical-safety gate. */
+        uint32_t drive_erpm=0u;
+        if(drive && drive->m_hall_initialized && drive->m_hall_direction!=0 &&
+           drive->m_hall_period>0u && drive->m_hall_period<MCCONF_HALL_TIMEOUT_TICKS &&
+           drive->m_hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS){
+            drive_erpm=((uint32_t)PWM_FREQ*10u)/(uint32_t)drive->m_hall_period;
+        }
         const bool drive_busy=(drive && drive->m_control_mode!=CONTROL_MODE_NONE) ||
-                              drive_erpm>(float)MCCONF_FAULT_RECOVERY_SAFE_ERPM;
+                              drive_erpm>(uint32_t)MCCONF_FAULT_RECOVERY_SAFE_ERPM;
         if(second || drive_busy){
             uint8_t reply[10]; int32_t ri=0; reply[ri++]=COMM_DETECT_ENCODER;
             buffer_append_float32(reply,1001.0f,1e6f,&ri);
