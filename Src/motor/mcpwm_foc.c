@@ -1912,10 +1912,10 @@ void mcpwm_foc_set_duty(float duty, bool second) {
     int32_t dpm=(int32_t)(duty>=0.0f?duty*1000.0f+0.5f:duty*1000.0f-0.5f);
     const int32_t lim=m->m_duty_limit_permille>0?m->m_duty_limit_permille:1000;
     dpm=CLAMP(dpm,-lim,lim);
-    /* VESC-style zero command: release the bridge instead of holding a
-     * continuously switched zero vector. Low-side shunt current is not reliably
-     * observable in that artificial driven-zero state on this board. */
-    if(dpm==0){mcpwm_foc_release_motor(second);return;}
+    /* Normal zero command keeps a centered switching vector for current sensing.
+     * Safety releases still use mcpwm_foc_release_motor() and force high-Z. */
+    if(dpm==0){mcpwm_foc_enter_standby(second);return;}
+    m->m_standby_sense=0u;
     set_control_mode(m, CONTROL_MODE_DUTY);
     m->m_duty_set_permille=(int16_t)dpm;
 }
@@ -1933,11 +1933,10 @@ void mcpwm_foc_set_pid_speed(float erpm, bool second) {
     m->m_speed_target_rpm = mech_rpm;
     m->m_speed_target_rpm_q16 = new_target_q16;
     if (m->m_speed_target_rpm_q16 != 0 || m->m_control_mode == CONTROL_MODE_SPEED) {
+        if(m->m_speed_target_rpm_q16!=0)m->m_standby_sense=0u;
         speed_mode_enter(m);
     } else {
-        /* Zero ERPM while not already in a speed ramp is a released standby,
-         * matching VESC's low-current/off behavior. */
-        mcpwm_foc_release_motor(second);
+        mcpwm_foc_enter_standby(second);
     }
 }
 void mcpwm_foc_set_pid_pos(float position_deg,bool second){
@@ -1961,6 +1960,7 @@ void mcpwm_foc_set_pid_pos(float position_deg,bool second){
     const bool branch_change=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode==0u);
     const int16_t target_delta=(int16_t)(new_phase-m->m_pos_pid_set_phase);
     const bool target_changed=(target_delta>64 || target_delta<-64);
+    m->m_standby_sense=0u;
     set_control_mode(m,CONTROL_MODE_POS);
     if(target_changed && !branch_change){
         m->m_position_breakaway_ticks=0u;m->m_position_no_motion_ticks=0u;m->m_position_motion_seen=0u;
@@ -1978,6 +1978,7 @@ void mcpwm_foc_set_position_counts(int32_t pc,bool second){
     const bool count_mode_active=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode==0u);
     const bool branch_change=(m->m_control_mode==CONTROL_MODE_POS && m->m_pos_pid_phase_mode!=0u);
     const bool target_changed=(pc!=m->m_position_target_counts);
+    m->m_standby_sense=0u;
     set_control_mode(m,CONTROL_MODE_POS);
     if(!count_mode_active || branch_change){
         m->m_position_target_ramp_q16=(int64_t)m->m_position_counts * 65536LL;
@@ -2158,11 +2159,10 @@ void mcpwm_foc_reset_position(bool second) {
 void mcpwm_foc_set_current(float current, bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     const float min_i=(m->m_conf.cc_min_current>0.0f)?m->m_conf.cc_min_current:MCCONF_CC_MIN_CURRENT;
-    /* Upstream VESC does not re-arm PWM for a current request below
-     * cc_min_current. For this low-side-shunt board an explicit zero command is
-     * therefore a released/high-impedance standby, where the separately learned
-     * OFF baseline is the physically meaningful current reference. */
-    if (current < min_i && current > -min_i) { mcpwm_foc_release_motor(second); return; }
+    /* Extend VESC release semantics for this telemetry-focused controller:
+     * zero current becomes sensing standby, not high-Z. */
+    if (current < min_i && current > -min_i) { mcpwm_foc_enter_standby(second); return; }
+    m->m_standby_sense=0u;
     set_control_mode(m, CONTROL_MODE_CURRENT);
     m->m_iq_target_q4=amp_to_q4(m,current);
     m->m_iq_set_q4=m->m_iq_target_q4;
@@ -2172,8 +2172,9 @@ void mcpwm_foc_set_current(float current, bool second) {
 static void mcpwm_foc_set_brake_current_q4(int16_t current_q4, bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     int32_t q=current_q4; if(q<0)q=-q;
-    if(q==0){mcpwm_foc_release_motor(second);return;}
+    if(q==0){mcpwm_foc_enter_standby(second);return;}
     if(q>MCCONF_MOTOR_CURRENT_MAX_Q4)q=MCCONF_MOTOR_CURRENT_MAX_Q4;
+    m->m_standby_sense=0u;
     set_control_mode(m,CONTROL_MODE_CURRENT_BRAKE);
     m->m_brake_current_q4=(int16_t)q;
     m->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0; m->m_id_set_q4=0;
@@ -2181,13 +2182,14 @@ static void mcpwm_foc_set_brake_current_q4(int16_t current_q4, bool second) {
 void mcpwm_foc_set_brake_current(float current, bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     const float min_i=(m->m_conf.cc_min_current>0.0f)?m->m_conf.cc_min_current:MCCONF_CC_MIN_CURRENT;
-    if (current < min_i && current > -min_i) { mcpwm_foc_release_motor(second); return; }
+    if (current < min_i && current > -min_i) { mcpwm_foc_enter_standby(second); return; }
     mcpwm_foc_set_brake_current_q4(amp_to_q4(m,current<0?-current:current),second);
 }
 void mcpwm_foc_set_handbrake(float current, bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     const float min_i=(m->m_conf.cc_min_current>0.0f)?m->m_conf.cc_min_current:MCCONF_CC_MIN_CURRENT;
-    if (current < min_i && current > -min_i) { mcpwm_foc_release_motor(second); return; }
+    if (current < min_i && current > -min_i) { mcpwm_foc_enter_standby(second); return; }
+    m->m_standby_sense=0u;
     set_control_mode(m, CONTROL_MODE_HANDBRAKE);
     m->m_handbrake_current_q4=amp_to_q4(m,current<0?-current:current);
     if(m->m_handbrake_current_q4<0)m->m_handbrake_current_q4=(int16_t)-m->m_handbrake_current_q4;
@@ -2197,11 +2199,11 @@ void mcpwm_foc_set_handbrake(float current, bool second) {
     m->m_id_set_q4=0;
 }
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool second) {
-    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second); set_control_mode(m, CONTROL_MODE_OPENLOOP);
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second); m->m_standby_sense=0u; set_control_mode(m, CONTROL_MODE_OPENLOOP);
     m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0; m->m_id_set_q4=0; m->m_iq_target_q4=amp_to_q4(m,current); m->m_iq_set_q4=m->m_iq_target_q4; m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536; m->m_openloop_speed_q16=(int32_t)(rpm*65536.0f); m->m_phase_override=1;
 }
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
-    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second); set_control_mode(m, CONTROL_MODE_OPENLOOP_PHASE);
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second); m->m_standby_sense=0u; set_control_mode(m, CONTROL_MODE_OPENLOOP_PHASE);
     m->m_openloop_id_target_q4=amp_to_q4(m,current);
     m->m_openloop_id_ramp_q16=(int32_t)m->m_openloop_id_target_q4*65536;
     m->m_id_set_q4=m->m_openloop_id_target_q4;
@@ -2576,8 +2578,41 @@ void mcpwm_foc_force_bridges_off(void){
     RIGHT_TIM->BDTR&=~TIM_BDTR_MOE;
 }
 
+void mcpwm_foc_enter_standby(bool second) {
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    /* User STOP is a sensing standby, not a safety release. Keep FOC modulation
+     * alive with Id*=Iq*=0 so the phase shunts remain observable while a spinning
+     * rotor still produces BEMF. This mirrors upstream release_motor(): preserve
+     * the active inner-current state across RUN->CURRENT(0) for a bumpless stop.
+     * Fault/E-stop/watchdog paths still hard-release MOE immediately. */
+    if (m->m_fault!=FAULT_CODE_NONE || s_estop_ticks!=0u || m->m_config_update_active) {
+        mcpwm_foc_release_motor(second);
+        return;
+    }
+    const bool was_running=(m->m_control_mode!=CONTROL_MODE_NONE && m->m_state==MC_STATE_RUNNING);
+    if (was_running) {
+        /* Do not call set_control_mode() here: that helper resets Id/Iq PI state.
+         * VESC release_motor() switches to CURRENT(0) without resetting the inner
+         * controller, which preserves the voltage needed to counter rotor BEMF. */
+        m->m_control_mode=CONTROL_MODE_CURRENT;
+        m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0;
+        m->m_speed_d_filter_q4=0; reset_position_pid(m);
+        m->m_duty_i_q15=0; m->m_duty_pi_active=0u;
+        m->m_brake_vq_prev=0; m->m_brake_speed_dir_prev=0; m->m_brake_zero_duty_samples=0u;
+    } else {
+        set_control_mode(m, CONTROL_MODE_CURRENT);
+    }
+    m->m_standby_sense=1u;
+    m->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;
+    m->m_id_set_q4=0; m->m_openloop_id_target_q4=0; m->m_openloop_id_ramp_q16=0;
+    m->m_duty_set_permille=0;
+    m->m_speed_target_rpm=0; m->m_speed_target_rpm_q16=0;
+    m->m_speed_set_rpm=0; m->m_speed_set_ramp_q16=0;
+}
+
 void mcpwm_foc_release_motor(bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    m->m_standby_sense=0u;
     /* Fail-safe ordering: hardware output off FIRST. If the ADC ISR pre-empts
      * any of the software-state cleanup below, it cannot generate torque. */
     if (second) {
@@ -2698,10 +2733,11 @@ void mcpwm_foc_set_mode_command(uint8_t mode, int16_t command, bool run_request,
                 m->m_iq_target_q4 = 0;
                 m->m_id_set_q4 = 0;
                 if (m->m_iq_set_q4 == 0 && m->m_iq_set_ramp_q16 == 0) {
-                    mcpwm_foc_release_motor(second);
+                    mcpwm_foc_enter_standby(second);
                 }
             }
         } else {
+            m->m_standby_sense=0u;
             set_control_mode(m, CONTROL_MODE_CURRENT);
             m->m_iq_target_q4 = trq_ca_to_q4(m, command);
             m->m_id_set_q4 = 0;
@@ -4464,9 +4500,22 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
 
     foc_dq_t v={m->m_vd,m->m_vq};
     m->m_state=MC_STATE_RUNNING;
+    /* STOP-SENSE is adaptive. At significant BEMF keep the normal zero-current
+     * FOC regulator alive; once the wheel is slow/current is quiet, use an exact
+     * centered vector to keep the shunts observable with minimal CPU load. */
+    const uint32_t standby_fast_period=(uint32_t)PWM_FREQ*10u/600u; /* 600 eRPM */
+    const bool standby_fast_hall=m->m_hall_initialized && m->m_hall_direction!=0 &&
+        m->m_hall_period>0u && m->m_hall_period<standby_fast_period &&
+        m->m_hall_ticks<=MCCONF_HALL_TIMEOUT_TICKS;
+    const int32_t standby_iq_thresh=(int32_t)FOC_CURRENT_Q4_PER_A/5; /* 0.2 A */
+    const bool standby_current_hot=ABS((int32_t)m->m_id_q4)>standby_iq_thresh ||
+                                   ABS((int32_t)m->m_iq_q4)>standby_iq_thresh;
+    const bool standby_voltage_hot=ABS((int32_t)m->m_duty_now_permille)>60;
+    const bool standby_regulate=!m->m_standby_sense || standby_fast_hall ||
+                                 standby_current_hot || standby_voltage_hot;
     uint32_t profRegulatorStart=0u;
     if(foc_prof_detail_sample && control_update)profRegulatorStart=DWT->CYCCNT;
-        if (control_update) {
+        if (control_update && standby_regulate) {
             /* Plant-identification capture for Detect All. m_vd is the voltage
              * held over the interval that produced the current delta below.
              * Accumulate sufficient statistics only; no float/division in ISR. */
@@ -4604,6 +4653,13 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
              * one-frame duty spike above COMM_SET_DUTY. */
             foc_vector_limit(&v,vector_limit);
             if(foc_prof_detail_sample){const uint32_t used=DWT->CYCCNT-profRegulatorStart;if(used>foc_prof_regulator_max_cycles)foc_prof_regulator_max_cycles=used;}
+        } else if (control_update && m->m_standby_sense) {
+            /* Low-BEMF STOP: measurement remains live, but there is no reason to
+             * spend a full Id/Iq PI update or chase a few ADC counts of noise. */
+            m->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;
+            m->m_id_set_q4=0;
+            reset_current_pi(m);
+            v.d=0; v.q=0;
         }
     m->m_vd=v.d; m->m_vq=v.q;
     uint32_t profSvpwmStart=0u;
@@ -4663,15 +4719,14 @@ static void motor_telemetry_non_isr(mcpwm_foc_motor_t *m, bool second, uint32_t 
         m->m_telem_current_lpf_q16[2]=0;
     }
     const uint16_t a=m->m_telem_current_filter_q16?m->m_telem_current_filter_q16:6553u;
-    /* Jalankan virtual sample sebanyak cadence regulator yang berlalu agar
-     * time-constant konfigurasi foc_current_filter_const tetap setara. */
-    while(virtual_steps--){
-        m->m_id_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[0],a,td);
-        m->m_iq_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[1],a,tq);
-        m->m_current_in_telem_counts=telemetry_lpf_step(&m->m_telem_current_lpf_q16[2],a,ti);
-        /* GET_VALUES accumulation is fed by real regulator samples in ISR.
-         * This slow filter remains monitoring-only (observer/slow diagnostics). */
-    }
+    /* GET_VALUES is already accumulated from every REAL regulator sample in ISR.
+     * This secondary LPF only feeds slow diagnostics/observer, so one update per
+     * housekeeping call is sufficient. Repeating one stale snapshot N times made
+     * a delayed main loop even slower and could create a self-reinforcing gap. */
+    (void)virtual_steps;
+    m->m_id_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[0],a,td);
+    m->m_iq_telem_q4=telemetry_lpf_step(&m->m_telem_current_lpf_q16[1],a,tq);
+    m->m_current_in_telem_counts=telemetry_lpf_step(&m->m_telem_current_lpf_q16[2],a,ti);
 }
 
 static int32_t relay_speed_erpm_now(const mcpwm_foc_motor_t *m, bool second) {
@@ -5082,8 +5137,11 @@ void mcpwm_foc_housekeeping_non_isr(uint32_t now_ms) {
     }
 
     const float dt=(float)elapsed*0.001f;
-    foc_observer_update_diag(&m_motor_1,dt);
-    foc_observer_update_diag(&m_motor_2,dt);
+    /* Hall/encoder phase is authoritative for this build. The Ortega observer is
+     * diagnostic only, so skip its floating-point update in STOP-SENSE to keep
+     * protocol/main-loop latency low while both current loops remain active. */
+    if(!m_motor_1.m_standby_sense)foc_observer_update_diag(&m_motor_1,dt);
+    if(!m_motor_2.m_standby_sense)foc_observer_update_diag(&m_motor_2,dt);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_DUTY)
         m_motor_1.m_duty_now_permille=duty_permille_from_vdq(m_motor_1.m_vd,m_motor_1.m_vq);
     if(m_motor_2.m_control_mode!=CONTROL_MODE_DUTY)
@@ -6115,8 +6173,11 @@ void mcpwm_foc_get_values_scaled(mcpwm_foc_values_scaled_t *v,bool second){
          * whose sign is SIGN(i_bus) and magnitude is i_abs_filter. Our DC-link
          * shunt is the HW_HAS_INPUT_CURRENT_SENSOR equivalent; ibus_counts has
          * opposite polarity to the public current_in value. */
+        /* Upstream SIGN(i_bus): -1 only when negative, +1 when zero or positive.
+         * ibus_counts has opposite polarity to public Ibat, therefore only a
+         * positive raw count marks regen/negative motor current. Never erase
+         * the D/Q magnitude just because the DC shunt quantizes to zero. */
         if(ibus_counts>0)im=-im;
-        else if(ibus_counts==0)im=0;
         v->current_motor_x100=(im*100)/q4pa;
     }
     v->duty_x1000=is.duty;
@@ -6178,7 +6239,6 @@ void mcpwm_foc_get_values(mc_values *v,bool second){
         v->id=q4_to_amp(id_q4); v->iq=q4_to_amp(iq_q4);
         int32_t im=(int32_t)imotor_q4;
         if(ibus_counts>0)im=-im;
-        else if(ibus_counts==0)im=0;
         v->current_motor=(float)im/(float)FOC_CURRENT_Q4_PER_A;
     }
     if(encoder_feedback_selected(m,second) && is.encoder_configured)

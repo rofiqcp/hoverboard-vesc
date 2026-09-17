@@ -17,8 +17,11 @@ typedef struct {
     mc_configuration m_conf;
     volatile mc_state m_state;
     volatile mc_control_mode m_control_mode;
-    /* Normal STOP/zero-current state: bridge remains driven at exact centered
-     * zero vector, but current PI is bypassed so ADC noise is never chased. */
+    /* Normal user STOP / zero-command sensing standby. Unlike a safety release,
+     * FOC remains powered with Id*=Iq*=0 so phase-current sensing stays valid
+     * during rotor coast. The current PI can generate Vd/Vq to cancel BEMF; once
+     * stationary its zero-current equilibrium returns close to centered PWM. */
+    volatile uint8_t m_standby_sense;
     volatile mc_fault_code m_fault;
     /* Main-context MC config publication can span many float/cache calculations.
      * While this flag is set the ADC ISR must never read the partially published
@@ -453,6 +456,9 @@ void mcpwm_foc_set_brake_current(float current, bool is_second_motor);
 void mcpwm_foc_set_handbrake(float current, bool is_second_motor);
 void mcpwm_foc_set_openloop_current(float current, float rpm, bool is_second_motor);
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool is_second_motor);
+/* User STOP/zero command: keep zero-vector PWM and current sensing alive while
+ * the VESC command link is healthy. Fault/E-stop/watchdog still use hard release. */
+void mcpwm_foc_enter_standby(bool is_second_motor);
 bool mcpwm_foc_encoder_startup_align(bool is_second_motor);
 bool mcpwm_foc_encoder_is_synced(bool is_second_motor);
 bool mcpwm_foc_encoder_detect(float current, bool is_second_motor, float *offset, float *ratio, bool *inverted);
