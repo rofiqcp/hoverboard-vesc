@@ -143,3 +143,39 @@ After testing, temporary FW parameters were restored in RAM to the safe/non-acti
 Priority-1 Flux Weakening runtime implementation is functionally verified on LEFT and RIGHT independently and simultaneously at conservative dual-load conditions. The key VESC behavior is present: duty-triggered FW request, ramped negative Id injection, Q-current sharing, current-circle limiting, backoff, and decay to zero outside the active region. Default FW remains disabled until explicitly configured.
 
 Remaining follow-up is performance qualification of the dual 6000-ERPM speed-loop plus aggressive realtime polling, which is separate from the demonstrated correctness of the FW current-control path.
+
+## Addendum: Dual 6000 ERPM + Realtime Stress Qualification
+The earlier note that dual 6000-ERPM telemetry was not fully qualified is superseded by this addendum. The bottleneck was traced to dual closed-loop Hall/held-SVPWM work being executed for both motors on every 16-kHz ADC frame, not to the FW algorithm or UART bandwidth.
+
+Runtime scheduling was optimized while preserving the control contracts:
+- ADC/DC-link protection remains 16 kHz.
+- LEFT current PI remains PWM/6 = 2.667 kHz on slot 0.
+- RIGHT current PI remains PWM/6 = 2.667 kHz on slot 1.
+- Closed-loop Hall phase + held-SVPWM updates are staggered at 8 kHz per motor.
+- Hall period/rate math keeps the original 16-kHz timebase through elapsed-PWM-tick compensation.
+- Full Hall edge/history processing runs only on a debounced Hall-state transition; unchanged sectors use the same interpolation/rate-limit stage directly.
+- OPENLOOP/commissioning paths retain full-frame service.
+
+After optimization, dual 6000-ERPM speed control with FW enabled (`1.0 A`, duty start `0.55`, ramp `0.5 s`, q factor `0.05`, backoff `0.2`) was tested simultaneously with VESC Tool-style RT traffic for 8 seconds:
+- LEFT GET_VALUES: `400/400`, `50.01 Hz`
+- RIGHT GET_VALUES: `400/400`, `49.99 Hz`
+- PPM: `160/160`, `20.00 Hz`
+- ADC: `160/160`, `20.01 Hz`
+- CHUK: `160/160`, `20.01 Hz`
+- Parser/validation errors: `0`
+- RX queue drop: `0`
+- TX queue drop: `0`
+- TX start failure: `0`
+- Fault LEFT/RIGHT: `0 / 0`
+- Current trip LEFT/RIGHT: `0 / 0`
+- Maximum protocol process gap: `5 ms`
+
+Steady high-speed samples at the end of the stress test remained physically coherent:
+- LEFT: `ERPM 6153`, duty `0.778`, Imotor `0.46 A`, Ibat `0.44 A`, Id `-0.42 A`, Iq `0.16 A`, fault `0`.
+- RIGHT: `ERPM 6153`, duty `0.750`, Imotor `0.47 A`, Ibat `0.28 A`, Id `-0.45 A`, Iq `0.13 A`, fault `0`.
+
+Compared with the clean pre-optimization stress run, protocol responsiveness improved from `process_gap_max_ms = 135 ms` with `4/40` GET_VALUES poll failures to `5 ms` with zero missing replies in the full 50/20-Hz stress test.
+
+Profiler caveat: peak current-control slots still exceed the nominal 4000-cycle 16-kHz frame budget (`slot0 ≈ 4948`, `slot1 ≈ 5599` maximum in this run), so `deadline_miss` remains non-zero. The staggered scheduler makes the other slots approximately `3130..3220` cycles, providing sufficient CPU recovery margin for deterministic communications. This report therefore qualifies the observed dual-6000 control and VESC realtime workload, but does not claim zero ISR deadline misses.
+
+Final result for this addendum: `DUAL_6000_FW_RT50_APP20_PASS`.

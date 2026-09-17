@@ -3063,7 +3063,97 @@ static uint8_t hall_sample_state(mcpwm_foc_motor_t *m, bool second) {
     return m->m_hall_state;
 }
 
-static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
+static void hall_phase_update_from_state(mcpwm_foc_motor_t *m, uint8_t angle, bool valid, uint8_t elapsed_pwm_ticks) {
+    if(elapsed_pwm_ticks==0u)elapsed_pwm_ticks=1u;
+    if (!valid || !m->m_hall_initialized || m->m_hall_ticks > MCCONF_HALL_TIMEOUT_TICKS ||
+        !m->m_hall_period || m->m_hall_direction == 0) {
+        m->m_rpm = 0;
+    }
+
+    /* VESC uses electrical RPM and max(time since edge,last edge period), not
+     * mechanical RPM hysteresis. Compare ticks against a precomputed boundary
+     * to avoid integer division in the 16-kHz ISR. This also disables
+     * interpolation naturally when the wheel slows/stops between Hall edges. */
+    if (m->m_hall_direction != 0 && m->m_hall_period > 0u &&
+        m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS) {
+        uint16_t hall_age=m->m_hall_ticks;
+        if(hall_age<m->m_hall_period)hall_age=m->m_hall_period;
+        m->m_hall_interp_active=(uint8_t)(m->m_hall_interp_erpm==0u ||
+                                         hall_age<=m->m_hall_interp_max_ticks);
+    } else {
+        m->m_hall_interp_active=0u;
+    }
+
+    uint16_t desired = m->m_phase_hall;
+    if (valid) {
+        /* If this debounced code was rejected as a non-adjacent transition,
+         * m_hall_pos_prev deliberately remains the previous accepted center.
+         * Never let the rejected code leak into the Hall phase estimator. */
+        const uint8_t phase_angle=(m->m_hall_initialized && angle!=m->m_hall_pos_prev) ?
+                                  m->m_hall_pos_prev : angle;
+        if (m->m_hall_interp_active && m->m_hall_direction != 0 &&
+            m->m_hall_period > 0u && m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS) {
+            const uint16_t edge_phase = hall_angle200_to_phase(m->m_hall_pos);
+            uint32_t ticks = m->m_hall_ticks;
+            if (ticks > m->m_hall_period) ticks = m->m_hall_period;
+            const uint32_t frac = (uint32_t)((ticks * m->m_hall_interp_step_q16) >> 16);
+            const uint32_t phase_delay_ticks=(uint32_t)MCCONF_HALL_PHASE_ADVANCE_TICKS+
+                                             (uint32_t)m->m_hall_filter_delay_ticks;
+            const uint32_t debounce_adv=(uint32_t)((phase_delay_ticks * m->m_hall_interp_step_q16) >> 16);
+            const uint32_t phase_frac=frac+debounce_adv;
+            const uint16_t interp_phase = (uint16_t)(m->m_hall_direction > 0 ?
+                                         (uint32_t)edge_phase + phase_frac :
+                                         (uint32_t)edge_phase - phase_frac);
+            const uint16_t center_phase = hall_angle200_to_phase(phase_angle);
+            const int16_t interp_center_err = phase_diff_u16(interp_phase, center_phase);
+            const int16_t max_interp_err = (int16_t)(65536u / 12u); /* 30 deg */
+            const int16_t abs_interp_err = interp_center_err < 0 ?
+                                           (int16_t)-interp_center_err : interp_center_err;
+
+            const bool err_same_direction=
+                (interp_center_err>0 && m->m_hall_direction>0) ||
+                (interp_center_err<0 && m->m_hall_direction<0);
+            if (abs_interp_err < max_interp_err || !err_same_direction) {
+                /* foc_correct_hall VESC: interpolate when error is <30 deg OR
+                 * its sign differs from Hall speed. The second condition is
+                 * essential after acceleration/reversal: an estimator that is
+                 * behind the new center must be allowed to catch up instead of
+                 * being pulled backwards by the 1%% correction branch. */
+                desired = interp_phase;
+            } else {
+                /* Jika tabel Hall tidak seragam atau akselerasi membuat
+                 * interpolator terlalu jauh, VESC menarik estimator ke center
+                 * sebesar error/100 setiap ISR, bukan membiarkannya drift. */
+                const int16_t center_error = phase_diff_u16(center_phase, m->m_phase_hall_target);
+                int16_t correction = (int16_t)(center_error / 100);
+                if (correction == 0 && center_error != 0) correction = center_error > 0 ? 1 : -1;
+                desired = (uint16_t)(m->m_phase_hall_target + correction);
+            }
+        } else {
+            /* At low speed use the calibrated Hall-sector center directly,
+             * just like foc_correct_hall() in VESC 6.00. */
+            desired = hall_angle200_to_phase(phase_angle);
+        }
+    }
+    m->m_phase_hall_target = desired;
+
+    /* VESC rate-limits corrected Hall phase to avoid current spikes when a
+     * Hall edge or noisy sample moves the target abruptly. The actual Hall
+     * sector rate is the primary limit; retain a small minimum around the
+     * interpolation-on threshold so low-speed center corrections stay smooth. */
+    uint32_t max_step=m->m_hall_rate_limit_step;
+    if(max_step==0u)max_step=1u;
+    max_step*=elapsed_pwm_ticks;
+    if(max_step>32767u)max_step=32767u;
+    const int16_t pd = phase_diff_u16(desired, m->m_phase_hall);
+    if (pd > (int16_t)max_step) m->m_phase_hall = (uint16_t)(m->m_phase_hall + (uint16_t)max_step);
+    else if (pd < -(int16_t)max_step) m->m_phase_hall = (uint16_t)(m->m_phase_hall - (uint16_t)max_step);
+    else m->m_phase_hall = desired;
+
+}
+
+static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h, uint8_t elapsed_pwm_ticks) {
+    if(elapsed_pwm_ticks==0u)elapsed_pwm_ticks=1u;
     const uint8_t angle = hall_table_angle(m, h);
     const bool valid = (h != 0u && h != 7u && angle < 200u);
     /* m_hall_ticks is aged once per 16-kHz ADC frame by hall_update() or the
@@ -3255,111 +3345,27 @@ static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
         }
     }
 
-    if (!valid || !m->m_hall_initialized || m->m_hall_ticks > MCCONF_HALL_TIMEOUT_TICKS ||
-        !m->m_hall_period || m->m_hall_direction == 0) {
-        m->m_rpm = 0;
-    }
-
-    /* VESC uses electrical RPM and max(time since edge,last edge period), not
-     * mechanical RPM hysteresis. Compare ticks against a precomputed boundary
-     * to avoid integer division in the 16-kHz ISR. This also disables
-     * interpolation naturally when the wheel slows/stops between Hall edges. */
-    if (m->m_hall_direction != 0 && m->m_hall_period > 0u &&
-        m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS) {
-        uint16_t hall_age=m->m_hall_ticks;
-        if(hall_age<m->m_hall_period)hall_age=m->m_hall_period;
-        m->m_hall_interp_active=(uint8_t)(m->m_hall_interp_erpm==0u ||
-                                         hall_age<=m->m_hall_interp_max_ticks);
-    } else {
-        m->m_hall_interp_active=0u;
-    }
-
-    uint16_t desired = m->m_phase_hall;
-    if (valid) {
-        /* If this debounced code was rejected as a non-adjacent transition,
-         * m_hall_pos_prev deliberately remains the previous accepted center.
-         * Never let the rejected code leak into the Hall phase estimator. */
-        const uint8_t phase_angle=(m->m_hall_initialized && angle!=m->m_hall_pos_prev) ?
-                                  m->m_hall_pos_prev : angle;
-        if (m->m_hall_interp_active && m->m_hall_direction != 0 &&
-            m->m_hall_period > 0u && m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS) {
-            const uint16_t edge_phase = hall_angle200_to_phase(m->m_hall_pos);
-            uint32_t ticks = m->m_hall_ticks;
-            if (ticks > m->m_hall_period) ticks = m->m_hall_period;
-            const uint32_t frac = (uint32_t)((ticks * m->m_hall_interp_step_q16) >> 16);
-            const uint32_t phase_delay_ticks=(uint32_t)MCCONF_HALL_PHASE_ADVANCE_TICKS+
-                                             (uint32_t)m->m_hall_filter_delay_ticks;
-            const uint32_t debounce_adv=(uint32_t)((phase_delay_ticks * m->m_hall_interp_step_q16) >> 16);
-            const uint32_t phase_frac=frac+debounce_adv;
-            const uint16_t interp_phase = (uint16_t)(m->m_hall_direction > 0 ?
-                                         (uint32_t)edge_phase + phase_frac :
-                                         (uint32_t)edge_phase - phase_frac);
-            const uint16_t center_phase = hall_angle200_to_phase(phase_angle);
-            const int16_t interp_center_err = phase_diff_u16(interp_phase, center_phase);
-            const int16_t max_interp_err = (int16_t)(65536u / 12u); /* 30 deg */
-            const int16_t abs_interp_err = interp_center_err < 0 ?
-                                           (int16_t)-interp_center_err : interp_center_err;
-
-            const bool err_same_direction=
-                (interp_center_err>0 && m->m_hall_direction>0) ||
-                (interp_center_err<0 && m->m_hall_direction<0);
-            if (abs_interp_err < max_interp_err || !err_same_direction) {
-                /* foc_correct_hall VESC: interpolate when error is <30 deg OR
-                 * its sign differs from Hall speed. The second condition is
-                 * essential after acceleration/reversal: an estimator that is
-                 * behind the new center must be allowed to catch up instead of
-                 * being pulled backwards by the 1%% correction branch. */
-                desired = interp_phase;
-            } else {
-                /* Jika tabel Hall tidak seragam atau akselerasi membuat
-                 * interpolator terlalu jauh, VESC menarik estimator ke center
-                 * sebesar error/100 setiap ISR, bukan membiarkannya drift. */
-                const int16_t center_error = phase_diff_u16(center_phase, m->m_phase_hall_target);
-                int16_t correction = (int16_t)(center_error / 100);
-                if (correction == 0 && center_error != 0) correction = center_error > 0 ? 1 : -1;
-                desired = (uint16_t)(m->m_phase_hall_target + correction);
-            }
-        } else {
-            /* At low speed use the calibrated Hall-sector center directly,
-             * just like foc_correct_hall() in VESC 6.00. */
-            desired = hall_angle200_to_phase(phase_angle);
-        }
-    }
-    m->m_phase_hall_target = desired;
-
-    /* VESC rate-limits corrected Hall phase to avoid current spikes when a
-     * Hall edge or noisy sample moves the target abruptly. The actual Hall
-     * sector rate is the primary limit; retain a small minimum around the
-     * interpolation-on threshold so low-speed center corrections stay smooth. */
-    uint32_t max_step=m->m_hall_rate_limit_step;
-    if(max_step==0u)max_step=1u;
-    const int16_t pd = phase_diff_u16(desired, m->m_phase_hall);
-    if (pd > (int16_t)max_step) m->m_phase_hall = (uint16_t)(m->m_phase_hall + (uint16_t)max_step);
-    else if (pd < -(int16_t)max_step) m->m_phase_hall = (uint16_t)(m->m_phase_hall - (uint16_t)max_step);
-    else m->m_phase_hall = desired;
+    hall_phase_update_from_state(m, angle, valid, elapsed_pwm_ticks);
 }
 
-static void hall_update(mcpwm_foc_motor_t *m, bool second, bool control_update) {
-    if (m->m_hall_ticks < 0xffffu) m->m_hall_ticks++;
+static void hall_update(mcpwm_foc_motor_t *m, bool second, uint8_t elapsed_pwm_ticks) {
+    if(elapsed_pwm_ticks==0u)elapsed_pwm_ticks=1u;
+    {
+        uint32_t ticks=(uint32_t)m->m_hall_ticks+(uint32_t)elapsed_pwm_ticks;
+        m->m_hall_ticks=(uint16_t)(ticks>0xffffu?0xffffu:ticks);
+    }
     const uint8_t before = m->m_hall_state;
     const uint8_t h = hall_sample_state(m, second);
-    /* GPIO/debounce remains 16 kHz. Full interpolation/correction is required
-     * immediately on an accepted edge, otherwise only at this motor's regulator
-     * cadence. This preserves edge timing/safety while freeing CPU for VESC IO. */
-    if (!m->m_hall_initialized || h != before || control_update) {
-        hall_process_state(m, second, h);
+    /* Full edge/history work is only needed when the debounced Hall state changes.
+     * Between edges, run the exact same interpolation/rate-limit stage directly.
+     * This preserves VESC Hall phase math while avoiding period/history/reject
+     * branches on every current-control tick. */
+    if (!m->m_hall_initialized || h != before) {
+        hall_process_state(m, second, h, elapsed_pwm_ticks);
     } else {
-        /* The heavy target estimator is decimated, but the VESC Hall phase rate
-         * limiter itself must still run every PWM frame. Otherwise phase_hall
-         * advances only 1/control_div as fast, lags the sector target by tens of
-         * electrical degrees, and torque collapses at speed. This fast path is
-         * only a signed compare/add and keeps Park/SVPWM phase at 16 kHz. */
-        uint32_t max_step=m->m_hall_rate_limit_step;
-        if(max_step==0u)max_step=1u;
-        const int16_t pd=phase_diff_u16(m->m_phase_hall_target,m->m_phase_hall);
-        if(pd>(int16_t)max_step)m->m_phase_hall=(uint16_t)(m->m_phase_hall+(uint16_t)max_step);
-        else if(pd<-(int16_t)max_step)m->m_phase_hall=(uint16_t)(m->m_phase_hall-(uint16_t)max_step);
-        else m->m_phase_hall=m->m_phase_hall_target;
+        const uint8_t angle=hall_table_angle(m,h);
+        const bool valid=(h!=0u && h!=7u && angle<200u);
+        hall_phase_update_from_state(m,angle,valid,elapsed_pwm_ticks);
     }
 }
 
@@ -4272,7 +4278,9 @@ static void current_decoupling_apply(mcpwm_foc_motor_t *m, bool second, foc_dq_t
 }
 
 static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_counts,
-                               int16_t i1_counts, int16_t idc_counts, bool control_update) {
+                               int16_t i1_counts, int16_t idc_counts, bool control_update,
+                               uint8_t elapsed_pwm_ticks) {
+    if(elapsed_pwm_ticks==0u)elapsed_pwm_ticks=1u;
     if(m->m_config_update_active){
         /* Configuration is being rebuilt in main context. Never inspect m_conf
          * while its struct copy/caches can be partial; output remains centered
@@ -4306,17 +4314,20 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
          * heavier edge estimator only when the debounced sector actually changes.
          * Between edges only age the last period so passive/manual-spin telemetry
          * remains real without paying closed-loop interpolation cost at 16 kHz. */
-        if(m->m_hall_ticks<0xffffu)m->m_hall_ticks++;
+        {
+            uint32_t ticks=(uint32_t)m->m_hall_ticks+(uint32_t)elapsed_pwm_ticks;
+            m->m_hall_ticks=(uint16_t)(ticks>0xffffu?0xffffu:ticks);
+        }
         const uint8_t before=m->m_hall_state;
         const uint8_t hs=hall_sample_state(m,second);
         if(!m->m_hall_initialized || hs!=before){
-            hall_process_state(m,second,hs);
+            hall_process_state(m,second,hs,elapsed_pwm_ticks);
         }else{
             if(m->m_hall_ticks>MCCONF_HALL_TIMEOUT_TICKS){
                 m->m_rpm=0; m->m_hall_direction=0; m->m_hall_interp_active=0u;
             }
         }
-    } else hall_update(m, second, control_update);
+    } else hall_update(m, second, elapsed_pwm_ticks);
     if (m->m_control_mode==CONTROL_MODE_OPENLOOP) {
         openloop_update(m);
     } else if (m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) {
@@ -5301,23 +5312,41 @@ void mcpwm_foc_adc_int_handler(void) {
             }
         }
     }
+    /* Dual-motor closed-loop staggering: keep each current regulator at PWM/6
+     * (2.667 kHz), but update Hall phase + held SVPWM at 8 kHz on alternating
+     * slots. Raw ADC/DC protection above remains 16 kHz. OPENLOOP commissioning
+     * retains full-frame service because its phase ramp/detect timing is defined
+     * in PWM ticks. */
+    const bool left_full_frame=(m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||
+                                m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
+    const bool right_full_frame=(m_motor_2.m_control_mode==CONTROL_MODE_OPENLOOP ||
+                                 m_motor_2.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
+    const bool run_left=left_full_frame || update_left || control_slot==2u || control_slot==4u;
+    const bool run_right=right_full_frame || update_right || control_slot==3u || control_slot==5u;
+    const uint8_t left_elapsed=left_full_frame?1u:2u;
+    const uint8_t right_elapsed=right_full_frame?1u:2u;
+
     uint32_t profMotorStart=0u;
-    if(foc_prof_detail_sample)profMotorStart=DWT->CYCCNT;
-    motor_control_step(&m_motor_1,false,curL_phaA,curL_phaB,curL_DC,update_left);
-    if(foc_prof_detail_sample){
-        const uint32_t used=DWT->CYCCNT-profMotorStart;
-        if(used>foc_prof_motor_step_max_cycles[0])foc_prof_motor_step_max_cycles[0]=used;
-        volatile uint32_t *const dst=update_left?&foc_prof_motor_control_max_cycles[0]:&foc_prof_motor_hold_max_cycles[0];
-        if(used>*dst)*dst=used;
+    if(run_left){
+        if(foc_prof_detail_sample)profMotorStart=DWT->CYCCNT;
+        motor_control_step(&m_motor_1,false,curL_phaA,curL_phaB,curL_DC,update_left,left_elapsed);
+        if(foc_prof_detail_sample){
+            const uint32_t used=DWT->CYCCNT-profMotorStart;
+            if(used>foc_prof_motor_step_max_cycles[0])foc_prof_motor_step_max_cycles[0]=used;
+            volatile uint32_t *const dst=update_left?&foc_prof_motor_control_max_cycles[0]:&foc_prof_motor_hold_max_cycles[0];
+            if(used>*dst)*dst=used;
+        }
     }
     if(update_left)foc_motor_heartbeat[0]++;
-    if(foc_prof_detail_sample)profMotorStart=DWT->CYCCNT;
-    motor_control_step(&m_motor_2,true,curR_phaB,curR_phaC,curR_DC,update_right);
-    if(foc_prof_detail_sample){
-        const uint32_t used=DWT->CYCCNT-profMotorStart;
-        if(used>foc_prof_motor_step_max_cycles[1])foc_prof_motor_step_max_cycles[1]=used;
-        volatile uint32_t *const dst=update_right?&foc_prof_motor_control_max_cycles[1]:&foc_prof_motor_hold_max_cycles[1];
-        if(used>*dst)*dst=used;
+    if(run_right){
+        if(foc_prof_detail_sample)profMotorStart=DWT->CYCCNT;
+        motor_control_step(&m_motor_2,true,curR_phaB,curR_phaC,curR_DC,update_right,right_elapsed);
+        if(foc_prof_detail_sample){
+            const uint32_t used=DWT->CYCCNT-profMotorStart;
+            if(used>foc_prof_motor_step_max_cycles[1])foc_prof_motor_step_max_cycles[1]=used;
+            volatile uint32_t *const dst=update_right?&foc_prof_motor_control_max_cycles[1]:&foc_prof_motor_hold_max_cycles[1];
+            if(used>*dst)*dst=used;
+        }
     }
     if(update_right)foc_motor_heartbeat[1]++;
     /* During a synchronized step, capture only after powered-offset settling;
