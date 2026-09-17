@@ -3234,7 +3234,7 @@ static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)
 
 static void terminal_help(void){
     terminal_send_text("Commands:\nREAD help fw status values model encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all|hard] | release [all]\n");
-    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V | fw_current A | fw_duty 0..1 | fw_ramp S | fw_q 0..1 | fw_backoff 0..10. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
+    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST|2FASTER | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V | fw_current A | fw_duty 0..1 | fw_ramp S | fw_q 0..1 | fw_backoff 0..10. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
     terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
 
@@ -3375,13 +3375,19 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         terminal_send_text(o);return;}
     if(!strcmp(a[0],"speed_est")){
         const int32_t pp=(int32_t)(mcpwm_foc_get_pole_pairs(second)?mcpwm_foc_get_pole_pairs(second):1u);
-        snprintf(o,sizeof(o),"SPEED_EST id=%u src=%u valid=%u pll_valid=%u raw_erpm=%ld pll_erpm=%ld fast_erpm=%ld faster_erpm=%ld pid_erpm=%ld\n",
+        const bool enc_raw=!second && m->m_encoder_configured &&
+            (m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER || m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB);
+        const int32_t raw_erpm=enc_raw?(m->m_encoder_erpm_q16/65536):(int32_t)((int64_t)m->m_rpm*pp);
+        int32_t pid_erpm=raw_erpm;
+        if(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_PLL && m->m_pll_valid)pid_erpm=m->m_pll_erpm_q16/65536;
+        else if(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_FAST && m->m_speed_est_valid)pid_erpm=m->m_speed_fast_erpm_q16/65536;
+        else if(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_FASTER && m->m_speed_est_valid)pid_erpm=m->m_speed_faster_erpm_q16/65536;
+        const int32_t dir=m->m_conf.m_invert_direction?-1:1;
+        const int32_t vesc_public_erpm=dir*(int32_t)mcpwm_foc_get_erpm_motor(second);
+        snprintf(o,sizeof(o),"SPEED_EST id=%u src=%u valid=%u pll_valid=%u raw_internal=%ld vesc_erpm=%ld pll_internal=%ld fast_internal=%ld faster_internal=%ld pid_internal=%ld\n",
             second?2u:1u,(unsigned)m->m_conf.s_pid_speed_source,(unsigned)m->m_speed_est_valid,(unsigned)m->m_pll_valid,
-            (long)((int64_t)m->m_rpm*pp),(long)(m->m_pll_erpm_q16/65536),
-            (long)(m->m_speed_fast_erpm_q16/65536),(long)(m->m_speed_faster_erpm_q16/65536),
-            (long)(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_PLL?m->m_pll_erpm_q16/65536:
-                   m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_FASTER?m->m_speed_faster_erpm_q16/65536:
-                   m->m_speed_fast_erpm_q16/65536));
+            (long)raw_erpm,(long)vesc_public_erpm,(long)(m->m_pll_erpm_q16/65536),
+            (long)(m->m_speed_fast_erpm_q16/65536),(long)(m->m_speed_faster_erpm_q16/65536),(long)pid_erpm);
         terminal_send_text(o);return;
     }
     if(!strcmp(a[0],"tuning")){
@@ -3464,6 +3470,11 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(!strcmp(a[1],"openloop")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&fabsf(x)<=I_MOT_MAX&&fabsf(y)<=MCCONF_L_MAX_ERPM){touch_motor(second);mc_interface_set_openloop_current(x,y);goto setok;}
         if(!strcmp(a[1],"input_current")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&x<=-0.1f&&x>=-I_DC_MAX&&y>=0.1f&&y<=I_DC_MAX){mc_configuration c=*cc;c.l_in_current_min=x;c.l_in_current_max=y;mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}
         if(!strcmp(a[1],"erpm_limit")&&ac>3&&terminal_float(a[2],&x)&&terminal_float(a[3],&y)&&x<0&&y>0&&x>=MCCONF_L_MIN_ERPM&&y<=MCCONF_L_MAX_ERPM){mc_configuration c=*cc;c.l_min_erpm=x;c.l_max_erpm=y;mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}
+        if(!strcmp(a[1],"speed_src")&&terminal_float(a[2],&x)){
+            int src=(int)x;
+            if(x!=(float)src||src<0||src>2||!mcpwm_foc_set_speed_pid_source((S_PID_SPEED_SRC)src,second))goto setbad;
+            terminal_send_text("OK RAM hot speed source; save mcconf\n");return;
+        }
         {mc_configuration c=*cc;int r=terminal_cfg_one(&c,second,a[1],a[2]);if(r==1){mc_interface_release_motor();mc_interface_set_configuration(&c);terminal_send_text("OK RAM; save mcconf\n");return;}if(r<0)goto setbad;}
 setbad: terminal_send_text("ERR set value/syntax; type help\n");return;
 setok: terminal_send_text("OK set\n");return;
