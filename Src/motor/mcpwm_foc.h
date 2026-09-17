@@ -40,6 +40,15 @@ typedef struct {
     volatile int16_t m_iq_set_q4;       /* slewed/active Iq reference */
     volatile int16_t m_iq_target_q4;    /* requested Iq reference */
     volatile int16_t m_id_set_q4;
+    /* VESC field-weakening state. m_i_fw_set_q4 is a positive magnitude;
+     * the closed-loop D-axis target is -m_i_fw_set_q4. Coefficients are
+     * precomputed outside the ISR from standard foc_fw_* MC configuration. */
+    volatile int16_t m_i_fw_set_q4;
+    int16_t m_fw_current_max_q4;
+    uint16_t m_fw_duty_start_permille;
+    uint16_t m_fw_q_current_factor_q15;
+    uint32_t m_fw_backoff_q15;
+    uint32_t m_fw_ramp_time_ms;
     volatile int16_t m_speed_set_rpm;       /* active/slewed mechanical RPM */
     volatile int16_t m_speed_target_rpm;    /* requested mechanical RPM, integer view */
     volatile int32_t m_speed_target_rpm_q16; /* authoritative requested mechanical RPM Q16 */

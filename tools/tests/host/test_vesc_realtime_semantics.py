@@ -21,7 +21,7 @@ assert 'selective ? COMM_GET_VALUES_SELECTIVE : COMM_GET_VALUES' in vp
 # GET_VALUES VESC semantics: OFF D/Q/Imotor zero, Ibat independent; RUN Imotor sign from Ibus.
 scaled=mc[mc.index('void mcpwm_foc_get_values_scaled'):mc.index('void mcpwm_foc_get_values(',mc.index('void mcpwm_foc_get_values_scaled'))]
 assert 'v->current_motor_x100=0;' in scaled and 'v->id_x100=0;' in scaled and 'v->iq_x100=0;' in scaled
-assert 'if(ibus_counts>0)im=-im;' in scaled and 'else if(ibus_counts==0)im=0;' in scaled
+assert 'if(ibus_counts>0)im=-im;' in scaled and 'else if(ibus_counts==0)im=0;' not in scaled
 assert 'pqi' not in scaled
 # Duty-now must come from actual limited D/Q vector, never command echo.
 assert re.search(r'm->m_duty_now_permille\s*=\s*duty_permille_from_vdq\(m->m_vd,m->m_vq\);', mc)

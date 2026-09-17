@@ -563,7 +563,7 @@ static int16_t current_circle_iq_limit_q4(const mcpwm_foc_motor_t *m, int16_t iq
         }
     }
     if (lim < 1) lim=1;
-    int32_t id = m ? m->m_id_q4 : 0;
+    int32_t id = m ? m->m_id_set_q4 : 0;
     if (id < 0) id = -id;
     if (id >= lim) return 0;
     const uint32_t lim2 = (uint32_t)(lim * lim);
@@ -758,11 +758,6 @@ static void f103_mcconf_canonicalize_unsupported(mc_configuration *c) {
     c->foc_phase_filter_disable_fault=true;
     c->foc_phase_filter_max_erpm=0.0f;
     c->foc_mtpa_mode=MTPA_MODE_OFF;
-    c->foc_fw_current_max=0.0f;
-    c->foc_fw_duty_start=1.0f;
-    c->foc_fw_ramp_time=0.0f;
-    c->foc_fw_q_current_factor=0.0f;
-    c->foc_fw_backoff=0.0f;
     c->foc_speed_soure=FOC_SPEED_SRC_CORRECTED;
     c->sp_pid_loop_rate=PID_RATE_1000_HZ;
     c->m_motor_temp_sens_type=TEMP_SENSOR_DISABLED;
@@ -781,6 +776,11 @@ static void f103_mcconf_canonicalize_unsupported(mc_configuration *c) {
 static void conf_defaults(mc_configuration *c, bool second) {
     memset(c, 0, sizeof(*c));
     f103_mcconf_canonicalize_unsupported(c);
+    c->foc_fw_current_max=0.0f;
+    c->foc_fw_duty_start=0.8f;
+    c->foc_fw_ramp_time=0.0f;
+    c->foc_fw_q_current_factor=0.05f;
+    c->foc_fw_backoff=2.0f;
     c->motor_type = MOTOR_TYPE_FOC;
     c->sensor_mode = SENSOR_MODE_SENSORED;
     /* Project hardware is mixed-sensor: LEFT steering uses the ABI encoder
@@ -1098,6 +1098,8 @@ static int32_t position_error_sign(const mcpwm_foc_motor_t *m, bool second) {
             m->m_conf.foc_encoder_inverted) ? -1 : 1;
 }
 
+static int16_t field_weakening_apply_iq_q4(const mcpwm_foc_motor_t *m,int16_t iq);
+
 static void current_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
     if(!m)return;
     /* Legacy/custom integer tuning fields remain wire-compatible, but their
@@ -1116,6 +1118,31 @@ static void current_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
     m->m_current_kpd_err_q8=(uint32_t)(((uint64_t)m->m_current_kpd_v_q16*8u+12u)/25u);
     m->m_current_kiq_err_q8=(uint32_t)(((uint64_t)m->m_current_kiq_dt_v_q16*8u+12u)/25u);
     m->m_current_kid_err_q8=(uint32_t)(((uint64_t)m->m_current_kid_dt_v_q16*8u+12u)/25u);
+}
+
+static void field_weakening_recompute_coeff(mcpwm_foc_motor_t *m) {
+    if(!m)return;
+    float imax=m->m_conf.foc_fw_current_max;
+    if(!isfinite(imax) || imax<0.0f)imax=0.0f;
+    m->m_fw_current_max_q4=(int16_t)CLAMP((int32_t)(imax*(float)FOC_CURRENT_Q4_PER_A+0.5f),0,MCCONF_MOTOR_CURRENT_MAX_Q4);
+    float ds=m->m_conf.foc_fw_duty_start;
+    if(!isfinite(ds))ds=1.0f;
+    if(ds<0.0f)ds=0.0f;
+    if(ds>1.0f)ds=1.0f;
+    const int32_t dmax=m->m_duty_limit_permille>0?m->m_duty_limit_permille:1000;
+    m->m_fw_duty_start_permille=(uint16_t)CLAMP((int32_t)(ds*(float)dmax+0.5f),0,dmax);
+    float rt=m->m_conf.foc_fw_ramp_time;
+    if(!isfinite(rt) || rt<0.0f)rt=0.0f;
+    m->m_fw_ramp_time_ms=(uint32_t)CLAMP((int64_t)(rt*1000.0f+0.5f),0,600000);
+    float qf=m->m_conf.foc_fw_q_current_factor;
+    if(!isfinite(qf) || qf<0.0f)qf=0.0f;
+    if(qf>1.0f)qf=1.0f;
+    m->m_fw_q_current_factor_q15=(uint16_t)(qf*32768.0f+0.5f);
+    float bo=m->m_conf.foc_fw_backoff;
+    if(!isfinite(bo) || bo<0.0f)bo=0.0f;
+    if(bo>10.0f)bo=10.0f;
+    m->m_fw_backoff_q15=(uint32_t)(bo*32768.0f+0.5f);
+    if(m->m_fw_current_max_q4<m->m_cc_min_current_q4)m->m_i_fw_set_q4=0;
 }
 
 static void speed_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
@@ -1419,6 +1446,7 @@ static void motor_reset(mcpwm_foc_motor_t *m, bool second) {
     m->m_voltage_limit_counts=(int16_t)CLAMP(((int32_t)m->m_duty_limit_permille*(int32_t)MCCONF_FOC_DUTY_VOLTAGE_MAX)/1000,1,MCCONF_FOC_DUTY_VOLTAGE_MAX);
     m->m_duty_start_permille=(int16_t)(MCCONF_L_MAX_DUTY*MCCONF_L_DUTY_START*1000.0f+0.5f);
     m->m_cc_min_current_q4=(int16_t)(MCCONF_CC_MIN_CURRENT*FOC_CURRENT_Q4_PER_A+0.5f);
+    field_weakening_recompute_coeff(m);
     m->m_duty_end_current_q4=(int16_t)(MCCONF_CC_MIN_CURRENT*5.0f*FOC_CURRENT_Q4_PER_A+0.5f);
     m->m_speed_kd_filter_q16=(uint16_t)(MCCONF_SPEED_KD_FILTER_DEFAULT*65535.0f+0.5f);
     m->m_telem_current_filter_q16=(uint16_t)(MCCONF_FOC_TELEMETRY_FILTER_DEFAULT*65535.0f+0.5f);
@@ -1557,6 +1585,13 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
         next.s_pid_speed_source=S_PID_SPEED_SRC_FAST;
     if((uint8_t)next.foc_cc_decoupling>(uint8_t)FOC_CC_DECOUPLING_CROSS_BEMF)
         next.foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
+    /* VESC 6.00 field-weakening configuration is supported at runtime.
+     * Keep current_max=0 as the fail-safe disabled default. */
+    if(!isfinite(next.foc_fw_current_max) || next.foc_fw_current_max<0.0f || next.foc_fw_current_max>I_MOT_MAX) next.foc_fw_current_max=0.0f;
+    if(!isfinite(next.foc_fw_duty_start) || next.foc_fw_duty_start<0.0f || next.foc_fw_duty_start>1.0f) next.foc_fw_duty_start=0.8f;
+    if(!isfinite(next.foc_fw_ramp_time) || next.foc_fw_ramp_time<0.0f || next.foc_fw_ramp_time>60.0f) next.foc_fw_ramp_time=0.0f;
+    if(!isfinite(next.foc_fw_q_current_factor) || next.foc_fw_q_current_factor<0.0f || next.foc_fw_q_current_factor>1.0f) next.foc_fw_q_current_factor=0.05f;
+    if(!isfinite(next.foc_fw_backoff) || next.foc_fw_backoff<0.0f || next.foc_fw_backoff>10.0f) next.foc_fw_backoff=2.0f;
     {
         const bool l_ok=isfinite(next.foc_motor_l)&&next.foc_motor_l>0.000001f&&next.foc_motor_l<=0.1f;
         const bool flux_ok=isfinite(next.foc_motor_flux_linkage)&&next.foc_motor_flux_linkage>0.000001f&&next.foc_motor_flux_linkage<=1.0f;
@@ -1750,6 +1785,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     m->m_voltage_limit_counts=(int16_t)CLAMP(((int32_t)m->m_duty_limit_permille*(int32_t)MCCONF_FOC_DUTY_VOLTAGE_MAX)/1000,1,MCCONF_FOC_DUTY_VOLTAGE_MAX);
     m->m_duty_start_permille=(int16_t)CLAMP((int32_t)(next.l_max_duty*next.l_duty_start*1000.0f+0.5f),0,m->m_duty_limit_permille);
     m->m_cc_min_current_q4=(int16_t)CLAMP((int32_t)(next.cc_min_current*FOC_CURRENT_Q4_PER_A+0.5f),1,MCCONF_MOTOR_CURRENT_MAX_Q4);
+    field_weakening_recompute_coeff(m);
     m->m_duty_end_current_q4=(int16_t)CLAMP((int32_t)(next.cc_min_current*5.0f*FOC_CURRENT_Q4_PER_A+0.5f),1,MCCONF_MOTOR_CURRENT_MAX_Q4);
     m->m_speed_kd_filter_q16=(uint16_t)CLAMP((int32_t)(next.s_pid_kd_filter*65535.0f+0.5f),0,65535);
     {
@@ -1768,6 +1804,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
 void mcpwm_foc_sync_tuning_to_conf(bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
     current_pid_recompute_coeff(m);
+    field_weakening_recompute_coeff(m);
     speed_pid_recompute_coeff(m);
     position_pid_recompute_coeff(m);
     m->m_conf.foc_current_kp=(float)m->m_kpq_q11/1536.0f;
@@ -1792,6 +1829,7 @@ void mcpwm_foc_apply_tuning_from_conf(bool second) {
     m->m_kip_q16=(uint16_t)CLAMP((int32_t)(m->m_conf.p_pid_ki*1000.0f+0.5f),0,65535);
     m->m_kdp_q11=(uint16_t)CLAMP((int32_t)(m->m_conf.p_pid_kd*1000.0f+0.5f),0,65535);
     current_pid_recompute_coeff(m);
+    field_weakening_recompute_coeff(m);
     speed_pid_recompute_coeff(m);
     position_pid_recompute_coeff(m);
 }
@@ -2643,6 +2681,7 @@ void mcpwm_foc_release_motor(bool second) {
     m->m_id_telem_q4=0; m->m_iq_telem_q4=0; m->m_current_in_telem_counts=0;
     m->m_telem_sum_id_q4=0; m->m_telem_sum_iq_q4=0; m->m_telem_sum_imotor_q4=0; m->m_telem_sum_ibus_counts=0; m->m_telem_avg_samples=0u;
     m->m_iq_set_q4=0; m->m_iq_target_q4=0; m->m_iq_set_ramp_q16=0;
+    m->m_i_fw_set_q4=0;
     m->m_duty_set_permille=0;
     m->m_id_set_q4=0; m->m_openloop_id_target_q4=0;
     m->m_openloop_id_ramp_q16=0;
@@ -4554,9 +4593,11 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                 m->m_voltage_limit_counts:(int16_t)MCCONF_FOC_DUTY_VOLTAGE_MAX;
             int16_t vector_limit=v_closed;
 
-            m->m_id_set_q4 = (m->m_control_mode==CONTROL_MODE_OPENLOOP ||
-                              m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE) ?
-                              m->m_id_set_q4 : 0;
+            if(m->m_control_mode!=CONTROL_MODE_OPENLOOP &&
+               m->m_control_mode!=CONTROL_MODE_OPENLOOP_PHASE){
+                /* Upstream VESC applies field weakening as negative D current. */
+                m->m_id_set_q4=(int16_t)-m->m_i_fw_set_q4;
+            }
             const int16_t ed=(int16_t)CLAMP((int32_t)m->m_id_set_q4-m->m_id_q4,-32768,32767);
             uint32_t profStageStart=0u;
             if(foc_prof_detail_sample)profStageStart=DWT->CYCCNT;
@@ -4583,6 +4624,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                 m->m_iq_set_q4=m->m_iq_target_q4;
                 m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
                 if(foc_prof_detail_sample)profStageStart=DWT->CYCCNT;
+                m->m_iq_set_q4=field_weakening_apply_iq_q4(m,m->m_iq_set_q4);
                 m->m_iq_set_q4=current_circle_iq_limit_q4(m,m->m_iq_set_q4);
                 if(foc_prof_detail_sample){const uint32_t used=DWT->CYCCNT-profStageStart;if(used>foc_prof_current_circle_max_cycles)foc_prof_current_circle_max_cycles=used;}
                 const int16_t eq=(int16_t)CLAMP((int32_t)m->m_iq_set_q4-m->m_iq_q4,-32768,32767);
@@ -4630,6 +4672,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
                     m->m_iq_set_ramp_q16=0;
                 }
                 if(foc_prof_detail_sample)profStageStart=DWT->CYCCNT;
+                m->m_iq_set_q4=field_weakening_apply_iq_q4(m,m->m_iq_set_q4);
                 m->m_iq_set_q4=current_circle_iq_limit_q4(m,m->m_iq_set_q4);
                 if(foc_prof_detail_sample){const uint32_t used=DWT->CYCCNT-profStageStart;if(used>foc_prof_current_circle_max_cycles)foc_prof_current_circle_max_cycles=used;}
                 const int16_t eq=(int16_t)CLAMP((int32_t)m->m_iq_set_q4-m->m_iq_q4,-32768,32767);
@@ -4918,6 +4961,55 @@ void mcpwm_foc_relay_get(mcpwm_foc_relay_status_t *out){
     FOC_MEMORY_BARRIER();
 }
 
+static int16_t field_weakening_apply_iq_q4(const mcpwm_foc_motor_t *m,int16_t iq){
+    if(!m || m->m_i_fw_set_q4<=0 || m->m_fw_q_current_factor_q15==0u)return iq;
+    int32_t delta=((int32_t)m->m_i_fw_set_q4*(int32_t)m->m_fw_q_current_factor_q15 + 16384)>>15;
+    int32_t sign=(m->m_vq<0 || (m->m_vq==0 && m->m_duty_now_permille<0))?-1:1;
+    int32_t out=(int32_t)iq-sign*delta;
+    return (int16_t)CLAMP(out,-32768,32767);
+}
+
+static void field_weakening_update_non_isr(mcpwm_foc_motor_t *m,bool second,uint32_t dt_ms){
+    if(!m)return;
+    const int32_t max0=m->m_fw_current_max_q4;
+    const int32_t ccmin=m->m_cc_min_current_q4>0?m->m_cc_min_current_q4:1;
+    const bool mode_ok=m->m_state==MC_STATE_RUNNING &&
+        (m->m_control_mode==CONTROL_MODE_CURRENT ||
+         m->m_control_mode==CONTROL_MODE_CURRENT_BRAKE ||
+         m->m_control_mode==CONTROL_MODE_SPEED ||
+         m->m_i_fw_set_q4>ccmin);
+    int32_t target=0;
+    if(mode_ok && max0>=ccmin && m->m_fw_duty_start_permille<990u){
+        int32_t duty=m->m_duty_now_permille; if(duty<0)duty=-duty;
+        int32_t dmax=m->m_duty_limit_permille>0?m->m_duty_limit_permille:1000;
+        int32_t dstart=m->m_fw_duty_start_permille;
+        if(duty>dstart && dmax>dstart){
+            int32_t maxeff=max0;
+            if(m->m_fw_backoff_q15){
+                const int32_t pp=(int32_t)motor_pole_pairs(second);
+                int64_t erpm64=((int64_t)measured_mech_rpm_q16(m,second)*pp)>>16;
+                int32_t err=(int32_t)m->m_iq_q4-(int32_t)m->m_iq_target_q4;
+                if(erpm64<0)err=-err;
+                if(err>0){
+                    int32_t frac=(int32_t)(((int64_t)err*m->m_fw_backoff_q15)/max0);
+                    if(frac>32768)frac=32768;
+                    maxeff=(int32_t)(((int64_t)max0*(32768-frac))>>15);
+                }
+            }
+            target=(int32_t)(((int64_t)(duty-dstart)*maxeff)/(dmax-dstart));
+            if(target>maxeff)target=maxeff;
+        }
+    }
+    int32_t cur=m->m_i_fw_set_q4;
+    const uint32_t ramp=m->m_fw_ramp_time_ms;
+    if(ramp==0u || ramp<=dt_ms){cur=target;}else{
+        int32_t step=(int32_t)(((int64_t)max0*dt_ms)/ramp); if(step<1)step=1;
+        if(cur<target){cur+=step;if(cur>target)cur=target;}
+        else if(cur>target){cur-=step;if(cur<target)cur=target;}
+    }
+    m->m_i_fw_set_q4=(int16_t)CLAMP(cur,0,max0);
+}
+
 void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
     const uint32_t cycle_start=DWT->CYCCNT;
     /* Finalisasi powered current-zero sesegera mungkin setelah jendela 80 ADC
@@ -4968,7 +5060,8 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
     for(uint8_t i=0u;i<2u;++i){
         mcpwm_foc_motor_t *m=motors[i];
         const bool second=i!=0u;
-        if(m->m_fault!=FAULT_CODE_NONE)continue;
+        if(m->m_fault!=FAULT_CODE_NONE){m->m_i_fw_set_q4=0;continue;}
+        field_weakening_update_non_isr(m,second,dt_ms);
         if(m->m_control_mode==CONTROL_MODE_SPEED){
             const uint32_t profSpeedStart=DWT->CYCCNT;
             speed_setpoint_slew_step(m,dt_ms);

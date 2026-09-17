@@ -3234,7 +3234,7 @@ static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)
 
 static void terminal_help(void){
     terminal_send_text("Commands:\nREAD help fw status values model encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all|hard] | release [all]\n");
-    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
+    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V | fw_current A | fw_duty 0..1 | fw_ramp S | fw_q 0..1 | fw_backoff 0..10. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
     terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
 }
 
@@ -3287,6 +3287,11 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
     if(!strcmp(k,"speed_ramp")){if(v<100.0f||v>75000.0f)return -1;c->s_pid_ramp_erpms_s=v;return 1;}
     if(!strcmp(k,"speed_src")){if(v!=(float)i||i<0||i>1)return -1;c->s_pid_speed_source=(S_PID_SPEED_SRC)i;return 1;}
     if(!strcmp(k,"decoupling")){if(v!=(float)i||i<0||i>3)return -1;c->foc_cc_decoupling=(mc_foc_cc_decoupling_mode)i;return 1;}
+    if(!strcmp(k,"fw_current")){if(v<0.0f||v>I_MOT_MAX)return -1;c->foc_fw_current_max=v;return 1;}
+    if(!strcmp(k,"fw_duty")){if(v<0.0f||v>1.0f)return -1;c->foc_fw_duty_start=v;return 1;}
+    if(!strcmp(k,"fw_ramp")){if(v<0.0f||v>60.0f)return -1;c->foc_fw_ramp_time=v;return 1;}
+    if(!strcmp(k,"fw_q")){if(v<0.0f||v>1.0f)return -1;c->foc_fw_q_current_factor=v;return 1;}
+    if(!strcmp(k,"fw_backoff")){if(v<0.0f||v>10.0f)return -1;c->foc_fw_backoff=v;return 1;}
     if(!strncmp(k,"current_k",9)){if(k[10]||v<0)return -1;if(k[9]=='p'){if(v>65535.0f/1536.0f)return -1;c->foc_current_kp=v;}else if(k[9]=='i'){if(v>65535.0f/4.608f)return -1;c->foc_current_ki=v;}else return -1;return 1;}
     return 0;
 }
@@ -3310,7 +3315,7 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
             cm->foc_hall_table[4],cm->foc_hall_table[5],cm->foc_hall_table[6],cm->foc_hall_table[7]);
         terminal_send_text(o);return;
     }
-    if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"%s FW6.00 id=%u role=%s sensor=%s\n",second?"motor_right":"motor_left",second?2u:1u,second?"drive":"steer",second?"Hall":(cc->m_sensor_port_mode==SENSOR_PORT_MODE_ABI?"ABI":"Hall"));terminal_send_text(o);return;}
+    if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"FW id=%u max_mA=%ld start_pm=%u ramp_ms=%lu qfac_q15=%u backoff_q15=%u active_mA=%ld idset_mA=%ld duty_pm=%d\n",second?2u:1u,(long)((int32_t)m->m_fw_current_max_q4*1000/FOC_CURRENT_Q4_PER_A),(unsigned)m->m_fw_duty_start_permille,(unsigned long)m->m_fw_ramp_time_ms,(unsigned)m->m_fw_q_current_factor_q15,(unsigned)m->m_fw_backoff_q15,(long)((int32_t)m->m_i_fw_set_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_id_set_q4*1000/FOC_CURRENT_Q4_PER_A),(int)m->m_duty_now_permille);terminal_send_text(o);return;}
     if(!strcmp(a[0],"faults_clear")||!strcmp(a[0],"faults_reset")||!strcmp(a[0],"reset_faults")||
        (!strcmp(a[0],"reset")&&ac>1&&!strcmp(a[1],"faults"))||
        (!strcmp(a[0],"faults")&&ac>1&&(!strcmp(a[1],"clear")||!strcmp(a[1],"reset")))){
