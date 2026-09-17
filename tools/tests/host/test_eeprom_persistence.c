@@ -115,7 +115,7 @@ int main(void){
     cl.foc_pll_kp=2100.125f; cl.foc_pll_ki=31000.5f; cl.foc_dt_us=0.1234f;
     cl.s_pid_speed_source=S_PID_SPEED_SRC_PLL; cl.foc_cc_decoupling=FOC_CC_DECOUPLING_CROSS_BEMF;
     cr.foc_pll_kp=1800.25f; cr.foc_pll_ki=28000.75f; cr.foc_dt_us=0.4564f;
-    cr.s_pid_speed_source=S_PID_SPEED_SRC_FAST; cr.foc_cc_decoupling=FOC_CC_DECOUPLING_BEMF;
+    cr.s_pid_speed_source=S_PID_SPEED_SRC_FASTER; cr.foc_cc_decoupling=FOC_CC_DECOUPLING_BEMF;
     mcpwm_foc_set_configuration(&cl,false);
     mcpwm_foc_set_configuration(&cr,true);
     m_motor_1.m_kpq_q11=1111u; m_motor_1.m_kiq_q16=2222u;
@@ -217,7 +217,7 @@ int main(void){
        m_motor_1.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_CROSS_BEMF ||
        fabsf(m_motor_2.m_conf.foc_pll_kp-1800.25f)>1e-6f ||
        fabsf(m_motor_2.m_conf.foc_pll_ki-28000.75f)>1e-4f ||
-       m_motor_2.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FAST ||
+       m_motor_2.m_conf.s_pid_speed_source!=S_PID_SPEED_SRC_FASTER ||
        m_motor_2.m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_BEMF ||
        fabsf(m_motor_1.m_conf.foc_dt_us-0.123f)>0.00051f ||
        fabsf(m_motor_2.m_conf.foc_dt_us-0.456f)>0.00051f)

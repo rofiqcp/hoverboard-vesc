@@ -459,8 +459,22 @@ static int32_t measured_mech_rpm_raw_q16(const mcpwm_foc_motor_t *m, bool second
 }
 
 static int32_t measured_mech_rpm_q16(const mcpwm_foc_motor_t *m, bool second) {
-    if(m && m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_PLL && m->m_pll_valid)
-        return m->m_pll_mech_rpm_q16;
+    if(m){
+        const int32_t pp=(int32_t)motor_pole_pairs(second);
+        switch(m->m_conf.s_pid_speed_source){
+        case S_PID_SPEED_SRC_PLL:
+            if(m->m_pll_valid)return m->m_pll_mech_rpm_q16;
+            break;
+        case S_PID_SPEED_SRC_FAST:
+            if(m->m_speed_est_valid)return pp>0?(m->m_speed_fast_erpm_q16/pp):m->m_speed_fast_erpm_q16;
+            break;
+        case S_PID_SPEED_SRC_FASTER:
+            if(m->m_speed_est_valid)return pp>0?(m->m_speed_faster_erpm_q16/pp):m->m_speed_faster_erpm_q16;
+            break;
+        default:
+            break;
+        }
+    }
     return measured_mech_rpm_raw_q16(m,second);
 }
 
@@ -1587,9 +1601,8 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     next.m_motor_temp_sens_type=TEMP_SENSOR_DISABLED;
     if(!(next.foc_pll_kp>=0.0f && next.foc_pll_kp<=10000.0f))next.foc_pll_kp=MCCONF_FOC_PLL_KP_DEFAULT;
     if(!(next.foc_pll_ki>=0.0f && next.foc_pll_ki<=200000.0f))next.foc_pll_ki=MCCONF_FOC_PLL_KI_DEFAULT;
-    /* F103 menyediakan source PLL dan FAST. FASTER belum mempunyai estimator
-     * terpisah, sehingga canonicalize ke FAST agar readback tidak berbohong. */
-    if(next.s_pid_speed_source!=S_PID_SPEED_SRC_PLL && next.s_pid_speed_source!=S_PID_SPEED_SRC_FAST)
+    /* VESC 6.00 exposes three speed-PID sources: PLL, FAST and FASTER. */
+    if((uint8_t)next.s_pid_speed_source>(uint8_t)S_PID_SPEED_SRC_FASTER)
         next.s_pid_speed_source=S_PID_SPEED_SRC_FAST;
     if((uint8_t)next.foc_cc_decoupling>(uint8_t)FOC_CC_DECOUPLING_CROSS_BEMF)
         next.foc_cc_decoupling=FOC_CC_DECOUPLING_DISABLED;
@@ -1782,6 +1795,9 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     m->m_in_current_map_filter_q16=(uint16_t)CLAMP((int32_t)(next.l_in_current_map_filter*65535.0f+0.5f),1,65535);
     m->m_in_current_map_lpf_q20=0;
     m->m_input_map_current_limit_q4=m->m_current_limit_q4;
+    m->m_speed_est_valid=0u;
+    m->m_speed_fast_erpm_q16=0;
+    m->m_speed_faster_erpm_q16=0;
     {
         int32_t a=(int32_t)(next.foc_current_filter_const*65535.0f+0.5f);
         m->m_telem_current_filter_q16=(uint16_t)CLAMP(a,1,65535);
@@ -2963,6 +2979,43 @@ static bool fault_recovery_conditions_safe(const mcpwm_foc_motor_t *m, bool seco
     return true;
 }
 
+
+static void foc_speed_est_update_fixed(mcpwm_foc_motor_t *m, bool second, bool control_update) {
+    if(!m || !control_update)return;
+    const bool sensor_ready=encoder_feedback_selected(m,second)?
+        (m->m_encoder_configured&&m->m_encoder_synced):hall_drive_ready(m);
+    const bool synthetic_phase=m->m_control_mode==CONTROL_MODE_OPENLOOP ||
+        m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE ||
+        m->m_control_mode==CONTROL_MODE_HANDBRAKE;
+    if(!sensor_ready || synthetic_phase){
+        m->m_speed_est_valid=0u;
+        m->m_speed_fast_erpm_q16=0;
+        m->m_speed_faster_erpm_q16=0;
+        return;
+    }
+    const uint16_t phase=m->m_phase;
+    if(!m->m_speed_est_valid){
+        m->m_speed_est_phase_prev=phase;
+        m->m_speed_fast_erpm_q16=0;
+        m->m_speed_faster_erpm_q16=0;
+        m->m_speed_est_valid=1u;
+        return;
+    }
+    int32_t d=(int32_t)(int16_t)(phase-m->m_speed_est_phase_prev);
+    m->m_speed_est_phase_prev=phase;
+    /* Upstream clamps instantaneous phase delta to +/-pi/3. One uint16
+     * electrical turn is 65536, so pi/3 is one sixth of a turn. */
+    if(d>10923)d=10923; else if(d<-10923)d=-10923;
+    /* At PWM/6 current-control cadence, ERPM_Q16 = phase_delta *
+     * 60*(PWM_FREQ/6). The Q16 phase scale cancels exactly. */
+    const int32_t inst_erpm_q16=d*(int32_t)((60u*(uint32_t)PWM_FREQ)/(uint32_t)MCCONF_FOC_CONTROL_DIV);
+    int64_t df64=(int64_t)inst_erpm_q16-(int64_t)m->m_speed_fast_erpm_q16;
+    if(df64>INT32_MAX)df64=INT32_MAX; else if(df64<INT32_MIN)df64=INT32_MIN;
+    m->m_speed_fast_erpm_q16 += (int32_t)df64/100; /* alpha 0.01 */
+    int64_t dfr64=(int64_t)inst_erpm_q16-(int64_t)m->m_speed_faster_erpm_q16;
+    if(dfr64>INT32_MAX)dfr64=INT32_MAX; else if(dfr64<INT32_MIN)dfr64=INT32_MIN;
+    m->m_speed_faster_erpm_q16 += (int32_t)dfr64/5; /* alpha 0.20 */
+}
 
 static void foc_pll_update_fixed(mcpwm_foc_motor_t *m, bool second, bool control_update) {
     if(!m || !control_update)return;
@@ -4418,6 +4471,7 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
     }
 
     if(control_update){
+        foc_speed_est_update_fixed(m,second,control_update);
         const bool pll_needed=(m->m_conf.s_pid_speed_source==S_PID_SPEED_SRC_PLL) ||
                               (m->m_conf.foc_cc_decoupling!=FOC_CC_DECOUPLING_DISABLED);
         if(pll_needed){

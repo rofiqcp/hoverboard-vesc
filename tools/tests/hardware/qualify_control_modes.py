@@ -68,7 +68,7 @@ def main():
         if cfg0['dec'] is None or cfg0['speed_src'] is None: raise RuntimeError('firmware lacks RAM mode observability')
         if args.kind in ('speed','all'):
             rr={}
-            for src in (0,1):
+            for src in (0,1,2):
                 set_ram(v,right,'speed_src',src); cases=[]
                 for t in targets: cases.append(run_target(v,right,t,args.hold,args.hz,args.max_current,args.min_vin))
                 rr[str(src)]=dict(cases=cases,score=statistics.mean([c['rmse']/max(100,abs(c['target'])) for c in cases]))

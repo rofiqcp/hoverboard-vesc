@@ -236,6 +236,13 @@ typedef struct {
     int32_t m_pll_speed_step_q32;
     volatile int32_t m_pll_erpm_q16;
     volatile int32_t m_pll_mech_rpm_q16;
+    /* VESC speed-PID low-latency estimators. Both are derived from corrected
+     * electrical phase delta at the real current-control cadence. FAST uses
+     * alpha=0.01; FASTER uses alpha=0.20, matching upstream foc_math. */
+    volatile int32_t m_speed_fast_erpm_q16;
+    volatile int32_t m_speed_faster_erpm_q16;
+    uint16_t m_speed_est_phase_prev;
+    volatile uint8_t m_speed_est_valid;
     uint32_t m_pll_kp_dt_q16;
     uint32_t m_pll_ki_dt2_q16;
     int32_t m_pll_speed_limit_step_q32;
