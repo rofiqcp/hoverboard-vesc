@@ -3333,7 +3333,16 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
        (!strcmp(a[0],"reset")&&ac>1&&!strcmp(a[1],"faults"))||
        (!strcmp(a[0],"faults")&&ac>1&&(!strcmp(a[1],"clear")||!strcmp(a[1],"reset")))){
         mcpwm_foc_clear_faults();
-        terminal_send_text("OK all motor faults reset; bridges remain released\n");
+        const mc_fault_code lf=mc_interface_get_fault_motor(false);
+        const mc_fault_code rf=mc_interface_get_fault_motor(true);
+        char msg[160];
+        if(lf==FAULT_CODE_NONE && rf==FAULT_CODE_NONE){
+            terminal_send_text("OK all motor faults reset; bridges remain released\n");
+        }else{
+            snprintf(msg,sizeof(msg),"BLOCKED fault reset unsafe: left=%d(%s) right=%d(%s); bridges remain released\n",
+                     (int)lf,vesc_fault_name(lf),(int)rf,vesc_fault_name(rf));
+            terminal_send_text(msg);
+        }
         return;
     }
     if(!strcmp(a[0],"status")||!strcmp(a[0],"values")||!strcmp(a[0],"faults")){terminal_values(second);return;}
