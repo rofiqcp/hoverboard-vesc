@@ -23,6 +23,14 @@ scaled=mc[mc.index('void mcpwm_foc_get_values_scaled'):mc.index('void mcpwm_foc_
 assert 'v->current_motor_x100=0;' in scaled and 'v->id_x100=0;' in scaled and 'v->iq_x100=0;' in scaled
 assert 'if(ibus_counts>0)im=-im;' in scaled and 'else if(ibus_counts==0)im=0;' not in scaled
 assert 'pqi' not in scaled
+# Stage-4 VESC input-current mapping: DCL/DCR public Ibat polarity feeds the
+# measured-current LPF, and the resulting mapped motor-current ceiling is applied
+# only on battery-drawing quadrants in addition to the fast mod_q*Iq limiter.
+assert 'input_current_map_update_non_isr' in mc
+assert 'target_q4=-(int32_t)m->m_current_in_counts' in mc
+assert 'm->m_input_map_current_limit_q4<lim' in mc
+assert 'm->m_in_current_map_start_q15<32113u' in mc
+
 # Duty-now must come from actual limited D/Q vector, never command echo.
 assert re.search(r'm->m_duty_now_permille\s*=\s*duty_permille_from_vdq\(m->m_vd,m->m_vq\);', mc)
 # VESC direction normalization: Iq/duty/RPM/Vq/tacho are direction-relative, Id/Imotor/Ibat are not.

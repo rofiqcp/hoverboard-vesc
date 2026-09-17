@@ -147,7 +147,8 @@ typedef struct {
     volatile int16_t m_temp_fet_accel_end_x10;    /* batas suhu akselerasi akhir */
     uint16_t m_in_current_map_start_q15;           /* l_in_current_map_start */
     uint16_t m_in_current_map_filter_q16;          /* alpha LPF measured Iin */
-    int32_t m_in_current_map_lpf_q20;              /* Iin Q4 disimpan Q20 */
+    int32_t m_in_current_map_lpf_q20;              /* measured Iin Q4 disimpan Q20 */
+    volatile int16_t m_input_map_current_limit_q4; /* measured-Iin mapped positive motor-current ceiling */
 
     /* Current state, same Q4 current-count unit as the legacy generated FOC. */
     volatile int16_t m_i_alpha_q4;

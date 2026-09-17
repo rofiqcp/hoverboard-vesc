@@ -3292,6 +3292,8 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
     if(!strcmp(k,"fw_ramp")){if(v<0.0f||v>60.0f)return -1;c->foc_fw_ramp_time=v;return 1;}
     if(!strcmp(k,"fw_q")){if(v<0.0f||v>1.0f)return -1;c->foc_fw_q_current_factor=v;return 1;}
     if(!strcmp(k,"fw_backoff")){if(v<0.0f||v>10.0f)return -1;c->foc_fw_backoff=v;return 1;}
+    if(!strcmp(k,"in_map_start")){if(v<0.0f||v>1.0f)return -1;c->l_in_current_map_start=v;return 1;}
+    if(!strcmp(k,"in_map_filter")){if(v<0.00001f||v>1.0f)return -1;c->l_in_current_map_filter=v;return 1;}
     if(!strncmp(k,"current_k",9)){if(k[10]||v<0)return -1;if(k[9]=='p'){if(v>65535.0f/1536.0f)return -1;c->foc_current_kp=v;}else if(k[9]=='i'){if(v>65535.0f/4.608f)return -1;c->foc_current_ki=v;}else return -1;return 1;}
     return 0;
 }
@@ -3313,6 +3315,18 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
             (unsigned)cm->m_sensor_port_mode,(unsigned)cm->foc_sensor_mode,
             cm->foc_hall_table[0],cm->foc_hall_table[1],cm->foc_hall_table[2],cm->foc_hall_table[3],
             cm->foc_hall_table[4],cm->foc_hall_table[5],cm->foc_hall_table[6],cm->foc_hall_table[7]);
+        terminal_send_text(o);return;
+    }
+    if(!strcmp(a[0],"ilim")){
+        const int32_t filt_q4=m->m_in_current_map_lpf_q20>>16;
+        snprintf(o,sizeof(o),"ILIM id=%u raw_mA=%ld filt_mA=%ld inmax_mA=%ld regen_mA=%ld map_start_q15=%u map_filter_q16=%u map_motor_mA=%ld base_motor_mA=%ld\n",
+            second?2u:1u,(long)(-(int32_t)m->m_current_in_counts*1000/A2BIT_CONV),
+            (long)(filt_q4*1000/FOC_CURRENT_Q4_PER_A),
+            (long)((int32_t)m->m_input_current_max_q4*1000/FOC_CURRENT_Q4_PER_A),
+            (long)((int32_t)m->m_input_current_regen_q4*1000/FOC_CURRENT_Q4_PER_A),
+            (unsigned)m->m_in_current_map_start_q15,(unsigned)m->m_in_current_map_filter_q16,
+            (long)((int32_t)m->m_input_map_current_limit_q4*1000/FOC_CURRENT_Q4_PER_A),
+            (long)((int32_t)m->m_current_limit_q4*1000/FOC_CURRENT_Q4_PER_A));
         terminal_send_text(o);return;
     }
     if(!strcmp(a[0],"fw")){snprintf(o,sizeof(o),"FW id=%u max_mA=%ld start_pm=%u ramp_ms=%lu qfac_q15=%u backoff_q15=%u active_mA=%ld idset_mA=%ld iqtar_mA=%ld iqset_mA=%ld iq_mA=%ld duty_pm=%d off_ms=%u\n",second?2u:1u,(long)((int32_t)m->m_fw_current_max_q4*1000/FOC_CURRENT_Q4_PER_A),(unsigned)m->m_fw_duty_start_permille,(unsigned long)m->m_fw_ramp_time_ms,(unsigned)m->m_fw_q_current_factor_q15,(unsigned)m->m_fw_backoff_q15,(long)((int32_t)m->m_i_fw_set_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_id_set_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_iq_target_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_iq_set_q4*1000/FOC_CURRENT_Q4_PER_A),(long)((int32_t)m->m_iq_q4*1000/FOC_CURRENT_Q4_PER_A),(int)m->m_duty_now_permille,(unsigned)m->m_current_off_delay_ms);terminal_send_text(o);return;}

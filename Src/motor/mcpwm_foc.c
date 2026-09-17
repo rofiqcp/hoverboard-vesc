@@ -523,6 +523,14 @@ static int16_t current_circle_iq_limit_q4(const mcpwm_foc_motor_t *m, int16_t iq
         const int32_t mod_q_min=(MCCONF_FOC_VOLTAGE_MAX+999)/1000; /* 0.001 */
         if (amod_q > mod_q_min) {
             const bool drawing=((iq_cmd_q4>=0)==(mod_q>=0));
+            /* Upstream update_override_limits() additionally maps measured
+             * positive input current into lo_current_max. Keep the existing
+             * fast model limiter below, but also honor the DCL/DCR-derived
+             * slow-loop ceiling so field-weakening Id power is accounted for. */
+            if(drawing && m->m_input_map_current_limit_q4>0 &&
+               m->m_input_map_current_limit_q4<lim){
+                lim=m->m_input_map_current_limit_q4;
+            }
             int32_t in_lim=drawing?m->m_input_current_max_q4:m->m_input_current_regen_q4;
             /* VESC 6.00 watt limit: I_in <= P_limit / V_in. P/V dikonversi
              * ke Q4 di slow path setiap Vbus/config berubah. ISR hanya memilih
@@ -1773,6 +1781,7 @@ void mcpwm_foc_set_configuration(const mc_configuration *conf, bool second) {
     m->m_in_current_map_start_q15=(uint16_t)CLAMP((int32_t)(next.l_in_current_map_start*32768.0f+0.5f),0,32768);
     m->m_in_current_map_filter_q16=(uint16_t)CLAMP((int32_t)(next.l_in_current_map_filter*65535.0f+0.5f),1,65535);
     m->m_in_current_map_lpf_q20=0;
+    m->m_input_map_current_limit_q4=m->m_current_limit_q4;
     {
         int32_t a=(int32_t)(next.foc_current_filter_const*65535.0f+0.5f);
         m->m_telem_current_filter_q16=(uint16_t)CLAMP(a,1,65535);
@@ -4981,6 +4990,52 @@ static int16_t field_weakening_apply_iq_q4(const mcpwm_foc_motor_t *m,int16_t iq
     return (int16_t)CLAMP(out,-32768,32767);
 }
 
+static void input_current_map_update_non_isr(mcpwm_foc_motor_t *m){
+    if(!m)return;
+    /* VESC mc_interface update_override_limits(): measured positive battery
+     * current gets an additional LPF, then maps lo_current_max from the normal
+     * motor-current ceiling down to cc_min_current between
+     * l_in_current_map_start*Iin_max and Iin_max. On this board the measured
+     * source is the real DCL/DCR shunt (50 ADC count/A), not mod_q*Iq. */
+    int32_t target_q4=0;
+    if(m->m_control_mode!=CONTROL_MODE_NONE && m->m_driven_offset_valid &&
+       !m->m_driven_offset_calibrating && m->m_bridge_settle_ticks==0u){
+        /* Public VESC I battery on this PCB is -ibus_counts; use the same
+         * polarity here so positive means drawing from the battery. */
+        target_q4=-(int32_t)m->m_current_in_counts*
+                  ((int32_t)FOC_CURRENT_Q4_PER_A/(int32_t)A2BIT_CONV);
+    }
+    const int32_t filt0=m->m_in_current_map_lpf_q20>>16;
+    const int32_t delta=target_q4-filt0;
+    /* state is Q4<<16. delta*alpha_q16 has exactly that scale and remains
+     * bounded below int32 for the validated +/-17 A DC range. */
+    m->m_in_current_map_lpf_q20 += delta*(int32_t)m->m_in_current_map_filter_q16;
+    const int32_t filt=m->m_in_current_map_lpf_q20>>16;
+
+    const int32_t base=m->m_current_limit_q4>0?m->m_current_limit_q4:1;
+    int32_t mapped=base;
+    int32_t in_lim=m->m_input_current_max_q4;
+    const int32_t watt_lim=m->m_watt_current_max_q4;
+    if(watt_lim>0 && watt_lim<in_lim)in_lim=watt_lim;
+    /* Upstream skips this map when start >= 0.98. Only positive/drawing
+     * measured current derates lo_current_max; regen keeps its independent
+     * l_in_current_min/mod_q fast limiter. */
+    if(in_lim>0 && m->m_in_current_map_start_q15<32113u && filt>0){
+        const int32_t start=(in_lim*(int32_t)m->m_in_current_map_start_q15+16384)>>15;
+        if(filt>start){
+            if(filt>=in_lim){
+                mapped=0;
+            }else{
+                const int32_t den=in_lim-start;
+                mapped=den>0?(base*(in_lim-filt))/den:0;
+            }
+            const int32_t floor=m->m_cc_min_current_q4>0?m->m_cc_min_current_q4:1;
+            if(mapped<floor)mapped=floor;
+        }
+    }
+    m->m_input_map_current_limit_q4=(int16_t)CLAMP(mapped,1,32767);
+}
+
 static void field_weakening_update_non_isr(mcpwm_foc_motor_t *m,bool second,uint32_t dt_ms){
     if(!m)return;
     /* Upstream foc_run_fw() owns a one-second current-off delay. Count it down
@@ -5086,6 +5141,7 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
     for(uint8_t i=0u;i<2u;++i){
         mcpwm_foc_motor_t *m=motors[i];
         const bool second=i!=0u;
+        input_current_map_update_non_isr(m);
         if(m->m_fault!=FAULT_CODE_NONE){m->m_i_fw_set_q4=0;m->m_current_off_delay_ms=0u;continue;}
         field_weakening_update_non_isr(m,second,dt_ms);
         if(m->m_control_mode==CONTROL_MODE_SPEED){
