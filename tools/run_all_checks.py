@@ -115,7 +115,7 @@ def check_static():
     assert 'MCCONF_FOC_HALL_INTERP_ERPM_DEFAULT' in mcc and 'hall_interp_recompute' in mc and 'm_hall_interp_max_ticks' in mc and 'm_hall_rate_min_step' in mc and 'err_same_direction' in mc, 'VESC foc_hall_interp_erpm runtime semantics missing'
     assert 'MCCONF_HALL_PHASE_ADVANCE_TICKS' in mc and 'debounce_adv' in mc, 'Hall debounce phase-delay compensation missing'
     assert 'phase_current_counts_to_q4' in mc and '27200' in mc, 'generated current input saturation missing'
-    assert 'duty_control_iq_target_step' in mc and 'm->m_iq_target_q4=duty_control_iq_target_step(m)' in mc, 'mode1 must use VESC-style current-controlled duty'
+    assert 'duty_control_iq_target_step' in mc and 'm->m_iq_target_q4=duty_control_iq_target_step(m,second)' in mc, 'mode1 must use VESC-style current-controlled duty with per-motor ERPM governor'
     assert 'foc_isqrt_u32(mag2)' in mc and 'mag*1000u' in mc and 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'VESC duty telemetry must normalize EFeru full-safe vector to 1.0'
     assert 'MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc and 'duty_v>MCCONF_FOC_DUTY_VOLTAGE_MAX' in mc, 'mode1 EFeru full-safe modulation ceiling missing'
     assert re.search(r'#define\s+MCCONF_L_MAX_DUTY\s+1\.00f',mcc), 'VESC normalized duty max must be 1.00'

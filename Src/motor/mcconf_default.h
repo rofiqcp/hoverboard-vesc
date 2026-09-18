@@ -137,6 +137,13 @@
  * hardware steps as the best response/stability compromise; still configurable. */
 #define MCCONF_SPEED_RAMP_ERPMS_S            20000u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
+#define MCCONF_SPEED_STARTUP_EXIT_MIN_ERPM       120u /* low command: hand off after real motion */
+#define MCCONF_SPEED_STARTUP_EXIT_MAX_ERPM       600u /* high command: do not hold breakaway torque too long */
+#define MCCONF_SPEED_STARTUP_EXIT_PERCENT         40u /* threshold from FINAL requested ERPM, not slew state */
+#define MCCONF_SPEED_STARTUP_CURRENT_MAX_MA      1300u /* bounded stiction breakaway, then integral is cleared */
+#define MCCONF_SPEED_STARTUP_CURRENT_MIN_MA       200u /* gentle initial traction torque */
+#define MCCONF_SPEED_STARTUP_CURRENT_RAMP_MA_S    400u /* deterministic stiction ramp; 0.2A -> 1.3A in 2.75s */
+#define MCCONF_SPEED_LOW_NO_BRAKE_TARGET_ERPM     600u /* low-speed overshoot coasts; never torque-reverses */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               30.0f /* absolute hard phase-current ceiling; VESC Tool motor limit <=30A */
@@ -144,8 +151,11 @@
 #define MCCONF_ABS_CURRENT_QUAL_SAMPLES           3u /* ~0.19 ms @16 kHz: reject transient D/Q spikes */
 /* Safety tambahan yang tetap ringan untuk Cortex-M3. Overspeed memakai Hall
  * period mentah agar fault tidak tertutup clamp telemetry 1000 mechanical RPM. */
+#define MCCONF_DUTY_ERPM_GOVERNOR_PERCENT          90u /* DUTY: zero accelerating torque by 90% ERPM limit */
+#define MCCONF_DUTY_ERPM_BRAKE_MAX_MA             500u /* DUTY: gentle regen above governor point */
 #define MCCONF_ABS_OVERSPEED_MARGIN_PERCENT      110u /* hard fault 10% di atas soft ERPM limit */
-#define MCCONF_ABS_OVERSPEED_QUAL_SAMPLES          8u /* 0,5 ms @16 kHz, menolak satu glitch timing */
+#define MCCONF_ABS_OVERSPEED_QUAL_MS               20u /* overspeed harus kontinu >=20 ms; housekeeping berjalan ~200 Hz */
+#define MCCONF_ABS_OVERSPEED_MIN_STABLE_HALL_EDGES  3u /* abaikan timing Hall saat arah baru lock/reversal */
 /* Dua shunt fase FOC normalnya berpusat dekat ADC midscale. Toleransi sengaja
  * lebar agar pergeseran common-mode board hoverboard tidak memicu false fault. */
 #define MCCONF_CURRENT_OFFSET_CENTER_ADC         2048
