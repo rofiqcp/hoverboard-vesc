@@ -6,7 +6,6 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 from vesc_common import crc16
-from vesc_dual import open_serial_compat
 
 COMM_FW_VERSION=0; COMM_JUMP_TO_BOOTLOADER=1; COMM_ERASE_NEW_APP=2; COMM_WRITE_NEW_APP_DATA=3
 COMM_CUSTOM_APP_DATA=36
@@ -123,10 +122,10 @@ class Link:
         self.open()
 
     def open(self):
-        self.ser=open_serial_compat(self.args.serial_port,self.current_baud,.10,2)
-        if not getattr(self.ser,"_hb_skip_buffer_reset",False):
-            try: self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
-            except Exception: pass
+        import serial
+        self.ser=serial.Serial(self.args.serial_port,self.current_baud,timeout=.10,write_timeout=2,exclusive=True)
+        try: self.ser.reset_input_buffer(); self.ser.reset_output_buffer()
+        except Exception: pass
 
     def close(self):
         if self.ser is not None:

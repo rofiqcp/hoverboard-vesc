@@ -132,57 +132,16 @@ def _direct_serial_candidates() -> list[tuple[str, str]]:
     return out
 
 
-def _is_pl2303(path: str) -> bool:
-    """Identify the Prolific 067b:2303 adapter used by the steering USART2 link."""
-    target=os.path.realpath(path)
-    try:
-        import serial.tools.list_ports
-        for port in serial.tools.list_ports.comports():
-            if os.path.realpath(port.device) == target:
-                return port.vid == 0x067B and port.pid == 0x2303
-    except Exception:
-        pass
-    return "prolific" in str(path).lower()
-
-
-def open_serial_compat(path: str, baud: int, timeout: float, write_timeout: float = 2.0):
-    """Open USB-UART without PL2303 DTR/tcflush operations that can stall on Jetson."""
-    if serial is None:
-        raise RuntimeError("pyserial required: python -m pip install pyserial")
-    if not _is_pl2303(path):
-        return serial.Serial(path,baud,timeout=timeout,write_timeout=write_timeout,exclusive=True)
-
-    import termios
-    ser=serial.Serial(port=None,baudrate=baud,timeout=timeout,write_timeout=write_timeout,
-                      exclusive=True,rtscts=True,dsrdtr=True)
-    ser.port=path
-    ser.open()
-    attrs=termios.tcgetattr(ser.fileno())
-    attrs[2] &= ~getattr(termios,"CRTSCTS",0)
-    termios.tcsetattr(ser.fileno(),termios.TCSANOW,attrs)
-    ser._hb_skip_buffer_reset=True
-    print(f"[SERIAL] PL2303 compatibility mode {path} @ {baud}",flush=True)
-    return ser
-
-
 def _probe_f103_uart(path: str, baud: int = DEFAULT_BAUD, timeout: float = 0.01):
     """Open and positively identify an F103 VESC/bootloader on a USB-UART."""
-    ser=open_serial_compat(path,baud,max(0.002,timeout),2)
+    if serial is None:
+        raise RuntimeError("pyserial required: python -m pip install pyserial")
+    ser=serial.Serial(path,baud,timeout=max(0.002,timeout),write_timeout=2,exclusive=True)
     try:
-        if not getattr(ser,"_hb_skip_buffer_reset",False):
-            try: ser.reset_input_buffer(); ser.reset_output_buffer()
-            except Exception: pass
+        try: ser.reset_input_buffer(); ser.reset_output_buffer()
+        except Exception: pass
         dec=PacketDecoder()
-        packet=frame(bytes((COMM_FW_VERSION,)))
-        written=ser.write(packet)
-        if written!=len(packet):
-            raise IOError(f"short probe write {written}/{len(packet)}")
-        # PL2303 tcdrain() can block indefinitely even after the complete frame
-        # has entered the kernel USB-UART queue.  Do not let target discovery
-        # deadlock on that adapter; transaction timeout/readback still proves
-        # whether the frame actually reached the F103.
-        if not getattr(ser,"_hb_skip_buffer_reset",False):
-            ser.flush()
+        ser.write(frame(bytes((COMM_FW_VERSION,)))); ser.flush()
         deadline=time.monotonic()+0.8
         while time.monotonic()<deadline:
             data=ser.read(ser.in_waiting or 1)
@@ -703,16 +662,6 @@ class VescDual:
     def close(self):
         self.ser.close()
 
-    def flush_tx(self) -> None:
-        """Drain host TX where safe; PL2303 uses reply/readback instead.
-
-        Some Linux PL2303 combinations can block indefinitely in tcdrain().
-        Every request/reply transaction already has a monotonic deadline, so
-        skipping tcdrain on that adapter is safer than hanging serial ownership.
-        """
-        if not getattr(self.ser, "_hb_skip_buffer_reset", False):
-            self.ser.flush()
-
     def send(self, payload: bytes):
         packet = frame(payload)
         lock = getattr(self, "tx_lock", None)
@@ -723,12 +672,10 @@ class VescDual:
             written = self.ser.write(packet)
             if written != len(packet):
                 raise IOError(f"short serial write {written}/{len(packet)}")
-            # Standard adapters may use tcdrain() here.  PL2303 compatibility
-            # sessions intentionally skip blocking flush because the Linux
-            # driver can remain in tty_wait_until_sent indefinitely.  A complete
-            # write plus the bounded reply timeout still gives fail-closed
-            # request/response semantics.
-            self.flush_tx()
+            # The reply timeout starts only after the full VESC frame has reached
+            # the OS/USB-UART transmit path. This matters especially immediately
+            # after COMM_REBOOT when a fresh tty session is opened.
+            self.ser.flush()
 
     def send_no_reply(self, payload: bytes, right: bool = False) -> None:
         """Send one command that is defined to produce no reply.
@@ -777,7 +724,7 @@ class VescDual:
                 written=self.ser.write(wire)
                 if written!=len(wire):
                     raise IOError(f'short serial batch write {written}/{len(wire)}')
-                self.flush_tx()
+                self.ser.flush()
             while need and time.monotonic()<end:
                 chunk=self.ser.read(512)
                 if not chunk:
@@ -823,7 +770,7 @@ class VescDual:
         req=bytes((COMM_SET_DETECT,int(mode)))
         with self.io_lock:
             self.send(self.fwd(req) if right else req)
-            self.flush_tx()
+            self.ser.flush()
 
     def recv_rotor_position(self, timeout: float = 0.25) -> float:
         p=self.recv(COMM_ROTOR_POSITION,timeout)
@@ -952,14 +899,14 @@ class VescDual:
         req = bytes((COMM_SET_ODOMETER,)) + struct.pack(">I", int(meters))
         with self.io_lock:
             self.send(self.fwd(req) if right else req)
-            self.flush_tx()
+            self.ser.flush()
 
     def shutdown_safe(self, right: bool = False) -> None:
         """Kirim COMM_SHUTDOWN; pada board ini firmware memetakan ke safe bridge release."""
         req = bytes((COMM_SHUTDOWN, 0, 0))
         with self.io_lock:
             self.send(self.fwd(req) if right else req)
-            self.flush_tx()
+            self.ser.flush()
 
     def disable_app_output(self, time_ms: int, forward_can: bool = False,
                            right: bool = False) -> None:
@@ -967,7 +914,7 @@ class VescDual:
         req=bytes((COMM_APP_DISABLE_OUTPUT,1 if forward_can else 0))+struct.pack(">i",int(time_ms))
         with self.io_lock:
             self.send(self.fwd(req) if right else req)
-            self.flush_tx()
+            self.ser.flush()
 
     def measure_r_l(self, right: bool = False) -> dict[str, float]:
         """Non-persistent VESC R/L measurement. Firmware restores MC config after reply."""
@@ -1090,7 +1037,7 @@ class VescDual:
         req = bytes((COMM_REBOOT,))
         with self.io_lock:
             self.send(self.fwd(req) if right else req)
-            self.flush_tx()
+            self.ser.flush()
 
     def set_rpm(self, left: int, right: int):
         l = bytes((COMM_SET_RPM,)) + struct.pack(">i", int(left))
@@ -1252,8 +1199,7 @@ class VescDual:
         q=23; sensor_port,foc_sensor,encoder_configured,fault=p[q:q+4];q+=4
         raw=struct.unpack_from(">I",p,q)[0];q+=4
         safe_span,pos360_mdeg=struct.unpack_from(">ii",p,q)
-        # datatypes.h: FOC_SENSOR_MODE_ENCODER=1, HALL=2, ENCODER_AB=9.
-        role='encoder' if sensor_port==1 and foc_sensor in (1,9) else ('hall' if sensor_port==0 and foc_sensor==2 else 'unsupported')
+        role='encoder' if sensor_port==1 and foc_sensor in (1,8) else ('hall' if sensor_port==0 and foc_sensor==2 else 'unsupported')
         return dict(role=role,sensor_port=sensor_port,foc_sensor=foc_sensor,calibrated=bool(flags&1),homed=bool(flags&2),
                     encoder_synced=bool(flags&4),logical_inverted=bool(flags&8),encoder_configured=bool(encoder_configured),
                     fault=fault,span=span,safe_span=safe_span,position=pos,target=target,steering_deg=deg_mdeg/1000.0,

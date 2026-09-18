@@ -140,7 +140,7 @@
 #define MCCONF_SPEED_STARTUP_EXIT_MIN_ERPM       120u /* low command: hand off after real motion */
 #define MCCONF_SPEED_STARTUP_EXIT_MAX_ERPM       600u /* high command: do not hold breakaway torque too long */
 #define MCCONF_SPEED_STARTUP_EXIT_PERCENT         40u /* threshold from FINAL requested ERPM, not slew state */
-#define MCCONF_SPEED_STARTUP_CURRENT_MAX_MA      1300u /* bounded stiction breakaway, then integral is cleared */
+#define MCCONF_SPEED_STARTUP_CURRENT_MAX_MA      15000u /* bounded stiction breakaway, then integral is cleared */
 #define MCCONF_SPEED_STARTUP_CURRENT_MIN_MA       200u /* gentle initial traction torque */
 #define MCCONF_SPEED_STARTUP_CURRENT_RAMP_MA_S    400u /* deterministic stiction ramp; 0.2A -> 1.3A in 2.75s */
 #define MCCONF_SPEED_LOW_NO_BRAKE_TARGET_ERPM     600u /* low-speed overshoot coasts; never torque-reverses */
