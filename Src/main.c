@@ -176,19 +176,22 @@ int main(void) {
   if(mc_interface_steering_calibration_valid()){
     for(uint32_t t=0u;t<2500u && !mcpwm_foc_dc_cal_done();++t)HAL_Delay(1u);
     if(mcpwm_foc_dc_cal_done()){
-      /* A cold power-up can catch the steering rack/current estimator in a
-       * transient high-stiction state even though a manual HOME a moment later
-       * succeeds. One bounded retry keeps the fail-closed homing policy while
-       * avoiding a permanently unsynced LEFT after a single transient miss.
-       * Never retry through a motor fault; the align helper already releases
-       * PWM on every failure path. */
-      bool home_ok=mc_interface_steering_boot_home();
-      if(!home_ok && mc_interface_get_fault_motor(false)==FAULT_CODE_NONE){
-        HAL_Delay(250u);
-        (void)mc_interface_steering_boot_home();
-      }
+      /* HOME uses only the persisted span plus ABI/electrical synchronization.
+       * The adaptive alignment now starts at 5 A and may rise to 15 A; it never
+       * performs a mechanical hard-stop/span sweep. */
+      (void)mc_interface_steering_boot_home();
     }
   }
+
+  /* If ADC/DC zero calibration was not ready inside the early startup window,
+   * finish HOME later from the normal main loop. This is especially important
+   * after a TEST-image boot where actuator probation can delay useful alignment.
+   * A valid persisted span is mandatory; no retry path is allowed to measure or
+   * overwrite span. */
+  bool steering_boot_home_pending = mc_interface_steering_calibration_valid() &&
+      (!mcpwm_foc_steering_is_homed() || !mcpwm_foc_encoder_is_synced(false));
+  uint8_t steering_boot_home_attempts = 0u;
+  uint32_t steering_boot_home_retry_ms = HAL_GetTick();
 
   poweronMelody();
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
@@ -286,6 +289,23 @@ int main(void) {
       } else if (elapsed>=15000u) {
         *(volatile uint32_t *)F103_RESET_STAGE_ADDR = F103_STAGE_PROBATION_TIMEOUT_BASE | gate_bits;
         f103_fw_reset_to_bootloader();
+      }
+    }
+
+    /* Deferred power-cycle HOME: wait until firmware probation is over and DC
+     * calibration is actually ready. HOME performs adaptive 5..15 A electrical
+     * sync and rebases the operator-provided physical center; it never calls the
+     * mechanical span detector. Keep retries bounded and fail closed on fault. */
+    if(steering_boot_home_pending && !fw_test_probation && mcpwm_foc_dc_cal_done() &&
+       mc_interface_get_fault_motor(false)==FAULT_CODE_NONE &&
+       (int32_t)(vesc_now_ms-steering_boot_home_retry_ms)>=0){
+      ++steering_boot_home_attempts;
+      if(mc_interface_steering_boot_home()){
+        steering_boot_home_pending=false;
+      }else if(steering_boot_home_attempts>=3u){
+        steering_boot_home_pending=false;
+      }else{
+        steering_boot_home_retry_ms=HAL_GetTick()+1000u;
       }
     }
     uint32_t profd=DWT->CYCCNT-prof0;

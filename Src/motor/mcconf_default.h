@@ -58,9 +58,9 @@
 #define MCCONF_ENCODER_COUNTS_DEFAULT             4096u
 #define MCCONF_ENCODER_RATIO_MAX                  10000.0f
 #define MCCONF_ENCODER_OFFSET_DEFAULT             0.0f
-#define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    3.00f /* Detect-All/boot Id starts at 3 A */
-#define MCCONF_ENCODER_STARTUP_ALIGN_STEP_A       1.00f /* VESC-style adaptive rise until motion */
-#define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A       15.00f /* hard board/config ceiling; never exceeded */
+#define MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A    5.00f /* HOME/sync starts at 5 A for reliable steering breakaway */
+#define MCCONF_ENCODER_STARTUP_ALIGN_STEP_A       1.00f /* adaptive 5,6,...15 A only when motion evidence is insufficient */
+#define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A       15.00f /* hard HOME/sync ceiling; never exceeded */
 #define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       120u
 #define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       120u
 /* Internal LEFT steering normalization envelope. External owners always use
@@ -92,7 +92,11 @@
 #define MCCONF_STEERING_STALL_MS                     350u
 #define MCCONF_STEERING_SEEK_TIMEOUT_MS            20000u
 #define MCCONF_STEERING_MIN_SPAN_COUNTS              32
-#define MCCONF_STEERING_CAL_MIN_SPAN_COUNTS        1 /* this steering axis historically spans ~3.7k..4.5k ABI counts; reject local-stiction pseudo-stops */
+/* Persisted/measured steering span must stay inside the proven hardware window.
+ * Normal units measure about 3.7k..4.5k ABI counts. A tiny span is never allowed
+ * to become READY after a reboot; commissioning remains manual only. */
+#define MCCONF_STEERING_CAL_MIN_SPAN_COUNTS          3000
+#define MCCONF_STEERING_CAL_MAX_SPAN_COUNTS          5000
 #define MCCONF_STEERING_SAFE_SPAN_PERCENT             95u /* measured hard-stop span is preserved; runtime uses 95% for 2.5% margin each side */
 #define MCCONF_STEERING_SETTLE_COUNTS                 6
 #define MCCONF_ENCODER_SPEED_WINDOW_TICKS           320u /* 20 ms @16 kHz, 50-Hz speed estimator */

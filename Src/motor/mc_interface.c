@@ -598,6 +598,11 @@ bool mc_interface_load_steering_calibration(void){
        inv!=~u)return false;
     s_steering_logical_inverted=(magic==EE_L_STEER_CAL_MAGIC_INVERTED);
     const int32_t span=(int32_t)u;
+    const int32_t span_abs=span<0?-span:span;
+    /* Power-cycle startup never re-measures the steering travel. Only accept a
+     * previously commissioned span that is inside the proven mechanical window. */
+    if(span_abs<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS ||
+       span_abs>MCCONF_STEERING_CAL_MAX_SPAN_COUNTS)return false;
     return mcpwm_foc_steering_set_span(span,false);
 }
 
@@ -639,11 +644,17 @@ bool mc_interface_steering_boot_home(void){
     const bool encoder_selected=m && m->m_conf.m_sensor_port_mode==SENSOR_PORT_MODE_ABI &&
         (m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER ||
          m->m_conf.foc_sensor_mode==FOC_SENSOR_MODE_ENCODER_AB);
-    /* Incremental ABI has no absolute index. Boot SOP is therefore explicit:
-     * power on only with the wheels physically straight. After electrical phase
-     * synchronization, that exact boot position becomes logical POS180 and the
-     * position controller immediately holds it. No mechanical-stop sweep occurs. */
+    /* Incremental ABI has no absolute index. Production startup policy:
+     * 1) operator powers on with steering physically centered,
+     * 2) persisted span must already be valid,
+     * 3) synchronize ABI/electrical phase only,
+     * 4) rebase the boot position as logical center.
+     * Never run a mechanical span sweep from HOME/startup. */
     if(!encoder_selected)return true;
+    const int32_t span=mcpwm_foc_steering_span_counts();
+    const int32_t span_abs=span<0?-span:span;
+    if(span_abs<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS ||
+       span_abs>MCCONF_STEERING_CAL_MAX_SPAN_COUNTS)return false;
     if(!mcpwm_foc_encoder_startup_align(false))return false;
     if(!mcpwm_foc_steering_rebase_center())return false;
     return mcpwm_foc_set_steering_deg(0.0f);
@@ -719,7 +730,10 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     s_steer_span1=span1; s_steer_span2=span2;
     const int32_t abs1=span1<0?-span1:span1;
     const int32_t abs2=span2<0?-span2:span2;
-    if(abs1<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS || abs2<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS){steering_stage_set(0xE5u);return false;}
+    if(abs1<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS || abs1>MCCONF_STEERING_CAL_MAX_SPAN_COUNTS ||
+       abs2<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS || abs2>MCCONF_STEERING_CAL_MAX_SPAN_COUNTS){
+        steering_stage_set(0xE5u);return false;
+    }
     const int32_t reference_span=(abs1+abs2)/2;
     int32_t repeat_tol=reference_span/50; /* 2% of span */
     if(repeat_tol<32)repeat_tol=32;
