@@ -3351,6 +3351,8 @@ static void terminal_help(void){
         "set speed_kd V                   (V=0..0.65535)\n"
         "set speed_ramp ERPM_S            (100..75000 ERPM/s)\n"
         "set speed_src 0/1                (0=PLL, 1=FAST)\n"
+        "set pll_kp V                      (0..10000)\n"
+        "set pll_ki V                      (0..200000)\n"
         "set pos_kp V                     (V=0..65.535)\n"
         "set pos_ki V                     (V=0..65.535)\n"
         "set pos_kd V                     (V=0..65.535)\n"
@@ -3417,6 +3419,8 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
     if(!strncmp(k,"speed_k",7)){if(v<0||v>65535.0f/MCCONF_SPEED_GAIN_SCALE||k[8])return -1;if(k[7]=='p')c->s_pid_kp=v;else if(k[7]=='i')c->s_pid_ki=v;else if(k[7]=='d')c->s_pid_kd=v;else return -1;return 1;}
     if(!strcmp(k,"speed_ramp")){if(v<100.0f||v>75000.0f)return -1;c->s_pid_ramp_erpms_s=v;return 1;}
     if(!strcmp(k,"speed_src")){if(v!=(float)i||i<0||i>1)return -1;c->s_pid_speed_source=(S_PID_SPEED_SRC)i;return 1;}
+    if(!strcmp(k,"pll_kp")){if(v<0.0f||v>10000.0f)return -1;c->foc_pll_kp=v;return 1;}
+    if(!strcmp(k,"pll_ki")){if(v<0.0f||v>200000.0f)return -1;c->foc_pll_ki=v;return 1;}
     if(!strcmp(k,"decoupling")){if(v!=(float)i||i<0||i>3)return -1;c->foc_cc_decoupling=(mc_foc_cc_decoupling_mode)i;return 1;}
     if(!strncmp(k,"current_k",9)){if(k[10]||v<0)return -1;if(k[9]=='p'){if(v>65535.0f/1536.0f)return -1;c->foc_current_kp=v;}else if(k[9]=='i'){if(v>65535.0f/4.608f)return -1;c->foc_current_ki=v;}else return -1;return 1;}
     return 0;
@@ -3469,7 +3473,7 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         terminal_send_text("ERR steering status|center|zero|reset|invert 0|1\n");return;
     }
     if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb dec=%u speed_src=%u\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);terminal_send_text(o);return;}
-    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pll %.1f %.1f | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->foc_pll_kp,(double)cc->foc_pll_ki,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
     if(!strcmp(a[0],"perf")){
         if(ac>1&&!strcmp(a[1],"reset")){
             foc_isr_cycles_max=0u; foc_isr_deadline_miss_count=0u;

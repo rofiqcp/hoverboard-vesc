@@ -1140,7 +1140,7 @@ static void speed_pid_recompute_coeff(mcpwm_foc_motor_t *m) {
      * error_q2 = ERPM*4. Tidak ada float/divide runtime di outer PID. */
     uint64_t v=((uint64_t)m->m_kps_q11*268435456ULL + 500000ULL)/1000000ULL;
     m->m_speed_kp_coeff_q16=(v>UINT32_MAX)?UINT32_MAX:(uint32_t)v;
-    /* 536870912 / 1e9 adalah faktor Q16 integrator untuk dt=1 ms. */
+    /* 536870912 / 1e9 is the deployed fixed-point integrator scaling. */
     v=((uint64_t)m->m_kis_q16*lim*536870912ULL + 500000000ULL)/1000000000ULL;
     m->m_speed_ki_coeff_q16=(v>UINT32_MAX)?UINT32_MAX:(uint32_t)v;
     /* D Q4 pada dt=1 ms: raw_gain/1e5 * current_limit * 3200. */
