@@ -1057,7 +1057,7 @@ bool mc_interface_store_configuration_motor(bool second) {
     return ok;
 }
 
-bool mc_interface_load_configuration_motor(bool second) {
+static bool mc_interface_load_configuration_motor_impl(bool second, bool allow_migration_store) {
     if (!persistence_ready()) return false;
     uint16_t key = 0u, sig = 0u;
     const uint8_t sig_slot = second ? EE_R_CFG_SIGNATURE : EE_L_CFG_SIGNATURE;
@@ -1141,13 +1141,12 @@ bool mc_interface_load_configuration_motor(bool second) {
         }
         m->m_conf.foc_current_filter_const = tf;
     }
-    /* EEPROM ramp/release slots are stored in ERPM using whatever pole count
-     * was active when they were written. Decode those slots with that persisted
-     * pole count first, then canonicalize to the fixed physical motor identity
-     * so correcting stale/cross-motor metadata preserves mechanical speed. */
+    /* EEPROM stores the physical pole identity per endpoint. Keep that value:
+     * the same firmware image is used by two physical boards, and local LEFT is
+     * 4 pole-pairs on the steering board but 15 pole-pairs on the drive board.
+     * A single compile-time LEFT pole count would corrupt one of those boards. */
     const uint16_t persisted_pp = mcpwm_foc_get_pole_pairs(second);
-    m->m_conf.si_motor_poles = (uint8_t)(2u * (second ? MCCONF_POLE_PAIRS_RIGHT : MCCONF_POLE_PAIRS_LEFT));
-    const uint16_t pp = mcpwm_foc_get_pole_pairs(second);
+    const uint16_t pp = persisted_pp;
 
     if (ee_read_slot(cur_slot, &v) && v >= 10u && v <= I_MOT_MAX * 100u) {
         m->m_conf.l_current_max = (float)v / 100.0f;
@@ -1459,11 +1458,29 @@ bool mc_interface_load_configuration_motor(bool second) {
         mcpwm_foc_set_configuration(&loaded,second);
         if(!second) mcpwm_foc_refresh_encoder_configuration(false,true);
     }
-    if (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension || migrate_hall_interp || migrate_encoder || migrate_hall_extra || migrate_motor_model || migrate_exact_pid || migrate_pll_decoupling) {
-        /* Rewrite only after a complete successful load; signature is written last. */
+    if (allow_migration_store && (migrate_speed_pid_scale || migrate_speed_pid || migrate_position_pid || migrate_telem_filter || migrate_mc_extension || migrate_hall_interp || migrate_encoder || migrate_hall_extra || migrate_motor_model || migrate_exact_pid || migrate_pll_decoupling)) {
+        /* Boot/load migration may canonicalize legacy EEPROM, but read-only
+         * Workbench persisted inspection explicitly disables this write. */
         (void)mc_interface_store_configuration_motor(second);
     }
     return true;
+}
+
+bool mc_interface_load_configuration_motor(bool second) {
+    return mc_interface_load_configuration_motor_impl(second, true);
+}
+
+bool mc_interface_read_persisted_configuration_motor(bool second, mc_configuration *out) {
+    if (!out) return false;
+    mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    const mc_configuration active=m->m_conf;
+    const bool ok=mc_interface_load_configuration_motor_impl(second, false);
+    if (ok) *out=m->m_conf;
+    /* Persisted inspection must be behaviorally read-only. Restore the active
+     * RAM configuration even when EEPROM parsing failed partway through. */
+    mcpwm_foc_set_configuration(&active,second);
+    if(!second)mcpwm_foc_refresh_encoder_configuration(false,true);
+    return ok;
 }
 
 void mc_interface_restore_default_motor(bool second, bool store_to_eeprom) {

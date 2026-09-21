@@ -245,6 +245,8 @@ HB_CLEAR_TRACE = 20
 HB_GET_PLATFORM_HEALTH = 21
 HB_GET_COMMS_HEALTH = 24
 HB_GET_PLATFORM_INFO = 25
+HB_GET_PERSISTED_MCCONF = 34
+HB_GET_PERSISTED_APPCONF = 35
 HB_GET_ADC_VALIDITY = 26
 HB_ARM_CURRENT_STEP = 27
 HB_GET_STEP_STATUS = 28
@@ -1319,6 +1321,20 @@ class VescDual:
             raise RuntimeError(f"comms_health status={status} len={len(p)}")
         vals=struct.unpack_from(">"+"I"*len(names),p,6)
         return dict(zip(names,vals))
+
+    def get_persisted_mcconf_raw(self, right: bool = False) -> bytes:
+        p=self.custom_transact(HB_GET_PERSISTED_MCCONF,right=right,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_PERSISTED_MCCONF)
+        if status: raise RuntimeError(f"persisted mcconf status={status}")
+        if len(p)<=6: raise RuntimeError("persisted mcconf payload empty")
+        return bytes(p[6:])
+
+    def get_persisted_appconf_raw(self, right: bool = False) -> bytes:
+        p=self.custom_transact(HB_GET_PERSISTED_APPCONF,right=right,timeout=max(self.timeout,1.2))
+        status=parse_custom_header(p,HB_GET_PERSISTED_APPCONF)
+        if status: raise RuntimeError(f"persisted appconf status={status}")
+        if len(p)<=6: raise RuntimeError("persisted appconf payload empty")
+        return bytes(p[6:])
 
     def platform_info(self) -> dict[str, int | str]:
         p=self.custom_transact(HB_GET_PLATFORM_INFO,right=False,timeout=max(self.timeout,1.2))

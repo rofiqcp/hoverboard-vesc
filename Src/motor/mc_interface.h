@@ -55,6 +55,8 @@ mc_state mc_interface_get_state_motor(bool is_second_motor);
 /* EEPROM persistence for the VESC-visible subset that affects this board. */
 bool mc_interface_store_configuration_motor(bool is_second_motor);
 bool mc_interface_load_configuration_motor(bool is_second_motor);
+bool mc_interface_read_persisted_configuration_motor(bool is_second_motor,
+                                                      mc_configuration *out);
 void mc_interface_restore_default_motor(bool is_second_motor, bool store_to_eeprom);
 
 #ifdef __cplusplus

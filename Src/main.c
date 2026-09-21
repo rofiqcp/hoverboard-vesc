@@ -255,6 +255,10 @@ int main(void) {
      * main-context budget. FOC current regulation remains interrupt-driven. */
     usart3_rx_check();
     vesc_protocol_process_pending();
+    /* Refresh the same heartbeat-qualified watchdog immediately after protocol
+     * work. This does not mask a dead ISR: platform_watchdog_service() reloads
+     * IWDG only when ADC + both motor heartbeats have advanced. */
+    platform_watchdog_service();
     vesc_now_ms = HAL_GetTick();
     vesc_protocol_periodic(vesc_now_ms);
     usart3_recovery_tick(vesc_now_ms);
@@ -297,6 +301,7 @@ int main(void) {
     app_vesc_process(HAL_GetTick());
     mcpwm_foc_energy_update(HAL_GetTick());
     mcpwm_foc_housekeeping_non_isr(HAL_GetTick());
+    platform_watchdog_service();
 
     /* Legacy serial has its own enable/beep handshake. A live VESC binary link
      * is armed by valid VESC traffic and must never enter this blocking ~300-ms

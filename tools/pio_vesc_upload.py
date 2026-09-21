@@ -143,7 +143,13 @@ class Link:
         print(f'[VESC] host UART -> {baud} baud', flush=True)
 
     def write(self,b):
-        self.ser.write(b); self.ser.flush()
+        self.ser.write(b)
+        # PL2303 on Jetson can block indefinitely in tcdrain() even after the
+        # full frame has entered the kernel/USB queue. open_serial_compat marks
+        # that adapter with _hb_skip_buffer_reset; transaction ACK/readback is
+        # sufficient proof that the frame reached the F103, so never tcdrain it.
+        if not getattr(self.ser,"_hb_skip_buffer_reset",False):
+            self.ser.flush()
 
     def read_some(self):
         d=self.ser.read(self.ser.in_waiting or 1)

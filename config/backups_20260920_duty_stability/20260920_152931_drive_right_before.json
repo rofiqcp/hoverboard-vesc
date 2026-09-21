@@ -1,0 +1,45 @@
+{
+  "mcconf_temp": {
+    "current_min_scale": 1.0,
+    "current_max_scale": 1.0,
+    "min_erpm": -4000.0,
+    "max_erpm": 4000.0,
+    "min_duty": 0.0,
+    "max_duty": 1.0,
+    "watt_min": -1500000.0,
+    "watt_max": 1500000.0,
+    "input_current_min": -15.0,
+    "input_current_max": 15.0,
+    "motor_poles": 30,
+    "gear_ratio": 1.0,
+    "wheel_diameter": 0.08299999684095383
+  },
+  "tuning": {
+    "kpq": 1382,
+    "kiq": 2304,
+    "kpd": 1382,
+    "kid": 2304,
+    "kps": 5000,
+    "kis": 5000,
+    "kds": 0,
+    "kpp": 25,
+    "kip": 0,
+    "kdp": 0,
+    "telem_filter_q16": 6554,
+    "current_limit_q4": 8000
+  },
+  "physical": {
+    "foc_q_kp": 0.8997395833333334,
+    "foc_q_ki": 500.00000000000006,
+    "foc_d_kp": 0.8997395833333334,
+    "foc_d_ki": 500.00000000000006,
+    "speed_kp": 0.05,
+    "speed_ki": 0.05,
+    "speed_kd": 0.0,
+    "pos_kp": 0.025,
+    "pos_ki": 0.0,
+    "pos_kd": 0.0,
+    "telemetry_filter": 0.10000762951094835,
+    "current_limit_a": 10.0
+  }
+}

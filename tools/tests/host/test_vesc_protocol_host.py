@@ -2,7 +2,7 @@
 from pathlib import Path
 import subprocess,tempfile,shutil,sys
 ROOT=next(p for p in Path(__file__).resolve().parents if (p/'platformio.ini').exists())
-HAL='''#pragma once\n#include <stdint.h>\n#include <stddef.h>\ntypedef struct {void*hdmatx;void*hdmarx;void*Instance;uint32_t gState;} UART_HandleTypeDef;\n#define HAL_OK 0\n#define HAL_UART_STATE_READY 0u\nuint32_t HAL_GetTick(void);\nint HAL_UART_Transmit(UART_HandleTypeDef*,uint8_t*,uint16_t,uint32_t);\nint HAL_UART_Transmit_DMA(UART_HandleTypeDef*,uint8_t*,uint16_t);\nvoid __disable_irq(void);\nvoid __enable_irq(void);\n'''
+HAL='''#pragma once\n#include <stdint.h>\n#include <stddef.h>\ntypedef struct {void*hdmatx;void*hdmarx;void*Instance;uint32_t gState;} UART_HandleTypeDef;\n#define HAL_OK 0\n#define HAL_UART_STATE_READY 0u\nuint32_t HAL_GetTick(void);\nvoid HAL_Delay(uint32_t);\nint HAL_UART_Transmit(UART_HandleTypeDef*,uint8_t*,uint16_t,uint32_t);\nint HAL_UART_Transmit_DMA(UART_HandleTypeDef*,uint8_t*,uint16_t);\nvoid __disable_irq(void);\nvoid __enable_irq(void);\n'''
 for cc in [c for c in ('gcc','clang') if shutil.which(c)]:
   with tempfile.TemporaryDirectory() as td:
     td=Path(td);(td/'stm32f1xx_hal.h').write_text(HAL)

@@ -8,7 +8,7 @@ extern volatile uint32_t boot_reset_reason;
 extern volatile uint32_t boot_reset_stage;
 
 #define PLATFORM_IWDG_SERVICE_MS 100u
-#define PLATFORM_IWDG_RELOAD     313u /* ~2.0 s at nominal 40-kHz LSI, /256 */
+#define PLATFORM_IWDG_RELOAD     625u /* ~4.0 s at nominal 40-kHz LSI, /256; still fail-closed but tolerates bounded protocol bursts */
 
 static volatile uint32_t s_feed_count=0u;
 static volatile uint32_t s_reject_count=0u;

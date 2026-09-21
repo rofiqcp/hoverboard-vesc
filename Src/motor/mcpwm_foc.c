@@ -1918,6 +1918,7 @@ static void speed_mode_enter(mcpwm_foc_motor_t *m) {
          * a low ERPM command immediately after breakaway. */
         m->m_speed_startup_active = 1u;
         m->m_speed_startup_ms = 0u;
+        m->m_speed_startup_rearm_ms = 0u;
     }
 }
 
@@ -1929,7 +1930,11 @@ static void set_control_mode(mcpwm_foc_motor_t *m, mc_control_mode mode) {
         const bool hall_rearm = (m->m_control_mode == CONTROL_MODE_NONE && mode != CONTROL_MODE_NONE);
         reset_current_pi(m);
         m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; m->m_speed_d_filter_q4=0;
-        if(mode!=CONTROL_MODE_SPEED){m->m_speed_startup_active=0u;m->m_speed_startup_ms=0u;}
+        if(mode!=CONTROL_MODE_SPEED){
+            m->m_speed_startup_active=0u;
+            m->m_speed_startup_ms=0u;
+            m->m_speed_startup_rearm_ms=0u;
+        }
         reset_position_pid(m);
         m->m_duty_i_q15=0; m->m_duty_pi_active=0u;
         m->m_brake_vq_prev=0; m->m_brake_speed_dir_prev=0; m->m_brake_zero_duty_samples=0u;
@@ -2303,7 +2308,7 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     float current=MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A;
     if(current<0.10f)current=0.10f;
     float previous=0.0f;
-    const float ratio=(float)MCCONF_POLE_PAIRS_LEFT;
+    const float ratio=(float)motor_pole_pairs(false);
     const uint32_t counts=m->m_encoder_counts>=4u?m->m_encoder_counts:MCCONF_ENCODER_COUNTS_DEFAULT;
     const int32_t half=(int32_t)(counts/2u);
     const float expected_f=(float)counts*60.0f/(360.0f*ratio);
@@ -2586,7 +2591,7 @@ bool mcpwm_foc_encoder_detect(float current, bool second, float *offset, float *
      * independently, so use it as the VESC encoder ratio and use the probe only
      * to prove A/B motion and determine inversion. At least one direction must
      * move by >=25% of the ideal 60-electrical-degree mechanical excursion. */
-    const float configured=(float)MCCONF_POLE_PAIRS_LEFT;
+    const float configured=(float)motor_pole_pairs(false);
     if(configured<1.0f || configured>100.0f){fail_code=11u; goto detect_fail;}
     const float ideal=60.0f/configured;
     const float min_motion=ideal*0.25f;
@@ -2665,16 +2670,51 @@ void mcpwm_foc_release_motor(bool second) {
     m->m_id_set_q4=0; m->m_openloop_id_target_q4=0;
     m->m_openloop_id_ramp_q16=0;
     m->m_speed_target_rpm=0; m->m_speed_target_rpm_q16=0; m->m_speed_set_rpm=0; m->m_speed_set_ramp_q16=0;
-    m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0; reset_position_pid(m);
+    m->m_speed_integrator=0; m->m_speed_prev_error=0; m->m_speed_sat_hold=0;
+    m->m_speed_startup_active=0u; m->m_speed_startup_ms=0u; m->m_speed_startup_rearm_ms=0u;
+    reset_position_pid(m);
     m->m_state=MC_STATE_OFF;
 }
 
 void mcpwm_foc_clear_fault(bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second);
+    const mc_fault_code prior=m->m_fault;
+
     /* A manual reset must never re-arm a bridge. Release first, then clear the
      * transient fault latch and its qualification state. If the underlying
      * condition still exists, the normal safety checks will fault again. */
     mcpwm_foc_release_motor(second);
+
+    /* Watchdog recovery can otherwise deadlock: the reset report is cleared
+     * while current_offset_valid is false, housekeeping immediately raises
+     * HIGH_OFFSET_CURRENT_SENSOR_1, and the bridge can never enter the powered
+     * zero-vector phase that would relearn its driven baseline.
+     *
+     * Restore only the bootstrap permission, and only when a bridge-OFF or
+     * already-learned powered baseline is independently plausible. This does
+     * NOT bypass a genuinely bad current sensor: implausible offsets keep the
+     * HIGH_OFFSET fault latched. Force powered_offset_valid false so the next
+     * legitimate drive request must perform a fresh powered zero-vector relearn
+     * before torque/current samples are trusted. */
+    if((prior==FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET ||
+        prior==FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1) &&
+       !m->m_current_offset_valid){
+        const bool off_ok=
+            m->m_off_offset_valid &&
+            current_offset_pair_plausible(m->m_off_offset0,m->m_off_offset1);
+        const bool driven_ok=
+            m->m_driven_offset_valid &&
+            driven_offset_pair_plausible(m->m_driven_offset0,m->m_driven_offset1);
+        if(off_ok||driven_ok){
+            m->m_current_offset_valid=1u;
+            m->m_driven_offset_powered_valid=0u;
+        }else{
+            m->m_fault=FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1;
+            m->m_state=MC_STATE_OFF;
+            return;
+        }
+    }
+
     m->m_fault_recovery_ticks=0u;
     m->m_fault_safe_ticks=0u;
     m->m_wrong_voltage_integrator=0u;
@@ -3093,12 +3133,30 @@ static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
                 const int8_t motion_dir = hall_motion_direction(second, dir);
                 uint16_t period = m->m_hall_ticks;
                 if (period == 0u) period = 1u;
+                /*
+                 * At very low traction speed, one premature/bouncing Hall edge
+                 * can make the period estimator report 2-5x the real speed.
+                 * The speed PI then removes torque from one wheel while the
+                 * other keeps driving, producing the observed alternating
+                 * left-stop/right-stop cycle.
+                 *
+                 * Keep the historical 4x limiter above 1000 eRPM, but tighten
+                 * it to 2x while the current filtered Hall period corresponds
+                 * to <=1000 eRPM. This rejects impossible single-edge jumps
+                 * without slowing normal higher-speed acceleration.
+                 */
+                const uint32_t low_speed_period_ticks =
+                    ((uint32_t)PWM_FREQ * 10u) / (uint32_t)MCCONF_HALL_PERIOD_LOW_SPEED_ERPM;
+                const uint32_t period_ratio =
+                    (m->m_hall_period >= low_speed_period_ticks)
+                    ? (uint32_t)MCCONF_HALL_PERIOD_OUTLIER_RATIO_LOW_SPEED
+                    : (uint32_t)MCCONF_HALL_PERIOD_OUTLIER_RATIO;
                 const bool period_outlier =
                     (m->m_hall_direction != 0 &&
                      m->m_hall_direction == dir &&
                      m->m_hall_direction_stable_edges >= MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES &&
                      m->m_hall_period < MCCONF_HALL_TIMEOUT_TICKS &&
-                     ((uint32_t)period * MCCONF_HALL_PERIOD_OUTLIER_RATIO) < m->m_hall_period);
+                     ((uint32_t)period * period_ratio) < m->m_hall_period);
                 uint16_t period_for_filter = period;
                 if (period_outlier) {
                     /* Never reject an electrically valid adjacent Hall state just
@@ -3113,7 +3171,7 @@ static void hall_process_state(mcpwm_foc_motor_t *m, bool second, uint8_t h) {
                         for(uint8_t rh=1u;rh<=6u;++rh) if(hall_table_angle(m,rh)==m->m_hall_pos_prev){m->m_hall_last_reject_from=rh;break;}
                         m->m_hall_last_reject_to = h;
                     }
-                    const uint16_t floor_period=(uint16_t)(m->m_hall_period/MCCONF_HALL_PERIOD_OUTLIER_RATIO);
+                    const uint16_t floor_period=(uint16_t)(m->m_hall_period/period_ratio);
                     if(floor_period>0u && period_for_filter<floor_period) period_for_filter=floor_period;
                 }
                 m->m_hall_reject_counted_state = 0xffu;
@@ -3935,38 +3993,93 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
      * first accepted edge, so an ordinary I-term can store >1 A and then throw
      * the unloaded wheel through several sectors at breakaway. Bound that Iq
      * authority until motion is actually proven, then clear stored integral so
-     * the normal speed loop takes over without a torque impulse. */
+     * the normal speed loop takes over without a torque impulse.
+     *
+     * A second protection handles low-speed re-stall: once startup has handed
+     * off, a sustained collapse below 100 eRPM with a real nonzero command
+     * re-arms the bounded current floor. This prevents the previous
+     * "move once -> handoff -> fall below stiction forever" behavior while the
+     * 250 ms qualification rejects brief Hall quantization dips. */
     int32_t startup_floor_q4=0;
+    const int64_t measured_abs_q16=measured64<0?-measured64:measured64;
+    const int64_t command_erpm_q16=(int64_t)m->m_speed_target_rpm_q16*pp;
+    const uint32_t command_abs_erpm=(uint32_t)(
+        (command_erpm_q16<0?-command_erpm_q16:command_erpm_q16)>>16);
+
+    /* Low-speed traction uses two torque envelopes:
+     * - startup: the proven gentle 0.65 A breakaway ceiling,
+     * - running: enough sustained authority to hold motion under load.
+     * The running path is additionally slew-limited before the current PI, so
+     * raising the ceiling cannot create a mechanical torque step. */
+    if(command_abs_erpm>0u &&
+       command_abs_erpm<=MCCONF_SPEED_LOW_TORQUE_REGION_ERPM){
+        const uint32_t cap_ma=m->m_speed_startup_active ?
+            (uint32_t)MCCONF_SPEED_STARTUP_CURRENT_MAX_MA :
+            (uint32_t)MCCONF_SPEED_LOW_RUN_CURRENT_MAX_MA;
+        const int32_t low_speed_cap_q4=(int32_t)(
+            (cap_ma*(uint32_t)FOC_CURRENT_Q4_PER_A+500u)/1000u);
+        if(limit_q4>low_speed_cap_q4)limit_q4=low_speed_cap_q4;
+    }
+
+    if(!m->m_speed_startup_active){
+        /* After low-speed startup has handed off, recovery is owned by the
+         * post-start governor (0.4-A bounded floor), not by another startup
+         * pulse. Re-entering the 0.65-A startup envelope at 500/1000 eRPM made
+         * an unloaded wheel repeat stall -> pulse -> overshoot. Higher-speed
+         * commands retain qualified startup re-arm after a genuine near-stall. */
+        const bool eligible_rearm=
+            command_abs_erpm>MCCONF_SPEED_LOW_TORQUE_REGION_ERPM &&
+            command_abs_erpm>=MCCONF_SPEED_STARTUP_REARM_MIN_TARGET_ERPM &&
+            measured_abs_q16<=((int64_t)MCCONF_SPEED_STARTUP_REARM_ERPM<<16);
+        if(eligible_rearm){
+            uint32_t rearm_ms=(uint32_t)m->m_speed_startup_rearm_ms+(dt_ms?dt_ms:1u);
+            if(rearm_ms>=MCCONF_SPEED_STARTUP_REARM_MS){
+                m->m_speed_startup_active=1u;
+                m->m_speed_startup_ms=0u;
+                m->m_speed_startup_rearm_ms=0u;
+                m->m_speed_integrator=0;
+            }else{
+                m->m_speed_startup_rearm_ms=(uint16_t)rearm_ms;
+            }
+        }else{
+            m->m_speed_startup_rearm_ms=0u;
+        }
+    }
+
     if(m->m_speed_startup_active){
-        int64_t am=measured64<0?-measured64:measured64;
+        int64_t am=measured_abs_q16;
         /* Base handoff on the FINAL RPM command, not the slew-limited setpoint.
          * Otherwise a 1000-ERPM request with a 1000-ERPM/s ramp can exit startup
          * at ~120 ERPM while the commanded ramp is still small, then fall back
          * below static friction. 40% gives low commands an early handoff while
          * capping higher commands at 600 ERPM to avoid an unloaded launch. */
-        int64_t command_erpm_q16=(int64_t)m->m_speed_target_rpm_q16*pp;
-        uint32_t command_abs_erpm=(uint32_t)((command_erpm_q16<0?-command_erpm_q16:command_erpm_q16)>>16);
         uint32_t exit_erpm=(command_abs_erpm*MCCONF_SPEED_STARTUP_EXIT_PERCENT+50u)/100u;
         if(exit_erpm<MCCONF_SPEED_STARTUP_EXIT_MIN_ERPM)exit_erpm=MCCONF_SPEED_STARTUP_EXIT_MIN_ERPM;
         if(exit_erpm>MCCONF_SPEED_STARTUP_EXIT_MAX_ERPM)exit_erpm=MCCONF_SPEED_STARTUP_EXIT_MAX_ERPM;
         const int64_t exit_q16=(int64_t)exit_erpm<<16;
         const bool sensor_moving=encoder_feedback_selected(m,second) ?
             (m->m_encoder_synced && am>=exit_q16) :
-            (m->m_hall_direction_stable_edges>=MCCONF_HALL_PERIOD_FILTER_WARMUP_EDGES && am>=exit_q16);
+            (m->m_hall_direction!=0 &&
+             m->m_hall_direction_stable_edges>=MCCONF_SPEED_STARTUP_EXIT_HALL_EDGES);
         if(sensor_moving){
             m->m_speed_startup_active=0u;
             m->m_speed_startup_ms=0u;
+            m->m_speed_startup_rearm_ms=0u;
             m->m_speed_integrator=0;
         }else{
             uint32_t ms=(uint32_t)m->m_speed_startup_ms+(dt_ms?dt_ms:1u);
             if(ms>65535u)ms=65535u;
             m->m_speed_startup_ms=(uint16_t)ms;
-            const int32_t startup_q4=(int32_t)(((uint32_t)MCCONF_SPEED_STARTUP_CURRENT_MAX_MA*
+            const bool strong_window=m->m_speed_startup_ms<=MCCONF_SPEED_STARTUP_STRONG_MS;
+            const uint32_t startup_cap_ma=strong_window ?
+                (uint32_t)MCCONF_SPEED_STARTUP_CURRENT_MAX_MA :
+                (uint32_t)MCCONF_SPEED_STARTUP_FALLBACK_MAX_MA;
+            const int32_t startup_q4=(int32_t)((startup_cap_ma*
                                                 (uint32_t)FOC_CURRENT_Q4_PER_A+500u)/1000u);
             if(limit_q4>startup_q4)limit_q4=startup_q4;
             uint32_t floor_ma=(uint32_t)MCCONF_SPEED_STARTUP_CURRENT_MIN_MA+
                 ((uint32_t)m->m_speed_startup_ms*(uint32_t)MCCONF_SPEED_STARTUP_CURRENT_RAMP_MA_S)/1000u;
-            if(floor_ma>MCCONF_SPEED_STARTUP_CURRENT_MAX_MA)floor_ma=MCCONF_SPEED_STARTUP_CURRENT_MAX_MA;
+            if(floor_ma>startup_cap_ma)floor_ma=startup_cap_ma;
             startup_floor_q4=(int32_t)((floor_ma*(uint32_t)FOC_CURRENT_Q4_PER_A+500u)/1000u);
         }
     }
@@ -3981,7 +4094,24 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
      * fraction of the requested speed period. */
     const int64_t min_erpm_q16 = (int64_t)m->m_speed_release_erpm_q16;
     const int64_t target_abs_q16 = target64 < 0 ? -target64 : target64;
-    if (target_abs_q16 < min_erpm_q16) {
+    /*
+     * Stage-8D: the release decision must follow the FINAL command, not only
+     * the slew-limited active setpoint. After a watchdog/re-entry the speed
+     * ramp is seeded from live feedback; if the wheel is stopped this can be
+     * below s_pid_min_erpm for a short time even though the host is still
+     * commanding 500 eRPM. Returning here used to bypass BOTH the startup
+     * torque floor and the Stage-8 anti-stall floor, producing cmd=500 with
+     * Iq=0 until the ramp recovered.
+     *
+     * True neutral remains fail-closed: the outer 1-kHz loop releases the
+     * bridge when m_speed_target_rpm_q16==0 and the ramp is below this same
+     * threshold. Only a nonzero final command is allowed to continue through
+     * the bounded startup/run torque logic below.
+     */
+    const int64_t command_abs_q16 =
+        command_erpm_q16 < 0 ? -command_erpm_q16 : command_erpm_q16;
+    if (target_abs_q16 < min_erpm_q16 &&
+        command_abs_q16 < min_erpm_q16) {
         m->m_speed_integrator = 0;
         m->m_speed_sat_hold = 0u;
         m->m_speed_prev_error = error_q16;
@@ -4046,16 +4176,100 @@ static int16_t speed_pid_iq_target_erpm_step(mcpwm_foc_motor_t *m, bool second,
         const int64_t erpm20_q16 = 20LL << 16;
         const int64_t low_target_q16=(int64_t)MCCONF_SPEED_LOW_NO_BRAKE_TARGET_ERPM<<16;
         const int64_t target_abs=target64<0?-target64:target64;
-        const bool low_speed_no_reverse_brake=target_abs<=low_target_q16;
-        bool suppressed=false;
-        if ((!m->m_conf.s_pid_allow_braking || low_speed_no_reverse_brake) &&
-            measured64 > erpm20_q16 && out_q4 < 0){out_q4=0;suppressed=true;}
-        if ((!m->m_conf.s_pid_allow_braking || low_speed_no_reverse_brake) &&
-            measured64 < -erpm20_q16 && out_q4 > 0){out_q4=0;suppressed=true;}
-        /* Do not wind the integral through a deliberately suppressed brake
-         * command; keep the previous I state until measured speed returns. */
-        if(suppressed)m->m_speed_integrator=i_old;
+        const bool low_speed_bounded_brake=target_abs<=low_target_q16;
+        const int32_t low_brake_cap_q4=(int32_t)(
+            ((uint32_t)MCCONF_SPEED_LOW_BRAKE_CURRENT_MAX_MA*
+             (uint32_t)FOC_CURRENT_Q4_PER_A+500u)/1000u);
+        bool brake_limited=false;
+
+        /*
+         * Low-speed Hall traction needs some damping. The previous implementation
+         * forced every overspeed correction to zero below 600 eRPM, creating a
+         * push -> overshoot -> coast -> push limit-cycle. Preserve the VESC
+         * "allow braking" switch, but when braking is allowed clamp reverse Iq
+         * to a small deterministic ceiling instead of disabling it entirely.
+         */
+        if(!m->m_conf.s_pid_allow_braking){
+            if(measured64 > erpm20_q16 && out_q4 < 0){out_q4=0;brake_limited=true;}
+            if(measured64 < -erpm20_q16 && out_q4 > 0){out_q4=0;brake_limited=true;}
+        }else if(low_speed_bounded_brake){
+            if(measured64 > erpm20_q16 && out_q4 < -low_brake_cap_q4){
+                out_q4=-low_brake_cap_q4;
+                brake_limited=true;
+            }
+            if(measured64 < -erpm20_q16 && out_q4 > low_brake_cap_q4){
+                out_q4=low_brake_cap_q4;
+                brake_limited=true;
+            }
+        }
+
+        /* Anti-windup: while the low-speed brake is being clamped, hold the
+         * previous integral state so I cannot demand progressively more reverse
+         * torque behind the limiter. */
+        if(brake_limited)m->m_speed_integrator=i_old;
     }
+
+    /*
+     * FINAL low-speed forward anti-stall floor.
+     *
+     * This intentionally runs after every PID/brake clamp so no later branch
+     * can erase the minimum sustaining torque. Use RAW Hall speed for the
+     * decision, matching the telemetry that proved the left wheel had actually
+     * stopped while the command remained at +500 eRPM.
+     *
+     * User-forward is +ERPM externally. Motor 2 is internally inverted, so map
+     * user-forward into the motor-local target sign before applying the floor.
+     */
+    if(!m->m_speed_startup_active &&
+       command_abs_erpm>0u &&
+       command_abs_erpm<=MCCONF_SPEED_LOW_NO_BRAKE_TARGET_ERPM){
+        const bool user_forward=
+            m->m_conf.m_invert_direction ? (target64<0) : (target64>0);
+        if(user_forward){
+            /*
+             * Stage-8B post-startup low-speed governor.
+             * Keep the speed PID authoritative, but bound its requested Iq at
+             * the proven gentle recovery current. Stage-8 telemetry showed the
+             * uncapped PID reaching ~0.64..0.65 A at a 500-eRPM command after a
+             * sparse Hall low sample, immediately followed by multi-kERPM Hall
+             * bursts and a host overspeed trip. Startup assist is excluded by
+             * the outer condition, so paired breakaway remains unchanged.
+             */
+            int32_t run_cap_q4=(int32_t)(
+                ((uint32_t)MCCONF_SPEED_FWD_RUN_CURRENT_MAX_MA*
+                 (uint32_t)FOC_CURRENT_Q4_PER_A+500u)/1000u);
+            if(run_cap_q4>limit_q4)run_cap_q4=limit_q4;
+            out_q4=CLAMP(out_q4,-run_cap_q4,run_cap_q4);
+
+            const int64_t hall_mech_q16=(int64_t)measured_mech_rpm_raw_q16(m,second);
+            const int64_t hall_erpm_q16=hall_mech_q16*(int64_t)pp;
+            const int64_t hall_abs_q16=hall_erpm_q16<0?-hall_erpm_q16:hall_erpm_q16;
+            const bool same_or_stopped=
+                hall_erpm_q16==0 ||
+                (target64>0 ? hall_erpm_q16>0 : hall_erpm_q16<0);
+            if(same_or_stopped){
+                /*
+                 * At the 500-eRPM traction point the physical steady-state
+                 * current is small. Keep a sustaining torque for the held
+                 * forward command so sparse Hall timing cannot make one wheel
+                 * coast to zero while the other keeps moving. Near a true stall
+                 * the floor is raised to the bounded recovery value below.
+                 */
+                uint32_t floor_ma=(uint32_t)MCCONF_SPEED_FWD_RUN_HOLD_CURRENT_MA;
+                if(hall_abs_q16<=((int64_t)MCCONF_SPEED_FWD_RECOVERY_APPLY_ERPM<<16))
+                    floor_ma=(uint32_t)MCCONF_SPEED_FWD_RECOVERY_CURRENT_MA;
+                int32_t floor_q4=(int32_t)(
+                    (floor_ma*(uint32_t)FOC_CURRENT_Q4_PER_A+500u)/1000u);
+                if(floor_q4>limit_q4)floor_q4=limit_q4;
+                if(target64>0){
+                    if(out_q4<floor_q4)out_q4=floor_q4;
+                }else{
+                    if(out_q4>-floor_q4)out_q4=-floor_q4;
+                }
+            }
+        }
+    }
+
     return (int16_t)CLAMP(out_q4,-limit_q4,limit_q4);
 }
 
@@ -4686,12 +4900,51 @@ static void motor_control_step(mcpwm_foc_motor_t *m, bool second, int16_t i0_cou
             }
             if (m->m_control_mode==CONTROL_MODE_SPEED) {
                 /* Outer SPEED PID berjalan 1 kHz di main context seperti thread
-                 * FOC PID VESC. ISR hanya menutup current loop dengan cached Iq. */
-                m->m_iq_set_q4=m->m_iq_target_q4;
-                m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
+                 * FOC PID VESC. ISR menutup current loop dengan cached Iq.
+                 *
+                 * Low-speed traction is slew-limited here, directly before the
+                 * current PI. This is the final protection against a torque
+                 * impulse: the PID may request enough sustained current to keep
+                 * the wheel moving, but that request cannot jump between control
+                 * slots. */
+                int16_t iq_target=m->m_iq_target_q4;
                 if(foc_prof_detail_sample)profStageStart=DWT->CYCCNT;
-                m->m_iq_set_q4=current_circle_iq_limit_q4(m,m->m_iq_set_q4);
+                iq_target=current_circle_iq_limit_q4(m,iq_target);
                 if(foc_prof_detail_sample){const uint32_t used=DWT->CYCCNT-profStageStart;if(used>foc_prof_current_circle_max_cycles)foc_prof_current_circle_max_cycles=used;}
+
+                const int32_t pp=(int32_t)motor_pole_pairs(second);
+                int64_t cmd_erpm64=(int64_t)m->m_speed_target_rpm_q16*pp;
+                if(cmd_erpm64<0)cmd_erpm64=-cmd_erpm64;
+                const uint32_t cmd_abs_erpm=(uint32_t)(cmd_erpm64>>16);
+                if(cmd_abs_erpm>0u && cmd_abs_erpm<=MCCONF_SPEED_LOW_TORQUE_REGION_ERPM){
+                    const int64_t target_q16=(int64_t)iq_target*65536LL;
+                    int64_t cur_q16=(int64_t)m->m_iq_set_ramp_q16;
+                    const bool adding_magnitude=
+                        ((target_q16>=0 && cur_q16>=0)||(target_q16<=0 && cur_q16<=0)) &&
+                        ((target_q16<0?-target_q16:target_q16) >
+                         (cur_q16<0?-cur_q16:cur_q16));
+                    const uint32_t slew_ma_s=adding_magnitude ?
+                        (uint32_t)MCCONF_SPEED_LOW_IQ_SLEW_UP_MA_S :
+                        (uint32_t)MCCONF_SPEED_LOW_IQ_SLEW_DOWN_MA_S;
+                    const uint32_t control_hz=(uint32_t)PWM_FREQ/(uint32_t)MCCONF_FOC_CONTROL_DIV;
+                    int64_t step_q16=((int64_t)slew_ma_s*(int64_t)FOC_CURRENT_Q4_PER_A*65536LL)/
+                                     (1000LL*(int64_t)(control_hz?control_hz:1u));
+                    if(step_q16<1)step_q16=1;
+                    if(cur_q16<target_q16){
+                        cur_q16+=step_q16;
+                        if(cur_q16>target_q16)cur_q16=target_q16;
+                    }else if(cur_q16>target_q16){
+                        cur_q16-=step_q16;
+                        if(cur_q16<target_q16)cur_q16=target_q16;
+                    }
+                    if(cur_q16>INT32_MAX)cur_q16=INT32_MAX;
+                    if(cur_q16<INT32_MIN)cur_q16=INT32_MIN;
+                    m->m_iq_set_ramp_q16=(int32_t)cur_q16;
+                    m->m_iq_set_q4=(int16_t)CLAMP((int32_t)(cur_q16>>16),-32768,32767);
+                }else{
+                    m->m_iq_set_q4=iq_target;
+                    m->m_iq_set_ramp_q16=(int32_t)m->m_iq_set_q4*65536;
+                }
                 const int16_t eq=(int16_t)CLAMP((int32_t)m->m_iq_set_q4-m->m_iq_q4,-32768,32767);
                 if(foc_prof_detail_sample)profStageStart=DWT->CYCCNT;
                 v.q=current_pi_vesc_state(eq,m->m_current_kpq_err_q8,m->m_current_kiq_err_q8,
@@ -5031,22 +5284,24 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
         s_outer_pid_last_cycle=cycle_start;
         return;
     }
-    uint32_t dt_ms=now_ms-s_outer_pid_last_ms;
-    if(dt_ms==0u)return;
+    uint32_t elapsed_ms=now_ms-s_outer_pid_last_ms;
+    if(elapsed_ms==0u)return;
     const uint32_t period_cycles=cycle_start-s_outer_pid_last_cycle;
     s_outer_pid_last_cycle=cycle_start;
     if(period_cycles<outer_control_period_min_cycles)outer_control_period_min_cycles=period_cycles;
     if(period_cycles>outer_control_period_max_cycles)outer_control_period_max_cycles=period_cycles;
-    const uint64_t expected64=(uint64_t)OUTER_PID_PERIOD_CYCLES*(uint64_t)dt_ms;
+    const uint64_t expected64=(uint64_t)OUTER_PID_PERIOD_CYCLES*(uint64_t)elapsed_ms;
     const uint32_t expected=expected64>UINT32_MAX?UINT32_MAX:(uint32_t)expected64;
     const uint32_t jitter=(period_cycles>expected)?(period_cycles-expected):(expected-period_cycles);
     if(jitter>outer_control_jitter_max_cycles)outer_control_jitter_max_cycles=jitter;
-    if(dt_ms>1u)outer_control_miss_count += dt_ms-1u;
+    if(elapsed_ms>1u)outer_control_miss_count += elapsed_ms-1u;
     s_outer_pid_last_ms=now_ms;
-    /* Normalnya tepat 1 ms. Gap panjang menandakan main sempat diblokir; jangan
-     * melakukan stale catch-up. Satu evaluasi memakai dt aktual yang dibatasi
-     * agar integral/derivative tidak memberi impulse berbahaya setelah stall. */
-    if(dt_ms>3u)dt_ms=3u;
+    /* Setpoint slew follows real wall time. If main context was delayed, the
+     * commanded ERPM ramp must not run artificially slow and accumulate target
+     * lag. PID I/D math remains capped to 3 ms so a long scheduling gap cannot
+     * inject an integral/derivative impulse on the first recovered iteration. */
+    uint32_t pid_dt_ms=elapsed_ms;
+    if(pid_dt_ms>3u)pid_dt_ms=3u;
 
     /* Snapshot feedback lebih dulu sehingga kedua outer loop memakai data yang
      * konsisten dari tick 1-kHz yang sama. Semua konversi ini di luar ADC ISR. */
@@ -5072,7 +5327,7 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
         if(m->m_fault!=FAULT_CODE_NONE)continue;
         if(m->m_control_mode==CONTROL_MODE_SPEED){
             const uint32_t profSpeedStart=DWT->CYCCNT;
-            speed_setpoint_slew_step(m,dt_ms);
+            speed_setpoint_slew_step(m,elapsed_ms);
             const int32_t pp=(int32_t)motor_pole_pairs(second);
             const int64_t set_erpm_q16=(int64_t)m->m_speed_set_ramp_q16*pp;
             const int64_t abs_set=set_erpm_q16<0?-set_erpm_q16:set_erpm_q16;
@@ -5082,13 +5337,13 @@ void mcpwm_foc_outer_control_non_isr(uint32_t now_ms) {
                 m->m_speed_sat_hold=0; m->m_speed_d_filter_q4=0;
                 mcpwm_foc_release_motor(second);
             }else{
-                m->m_iq_target_q4=speed_pid_iq_target_step(m,second,dt_ms);
+                m->m_iq_target_q4=speed_pid_iq_target_step(m,second,pid_dt_ms);
             }
             const uint32_t profSpeedUsed=DWT->CYCCNT-profSpeedStart;
             if(profSpeedUsed>foc_prof_speed_pid_max_cycles)foc_prof_speed_pid_max_cycles=profSpeedUsed;
         }else if(m->m_control_mode==CONTROL_MODE_POS){
             const uint32_t profPosStart=DWT->CYCCNT;
-            m->m_iq_target_q4=position_pid_iq_target_step(m,second,dt_ms);
+            m->m_iq_target_q4=position_pid_iq_target_step(m,second,pid_dt_ms);
             const uint32_t profPosUsed=DWT->CYCCNT-profPosStart;
             if(profPosUsed>foc_prof_position_pid_max_cycles)foc_prof_position_pid_max_cycles=profPosUsed;
         }

@@ -72,6 +72,8 @@
 #define HB_CUSTOM_START_RELAY_AUTOTUNE              31u /* stage-2 firmware-clocked speed/position relay */
 #define HB_CUSTOM_GET_RELAY_AUTOTUNE                32u
 #define HB_CUSTOM_ABORT_RELAY_AUTOTUNE              33u
+#define HB_CUSTOM_GET_PERSISTED_MCCONF              34u /* read EEPROM-backed MC config without storing */
+#define HB_CUSTOM_GET_PERSISTED_APPCONF             35u /* read EEPROM-backed App config without storing */
 #define HB_PLATFORM_SCHEMA 2u
 #define HB_DIAG_SCHEMA 4u
 #define HB_ISR_SCHEMA 3u
@@ -1135,7 +1137,10 @@ static void set_mcconf(bool second, const uint8_t *data, uint16_t len) {
             if(c->foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER && c->foc_sensor_mode!=FOC_SENSOR_MODE_ENCODER_AB)
                 c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
             if(c->m_encoder_counts<4 || c->m_encoder_counts>65536)c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
-            if(!(c->foc_encoder_ratio>=0.01f && c->foc_encoder_ratio<=MCCONF_ENCODER_RATIO_MAX))c->foc_encoder_ratio=(float)MCCONF_POLE_PAIRS_LEFT;
+            if(!(c->foc_encoder_ratio>=0.01f && c->foc_encoder_ratio<=MCCONF_ENCODER_RATIO_MAX)){
+                const uint8_t poles=(c->si_motor_poles>=2u && !(c->si_motor_poles&1u))?c->si_motor_poles:30u;
+                c->foc_encoder_ratio=(float)(poles/2u);
+            }
             while(c->foc_encoder_offset>=360.0f)c->foc_encoder_offset-=360.0f;
             while(c->foc_encoder_offset<0.0f)c->foc_encoder_offset+=360.0f;
         }else{
@@ -1532,7 +1537,8 @@ static bool detect_all_prepare_encoder_left(void) {
     c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;
     c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;
     c->m_encoder_counts=(int32_t)MCCONF_ENCODER_COUNTS_DEFAULT;
-    c->si_motor_poles=(uint8_t)(2u*MCCONF_POLE_PAIRS_LEFT);
+    /* Preserve the per-board pole count already present in result[0].
+     * Steering LEFT and drive LEFT are different physical motors. */
     c->foc_encoder_offset=off; c->foc_encoder_ratio=ratio; c->foc_encoder_inverted=inv;
     s_detect_all.encoder_offset=off; s_detect_all.encoder_ratio=ratio; s_detect_all.encoder_inverted=inv?1u:0u;
     /* Detect-All mengikuti semantik VESC: komisioning sensor hanya mencari
@@ -2682,6 +2688,38 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_uint32(b,MCPWM_FOC_ISR_PROFILE_REVISION,&j); buffer_append_uint16(b,MCPWM_FOC_TRACE_CAPACITY,&j);
         buffer_append_uint16(b,MCPWM_FOC_PROFILE_SLOT_CAPACITY,&j); uart_send_payload(b,(uint16_t)j); return;
     }
+    if (op == HB_CUSTOM_GET_PERSISTED_MCCONF) {
+        mc_configuration persisted;
+        int32_t j=0;
+        s_config_payload[j++]=COMM_CUSTOM_APP_DATA;
+        s_config_payload[j++]=HB_CUSTOM_MAGIC0; s_config_payload[j++]=HB_CUSTOM_MAGIC1;
+        s_config_payload[j++]=HB_CUSTOM_VERSION; s_config_payload[j++]=op;
+        const bool ok=mc_interface_read_persisted_configuration_motor(second,&persisted);
+        s_config_payload[j++]=ok?0u:1u;
+        if(ok){
+            const int32_t nmc=confgenerator_serialize_mcconf(&s_config_payload[j],&persisted);
+            if(nmc>0 && (uint32_t)(j+nmc)<=sizeof(s_config_payload)){
+                uart_send_payload(s_config_payload,(uint16_t)(j+nmc)); return;
+            }
+        }
+        uart_send_payload(s_config_payload,(uint16_t)j); return;
+    }
+    if (op == HB_CUSTOM_GET_PERSISTED_APPCONF) {
+        app_configuration persisted;
+        int32_t j=0;
+        s_config_payload[j++]=COMM_CUSTOM_APP_DATA;
+        s_config_payload[j++]=HB_CUSTOM_MAGIC0; s_config_payload[j++]=HB_CUSTOM_MAGIC1;
+        s_config_payload[j++]=HB_CUSTOM_VERSION; s_config_payload[j++]=op;
+        const bool ok=app_vesc_read_persisted_configuration(second,&persisted);
+        s_config_payload[j++]=ok?0u:1u;
+        if(ok){
+            const int32_t napp=confgenerator_serialize_appconf(&s_config_payload[j],&persisted);
+            if(napp>0 && (uint32_t)(j+napp)<=sizeof(s_config_payload)){
+                uart_send_payload(s_config_payload,(uint16_t)(j+napp)); return;
+            }
+        }
+        uart_send_payload(s_config_payload,(uint16_t)j); return;
+    }
     if (op == HB_CUSTOM_GET_ADC_VALIDITY) {
         mcpwm_foc_adc_sample_diag_t q;mcpwm_foc_get_adc_sample_diag(second,&q);
         uint8_t b[40];int32_t j=0;b[j++]=COMM_CUSTOM_APP_DATA;b[j++]=HB_CUSTOM_MAGIC0;b[j++]=HB_CUSTOM_MAGIC1;b[j++]=HB_CUSTOM_VERSION;b[j++]=op;b[j++]=0u;
@@ -3169,10 +3207,18 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     }
 }
 
-/** VESC Tool Terminal output. Keep one print below the normal payload limit. */
+/** VESC Tool Terminal output.
+ * Terminal help is intentionally multi-packet. Wait for TX room so a long
+ * vertical help listing is not silently truncated by the 8-slot UART queue. */
 static void terminal_send_text(const char *text) {
     static uint8_t b[VESC_MAX_PAYLOAD];
     if(!text)return;
+    const uint32_t wait_start=HAL_GetTick();
+    while(vesc_tx_queue_count()>=(VESC_TX_QUEUE_DEPTH-2u)){
+        vesc_tx_service();
+        if((uint32_t)(HAL_GetTick()-wait_start)>=250u)break;
+        HAL_Delay(1u);
+    }
     size_t n=strlen(text); if(n>sizeof(b)-1u)n=sizeof(b)-1u;
     b[0]=COMM_PRINT; memcpy(&b[1],text,n); uart_send_payload(b,(uint16_t)(n+1u));
 }
@@ -3233,9 +3279,94 @@ static bool terminal_float(const char *s,float *out){
 static void terminal_lower(char *s){for(;s&&*s;s++)if(*s>='A'&&*s<='Z')*s=(char)(*s-'A'+'a');}
 
 static void terminal_help(void){
-    terminal_send_text("Commands:\nREAD help fw status values model encoder|enc config|mcconf tuning faults perf detect\nCTRL set duty X | current A | current_rel X | brake A | handbrake A | rpm ERPM | pos 0..360 | steer -30..30 | id A PHASE | openloop A ERPM | stop [all|hard] | release [all]\n");
-    terminal_send_text("Commands: CFG: set sensor encoder|hall | invert 0|1 | current_limit A | input_current MIN MAX | erpm_limit MIN MAX | poles N | gear R | encoder_counts N | encoder_ratio R | encoder_offset DEG | encoder_invert 0|1 | pos_kp/pos_ki/pos_kd/pos_kd_proc V | speed_kp/speed_ki/speed_kd V | speed_ramp ERPM_S | speed_src 0PLL|1FAST | decoupling 0OFF|1CROSS|2BEMF|3BOTH | current_kp/current_ki V. FAULT: faults | faults clear|reset | faults_clear | faults_reset. SAVE: save mcconf|steering | load mcconf | defaults [save]\n");
-    terminal_send_text("Commands: DETECT hall [A] | encoder [START_A] | all [LOSS MIN_IN MAX_IN OPENRPM SLERPM] | status|cancel | home; alias foc_encoder_detect. Detect Encoder LEFT: electrical ABI detect + 2x sweep hard-stop kiri/kanan + simpan span. Detect All: R/L/flux kedua motor + sensor commissioning; tidak mengubah hard-stop/span steering. RIGHT Hall-only. rpm=ERPM, A=amp, rel=-1..1.\n");
+    terminal_send_text(
+        "\n=== VESC TERMINAL HELP | F103 USART2 ===\n"
+        "A=ampere | ERPM=electrical RPM | LEFT steering=ABI encoder\n");
+
+    terminal_send_text(
+        "--- READ ---\n"
+        "help / ?                         (bantuan ini)\n"
+        "fw                               (firmware, ID, role, sensor)\n"
+        "status / values / faults         (telemetri + fault motor terpilih)\n"
+        "model                            (R, L, flux, sensor, Hall table)\n"
+        "encoder / enc                    (status ABI encoder LEFT)\n"
+        "config / mcconf                  (ringkasan konfigurasi)\n"
+        "tuning                           (gain current/speed/position)\n"
+        "perf [reset]                     (performance counter; reset opsional)\n"
+        "trace meta/clear/freeze           (kontrol trace ISR)\n"
+        "trace sample N                    (N=0..255)\n");
+
+    terminal_send_text(
+        "--- STEERING / DETECT ---\n"
+        "steering status                  (span, home, sync, sweep, invert)\n"
+        "steering center / zero           (posisi sekarang = center / 0 deg)\n"
+        "steering reset                   (hapus span; config elektrik tetap)\n"
+        "steering invert 0/1              (mapping logical normal/invert)\n"
+        "home                             (home/startup center LEFT encoder)\n"
+        "detect / detect status           (status/progress detect)\n");
+
+    terminal_send_text(
+        "detect hall [A]                  (A=0.3..30; default 3.0)\n"
+        "detect encoder [A]               (LEFT span 2x sweep; A=0.3..15; default 3.0)\n"
+        "detect encoder 1.0               (contoh span LEFT dengan 1.0 A)\n"
+        "foc_encoder_detect [A]           (alias terminal detect encoder)\n"
+        "detect all [LOSS MIN MAX OPEN SL](FOC Detect-All dari LEFT/ID1)\n"
+        "detect cancel                    (batalkan detect aktif)\n");
+
+    terminal_send_text(
+        "--- CONTROL ---\n"
+        "set duty X                       (X=-1..1)\n"
+        "set current A                    (A=-30..30)\n"
+        "set current_rel X                (X=-1..1)\n"
+        "set brake A                      (A=0..30)\n"
+        "set handbrake A                  (A=0..30)\n"
+        "set rpm ERPM                     (dalam limit aktif; maksimum -15000..15000)\n"
+        "set pos DEG                      (LEFT=0..360; RIGHT=PID position)\n"
+        "set steer DEG                    (LEFT=-30..30 deg)\n"
+        "set id A PHASE                   (A=0..30; open-loop phase)\n"
+        "set openloop A ERPM              (A=-30..30; ERPM=-15000..15000)\n"
+        "stop [all|hard]                  (standby / hard release)\n"
+        "release [all]                    (release override)\n");
+
+    terminal_send_text(
+        "--- CONFIG | RAM, lalu 'save mcconf' ---\n"
+        "set sensor encoder/hall           (encoder hanya LEFT)\n"
+        "set invert 0/1                   (arah motor)\n"
+        "set current_limit A              (A=0.1..30)\n"
+        "set input_current MIN MAX        (MIN=-17..-0.1; MAX=0.1..17 A)\n"
+        "set erpm_limit MIN MAX           (MIN=-15000..<0; MAX=>0..15000)\n"
+        "set poles N                      (N genap 2..254)\n"
+        "set gear R                       (R=0.01..1000)\n"
+        "set encoder_counts N             (LEFT; N=4..65536)\n"
+        "set encoder_ratio R              (LEFT; R=0.01..10000)\n"
+        "set encoder_offset DEG           (LEFT; DEG=-100000..100000)\n"
+        "set encoder_invert 0/1           (LEFT electrical encoder direction)\n");
+
+    terminal_send_text(
+        "--- TUNING | RAM, lalu 'save mcconf' ---\n"
+        "set current_kp V                 (V=0..42.666)\n"
+        "set current_ki V                 (V=0..14222.005)\n"
+        "set speed_kp V                   (V=0..0.65535)\n"
+        "set speed_ki V                   (V=0..0.65535)\n"
+        "set speed_kd V                   (V=0..0.65535)\n"
+        "set speed_ramp ERPM_S            (100..75000 ERPM/s)\n"
+        "set speed_src 0/1                (0=PLL, 1=FAST)\n"
+        "set pos_kp V                     (V=0..65.535)\n"
+        "set pos_ki V                     (V=0..65.535)\n"
+        "set pos_kd V                     (V=0..65.535)\n"
+        "set pos_kd_proc V                (V=0..10)\n"
+        "set decoupling 0/1/2/3           (OFF/CROSS/BEMF/BOTH)\n");
+
+    terminal_send_text(
+        "--- FAULT / SAVE ---\n"
+        "faults clear/reset               (clear semua motor fault)\n"
+        "faults_clear / faults_reset       (alias)\n"
+        "reset_faults / reset faults       (alias)\n"
+        "save mcconf                      (simpan config motor ke flash)\n"
+        "save steering                    (simpan kalibrasi steering LEFT)\n"
+        "load mcconf                      (muat config dari flash)\n"
+        "defaults [save]                  (default RAM; 'save' juga simpan flash)\n"
+        "NOTE: Terminal detect encoder = span mekanik. COMM_DETECT_ENCODER API = electrical ABI + span.\n");
 }
 
 static void terminal_values(bool second){
@@ -3266,7 +3397,7 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
     float v;if(!c||!k||!sv)return -1;
     if(!strcmp(k,"sensor")){
         if(!strcmp(sv,"hall")){c->m_sensor_port_mode=SENSOR_PORT_MODE_HALL;c->sensor_mode=SENSOR_MODE_SENSORED;c->foc_sensor_mode=FOC_SENSOR_MODE_HALL;return 1;}
-        if(!second&&!strcmp(sv,"encoder")){c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;c->sensor_mode=SENSOR_MODE_SENSORED;c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;c->m_encoder_counts=MCCONF_ENCODER_COUNTS_DEFAULT;c->si_motor_poles=2u*MCCONF_POLE_PAIRS_LEFT;c->foc_encoder_ratio=MCCONF_POLE_PAIRS_LEFT;return 1;}return -1;
+        if(!second&&!strcmp(sv,"encoder")){c->m_sensor_port_mode=SENSOR_PORT_MODE_ABI;c->sensor_mode=SENSOR_MODE_SENSORED;c->foc_sensor_mode=FOC_SENSOR_MODE_ENCODER;c->m_encoder_counts=MCCONF_ENCODER_COUNTS_DEFAULT;if(c->si_motor_poles<2u||(c->si_motor_poles&1u))c->si_motor_poles=30u;c->foc_encoder_ratio=(float)(c->si_motor_poles/2u);return 1;}return -1;
     }
     if(!terminal_float(sv,&v))return -1;
     long i=(long)v;

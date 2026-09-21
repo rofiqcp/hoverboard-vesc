@@ -1,0 +1,2 @@
+cmd,t,left_erpm,right_erpm,left_duty,right_duty,left_iq,right_iq,left_id,right_id,left_vin,right_vin,left_fault,right_fault,left_hall_rejects,right_hall_rejects,left_seq,right_seq,left_trips,right_trips
+0.1,0.31155835800018394,0.0,471.0,0.1,0.1,0.58,0.47,0.03,0.0,42.3,42.3,0,0,54,110,0,0,0,0

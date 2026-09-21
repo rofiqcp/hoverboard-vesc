@@ -257,6 +257,44 @@ term help @left
 
 Semua frame memakai encoding VESC 6.00 dari `vesc_dual.py`; RIGHT dikirim melalui `COMM_FORWARD_CAN` ID 2. Satu-satunya frontend operasional adalah `vesc_tool.py`.
 
+### Help terminal firmware
+
+Untuk melihat daftar terminal firmware yang lengkap dan ditulis satu command per baris:
+
+```text
+term help @left
+```
+
+Jika memakai VESC Tool GUI melalui TCP bridge ROS port 65102, cukup buka **Terminal** lalu ketik:
+
+```text
+help
+```
+
+Contoh penting:
+
+```text
+detect encoder 1.0
+foc_encoder_detect 1.0
+steering status
+steering center
+steering invert 0
+detect hall 3.0
+detect
+detect all
+detect cancel
+home
+save mcconf
+save steering
+faults clear
+stop all
+release all
+```
+
+Perbedaan jalur encoder harus diperhatikan. Command `term detect encoder 1.0 @left` atau `detect encoder 1.0` yang diketik langsung di **VESC Tool Terminal** masuk ke parser terminal firmware dan melakukan kalibrasi mekanik span steering LEFT dengan dua sweep hard-stop sambil mempertahankan konfigurasi elektrik encoder yang sudah ada. Sebaliknya, command CLI `detect encoder 1.0 left` pada `tools/vesc_tool.py` memakai paket biner `COMM_DETECT_ENCODER`, sehingga melakukan deteksi elektrik ABI terlebih dahulu lalu kalibrasi span mekanik.
+
+Help firmware juga menjelaskan seluruh command read/status, steering, detection, control, sensor config, current/speed/position tuning, fault, performance/trace, save/load/default, stop, dan release.
+
 Selftest tanpa hardware:
 
 ```bash

@@ -333,12 +333,33 @@ Detection / config:
   alive [target] | shutdown [target] | reboot [target]
   bootloader                             handoff local F103 ke resident bootloader
 
-Terminal VESC firmware:
-  term COMMAND... [@left|@right|@both]    contoh: term status @left
-  term steering zero @left
-  term set sensor encoder @left
-  term save mcconf @left
-  term help @left                         seluruh command terminal firmware
+Terminal VESC firmware (COMM_TERMINAL_CMD pass-through):
+  term help @left                         help firmware lengkap, satu command per baris
+  term status @left                       telemetry/status dari parser terminal firmware
+  term encoder @left                      debug ABI encoder LEFT
+  term steering status @left              status span/home/sync steering LEFT
+  term steering zero @left                posisi sekarang menjadi center/0 deg
+  term steering invert 0|1 @left          mapping logical steering normal/invert
+  term detect hall 3.0 @left              mulai Hall detect 3.0 A; poll term detect
+  term detect encoder 1.0 @left           span-only: 2x sweep hard-stop LEFT 1.0 A
+  term foc_encoder_detect 1.0 @left       alias terminal dari detect encoder
+  term detect all @left                   Detect-All FOC; tidak overwrite span steering
+  term detect @left                       status/progress detect
+  term detect cancel @left                batalkan detect yang aktif
+  term home @left                         homing/startup center LEFT encoder
+  term set sensor encoder @left           ubah sensor LEFT ke ABI encoder di RAM
+  term set sensor hall @left              ubah sensor ke Hall di RAM
+  term set steer 0 @left                  steering LEFT langsung ke 0 deg
+  term set rpm 1000 @right                PID speed RIGHT 1000 ERPM
+  term save mcconf @left                  simpan MC config terpilih ke flash
+  term save steering @left                simpan kalibrasi steering LEFT
+  term faults clear @left                 reset fault
+  term stop all @left                     standby kedua motor pada board
+  term COMMAND... [@left|@right|@both]    command lain; lihat 'term help @left'
+
+PENTING:
+  detect encoder 1.0 left                 memakai COMM_DETECT_ENCODER: electrical ABI detect + span.
+  term detect encoder 1.0 @left           memakai parser terminal: span mekanik saja, config elektrik dipertahankan.
 
 Shortcut: current/rpm/duty/pos/brake/handbrake ... = set <mode> ...
 quit / exit / q

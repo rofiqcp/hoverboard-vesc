@@ -39,7 +39,7 @@
 #define MCCONF_L_MAX_ERPM                 15000.0f
 #define MCCONF_L_MIN_ERPM                -15000.0f
 #define MCCONF_L_MIN_DUTY                     0.0f
-#define MCCONF_L_MAX_DUTY                    1.00f
+#define MCCONF_L_MAX_DUTY                    0.95f
 #define MCCONF_FAULT_STOP_TIME_MS             500u
 /* Automatic fault recovery is deliberately stricter than the fault-stop timer.
  * A transient fault may clear only after the bridge has remained electrically
@@ -114,14 +114,14 @@
 #define MCCONF_FOC_DT_US_DEFAULT                  0.0f
 #define MCCONF_FOC_DT_US_MAX                      4.095f
 #define MCCONF_FOC_DT_NS_MAX                      4095u
-/* VESC speed PID uses normalized output/current scaling. Hardware step tests at
- * +/-750 ERPM selected Kp=0.002, Ki=0.002, Kd=0 for this Hall hoverboard: the
- * doubled Ki removed ~3.3% steady error without excessive current; Kd stays 0
- * because Hall-speed quantization makes a derivative term noisy. These integer
- * fields are persisted gain*1000, not direct Vq-controller coefficients. */
+/* VESC speed PID uses normalized output/current scaling. Low-speed traction
+ * testing uses Kp=0.003, Ki=0.0005, Kd=0 together with bounded 0.4 A braking.
+ * The small integral compensates rolling load without recreating the old
+ * low-speed windup/overshoot cycle; Kd stays 0 because Hall-speed quantization
+ * makes a derivative term noisy. */
 #define MCCONF_SPEED_GAIN_SCALE             100000u /* 1e-5 resolution; fits standard VESC speed gains in uint16 */
-#define MCCONF_SPEED_KP_Q11                   200u /* 0.00200 */
-#define MCCONF_SPEED_KI_Q16                   200u /* 0.00200 */
+#define MCCONF_SPEED_KP_Q11                   300u /* 0.00300: stronger post-start holding torque */
+#define MCCONF_SPEED_KI_Q16                    50u /* 0.00050: small steady-state load compensation */
 #define MCCONF_SPEED_KD_Q11                     0u
 #define MCCONF_SPEED_KD_FILTER_DEFAULT         0.20f
 #define MCCONF_POSITION_KP_Q11                  25u /* 0.025: upstream VESC default position Kp */
@@ -133,17 +133,33 @@
 #define MCCONF_POSITION_CURRENT_MAX_MA          600u /* custom count-position ceiling */
 #define MCCONF_POSITION_DAMP_CURRENT_MA         400u /* kinetic brake; below measured 0.6 A static breakaway */
 /* VESC-style speed-command ramp. VESC exposes this in ERPM/s; the ISR keeps
- * mechanical RPM fixed-point. 20000 ERPM/s was selected from repeated 8000-ERPM
- * hardware steps as the best response/stability compromise; still configurable. */
-#define MCCONF_SPEED_RAMP_ERPMS_S            20000u
+ * mechanical RPM fixed-point. The traction profile defaults to 1000 ERPM/s so
+ * a 500-ERPM low-speed command is introduced smoothly and symmetrically. */
+#define MCCONF_SPEED_RAMP_ERPMS_S             1000u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
 #define MCCONF_SPEED_STARTUP_EXIT_MIN_ERPM       120u /* low command: hand off after real motion */
 #define MCCONF_SPEED_STARTUP_EXIT_MAX_ERPM       600u /* high command: do not hold breakaway torque too long */
 #define MCCONF_SPEED_STARTUP_EXIT_PERCENT         40u /* threshold from FINAL requested ERPM, not slew state */
-#define MCCONF_SPEED_STARTUP_CURRENT_MAX_MA      15000u /* bounded stiction breakaway, then integral is cleared */
-#define MCCONF_SPEED_STARTUP_CURRENT_MIN_MA       200u /* gentle initial traction torque */
-#define MCCONF_SPEED_STARTUP_CURRENT_RAMP_MA_S    400u /* deterministic stiction ramp; 0.2A -> 1.3A in 2.75s */
-#define MCCONF_SPEED_LOW_NO_BRAKE_TARGET_ERPM     600u /* low-speed overshoot coasts; never torque-reverses */
+#define MCCONF_SPEED_STARTUP_CURRENT_MAX_MA        650u /* match ROS breakaway ceiling: no multi-amp startup kick */
+#define MCCONF_SPEED_STARTUP_CURRENT_MIN_MA        150u /* gentle first torque, same order as ROS assist */
+#define MCCONF_SPEED_STARTUP_CURRENT_RAMP_MA_S     180u /* slow deterministic rise; prevents torque step */
+#define MCCONF_SPEED_STARTUP_REARM_ERPM             100u /* re-arm only after a genuine near-stall */
+#define MCCONF_SPEED_STARTUP_REARM_MS               500u /* reject Hall dips before allowing any re-assist */
+#define MCCONF_SPEED_STARTUP_REARM_MIN_TARGET_ERPM  250u /* never re-arm for tiny commands near release */
+#define MCCONF_SPEED_STARTUP_EXIT_HALL_EDGES          2u /* require two genuine Hall edges before startup handoff */
+#define MCCONF_SPEED_STARTUP_STRONG_MS              60000u /* bounded profile stays gentle for the whole startup state */
+#define MCCONF_SPEED_STARTUP_FALLBACK_MAX_MA         650u /* re-arm can never inject more than gentle launch torque */
+#define MCCONF_SPEED_LOW_TORQUE_REGION_ERPM         1000u /* joystick level-1 and nearby low-speed commands */
+#define MCCONF_SPEED_LOW_RUN_CURRENT_MAX_MA           900u /* <=1000 eRPM: enough motoring authority while reverse damping is separately capped */
+#define MCCONF_SPEED_LOW_IQ_SLEW_UP_MA_S              600u /* torque may rise, but never as a step */
+#define MCCONF_SPEED_LOW_IQ_SLEW_DOWN_MA_S           1500u /* remove excess torque faster than it is added */
+#define MCCONF_SPEED_LOW_NO_BRAKE_TARGET_ERPM        1000u /* bound reverse torque across the full Hall-quantized low-speed region */
+#define MCCONF_SPEED_LOW_BRAKE_CURRENT_MAX_MA        200u /* gentle damping only; prevents +/- current limit cycling at 500-1000 eRPM */
+#define MCCONF_SPEED_FWD_RUN_HOLD_CURRENT_MA          120u /* low-speed sustaining floor; enough to keep a lifted wheel moving without hunting */
+#define MCCONF_SPEED_FWD_RUN_CURRENT_MAX_MA           280u /* bounded post-start low-speed torque; reduces 500-eRPM overshoot */
+#define MCCONF_SPEED_FWD_RUN_HOLD_APPLY_ERPM          650u /* pre-stall support before sparse Hall feedback falls to zero */
+#define MCCONF_SPEED_FWD_RECOVERY_CURRENT_MA          280u /* gentle near-stall recovery below startup envelope */
+#define MCCONF_SPEED_FWD_RECOVERY_APPLY_ERPM          100u /* recovery zone; final Iq slew still prevents a kick */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               30.0f /* absolute hard phase-current ceiling; VESC Tool motor limit <=30A */
@@ -186,7 +202,7 @@
 #define MCCONF_OFF_TELEM_SETTLE_SAMPLES           16000u /* 1 s @16 kHz: high-Z shunt common-mode benar-benar stabil */
 #define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
 #define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX
-#define MCCONF_POLE_PAIRS_LEFT               4u
+#define MCCONF_POLE_PAIRS_LEFT              15u
 #define MCCONF_POLE_PAIRS_RIGHT              15u
 /* VESC mcconf_default.h: foc_hall_interp_erpm default = 500 ERPM.
  * Nilai runtime tetap berasal dari Motor Config dan diprecompute ke integer
@@ -209,7 +225,9 @@
 #define MCCONF_HALL_TIMEOUT_TICKS            8000u
 /* Reject an impossible Hall edge that is >4x faster than the previous valid
  * sector period. This suppresses contact/boundary chatter near zero speed. */
-#define MCCONF_HALL_PERIOD_OUTLIER_RATIO         4u
+#define MCCONF_HALL_PERIOD_OUTLIER_RATIO            4u
+#define MCCONF_HALL_PERIOD_OUTLIER_RATIO_LOW_SPEED  2u
+#define MCCONF_HALL_PERIOD_LOW_SPEED_ERPM        1000u
 /* Require a new GPIO Hall code to persist for three 16-kHz samples (~125 us
  * from first to third sample). This filters switching-edge/metastability
  * glitches without materially shifting a 60-deg sector at steering speeds. */

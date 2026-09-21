@@ -61,6 +61,7 @@ bool f103_fw_write_staging(uint32_t offset,const uint8_t *data,uint32_t len){(vo
 void f103_fw_reset_to_bootloader(void){fw_reset_count++;}
 
 uint32_t HAL_GetTick(void) { return tick_ms; }
+void HAL_Delay(uint32_t ms) { tick_ms += ms; }
 int HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *d, uint16_t n, uint32_t t) {
     (void)h; (void)t;
     if (n > sizeof(tx_capture)) return 1;
@@ -83,6 +84,7 @@ float foc_sqrtf_slow(float x) { return x>0.0f?sqrtf(x):0.0f; }
 void mc_interface_select_motor_thread(int motor) { selected_motor=motor; }
 bool mc_interface_dccal_done(void){return true;}
 const volatile mc_configuration *mc_interface_get_configuration_motor(bool second) { return &confs[second?1:0]; }
+bool mc_interface_read_persisted_configuration_motor(bool second, mc_configuration *out) { if(out)*out=confs[second?1:0]; return true; }
 void mc_interface_set_configuration(mc_configuration *configuration) { confs[selected_motor==2?1:0]=*configuration; }
 void mc_interface_get_values_motor(mc_values *v, bool second) {
     memset(v,0,sizeof(*v));

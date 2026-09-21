@@ -186,6 +186,18 @@ bool app_vesc_store_configuration(bool second) { (void)second; return true; }
 bool app_vesc_load_configuration(bool second) { (void)second; return false; }
 #endif
 
+bool app_vesc_read_persisted_configuration(bool second, app_configuration *out) {
+    if (!out) return false;
+    const app_configuration active=*app_vesc_get_configuration(second);
+    const bool ok=app_vesc_load_configuration(second);
+    if (ok) *out=*app_vesc_get_configuration(second);
+    /* app_vesc_load_configuration only reads EEPROM, but it applies the result
+     * to RAM. Restore the previous active config so Workbench inspection cannot
+     * alter runtime behavior. */
+    (void)app_vesc_set_configuration(second,&active);
+    return ok;
+}
+
 void app_vesc_defaults(app_configuration *a, uint8_t id) {
     if (!a) return;
     memset(a, 0, sizeof(*a));

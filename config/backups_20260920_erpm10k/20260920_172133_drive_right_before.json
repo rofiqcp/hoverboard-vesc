@@ -1,0 +1,18 @@
+{
+  "mcconf_temp": {
+    "current_min_scale": 1.0,
+    "current_max_scale": 1.0,
+    "min_erpm": -4000.0,
+    "max_erpm": 4000.0,
+    "min_duty": 0.0,
+    "max_duty": 0.949999988079071,
+    "watt_min": -1500000.0,
+    "watt_max": 1500000.0,
+    "input_current_min": -15.0,
+    "input_current_max": 15.0,
+    "motor_poles": 30,
+    "gear_ratio": 1.0,
+    "wheel_diameter": 0.08299999684095383
+  },
+  "sha256": "a1782e5cd715ac43cf1b9dd7dfe028dea59cc5130371e0cd103addd6311135d4"
+}
