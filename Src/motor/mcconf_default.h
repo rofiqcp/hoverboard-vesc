@@ -92,6 +92,7 @@
 #define MCCONF_STEERING_STALL_MS                     350u
 #define MCCONF_STEERING_SEEK_TIMEOUT_MS            20000u
 #define MCCONF_STEERING_MIN_SPAN_COUNTS              32
+#define MCCONF_STEERING_CAL_MIN_SPAN_COUNTS        1 /* this steering axis historically spans ~3.7k..4.5k ABI counts; reject local-stiction pseudo-stops */
 #define MCCONF_STEERING_SAFE_SPAN_PERCENT             95u /* measured hard-stop span is preserved; runtime uses 95% for 2.5% margin each side */
 #define MCCONF_STEERING_SETTLE_COUNTS                 6
 #define MCCONF_ENCODER_SPEED_WINDOW_TICKS           320u /* 20 ms @16 kHz, 50-Hz speed estimator */
@@ -137,29 +138,6 @@
  * a 500-ERPM low-speed command is introduced smoothly and symmetrically. */
 #define MCCONF_SPEED_RAMP_ERPMS_S             1000u
 #define MCCONF_SPEED_RELEASE_ERPM               75u  /* 5 mechanical RPM @ 15 pole-pairs */
-#define MCCONF_SPEED_STARTUP_EXIT_MIN_ERPM       120u /* low command: hand off after real motion */
-#define MCCONF_SPEED_STARTUP_EXIT_MAX_ERPM       600u /* high command: do not hold breakaway torque too long */
-#define MCCONF_SPEED_STARTUP_EXIT_PERCENT         40u /* threshold from FINAL requested ERPM, not slew state */
-#define MCCONF_SPEED_STARTUP_CURRENT_MAX_MA        650u /* match ROS breakaway ceiling: no multi-amp startup kick */
-#define MCCONF_SPEED_STARTUP_CURRENT_MIN_MA        150u /* gentle first torque, same order as ROS assist */
-#define MCCONF_SPEED_STARTUP_CURRENT_RAMP_MA_S     180u /* slow deterministic rise; prevents torque step */
-#define MCCONF_SPEED_STARTUP_REARM_ERPM             100u /* re-arm only after a genuine near-stall */
-#define MCCONF_SPEED_STARTUP_REARM_MS               500u /* reject Hall dips before allowing any re-assist */
-#define MCCONF_SPEED_STARTUP_REARM_MIN_TARGET_ERPM  250u /* never re-arm for tiny commands near release */
-#define MCCONF_SPEED_STARTUP_EXIT_HALL_EDGES          2u /* require two genuine Hall edges before startup handoff */
-#define MCCONF_SPEED_STARTUP_STRONG_MS              60000u /* bounded profile stays gentle for the whole startup state */
-#define MCCONF_SPEED_STARTUP_FALLBACK_MAX_MA         650u /* re-arm can never inject more than gentle launch torque */
-#define MCCONF_SPEED_LOW_TORQUE_REGION_ERPM         1000u /* joystick level-1 and nearby low-speed commands */
-#define MCCONF_SPEED_LOW_RUN_CURRENT_MAX_MA           900u /* <=1000 eRPM: enough motoring authority while reverse damping is separately capped */
-#define MCCONF_SPEED_LOW_IQ_SLEW_UP_MA_S              600u /* torque may rise, but never as a step */
-#define MCCONF_SPEED_LOW_IQ_SLEW_DOWN_MA_S           1500u /* remove excess torque faster than it is added */
-#define MCCONF_SPEED_LOW_NO_BRAKE_TARGET_ERPM        1000u /* bound reverse torque across the full Hall-quantized low-speed region */
-#define MCCONF_SPEED_LOW_BRAKE_CURRENT_MAX_MA        200u /* gentle damping only; prevents +/- current limit cycling at 500-1000 eRPM */
-#define MCCONF_SPEED_FWD_RUN_HOLD_CURRENT_MA          120u /* low-speed sustaining floor; enough to keep a lifted wheel moving without hunting */
-#define MCCONF_SPEED_FWD_RUN_CURRENT_MAX_MA           280u /* bounded post-start low-speed torque; reduces 500-eRPM overshoot */
-#define MCCONF_SPEED_FWD_RUN_HOLD_APPLY_ERPM          650u /* pre-stall support before sparse Hall feedback falls to zero */
-#define MCCONF_SPEED_FWD_RECOVERY_CURRENT_MA          280u /* gentle near-stall recovery below startup envelope */
-#define MCCONF_SPEED_FWD_RECOVERY_APPLY_ERPM          100u /* recovery zone; final Iq slew still prevents a kick */
 #define MCCONF_FOC_VOLTAGE_MAX              16000
 #define MCCONF_FOC_DUTY_VOLTAGE_MAX          FOC_SVPWM_VECTOR_MAX
 #define MCCONF_L_ABS_CURRENT_MAX               30.0f /* absolute hard phase-current ceiling; VESC Tool motor limit <=30A */

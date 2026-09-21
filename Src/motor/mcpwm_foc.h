@@ -353,9 +353,6 @@ typedef struct {
     uint8_t m_iq_sat_hold;
     uint8_t m_id_sat_hold;
     uint8_t m_speed_sat_hold;
-    uint8_t m_speed_startup_active; /* anti-windup state until Hall/encoder proves motion */
-    uint16_t m_speed_startup_ms; /* elapsed bounded breakaway ramp time */
-    uint16_t m_speed_startup_rearm_ms; /* sustained near-stall time before startup floor is re-armed */
     /* Brake current is stored as a magnitude. CONTROL_MODE_CURRENT_BRAKE
      * recomputes its sign from fresh Hall speed every control update, matching
      * VESC's -SIGN(speed)*abs(current) semantics without reverse run-away. */

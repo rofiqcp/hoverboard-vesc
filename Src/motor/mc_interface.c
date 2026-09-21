@@ -393,7 +393,7 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
     uint32_t level_age=0u;
     uint32_t last_move_age=0u;
     const int32_t origin=m->m_position_counts;
-    int32_t last=origin;
+    int32_t best_progress=0;
     bool direction_has_moved=false;
 
     while(age<MCCONF_STEERING_SEEK_TIMEOUT_MS){
@@ -405,22 +405,21 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
         if(m->m_fault!=FAULT_CODE_NONE)break;
 
         const int32_t now=m->m_position_counts;
-        int32_t d=now-last; if(d<0)d=-d;
+        const int32_t progress=(now-origin)*(int32_t)user_dir;
         if(!direction_has_moved){
-            /* Do not let one or two ABI chatter counts masquerade as real rack
-             * motion. Commissioning may start below breakaway torque, so require
-             * the same meaningful progress threshold used by runtime steering
-             * before arming hard-stop detection. Until then the adaptive current
-             * ramp remains active. */
-            int32_t progress=(now-origin)*(int32_t)user_dir;
+            /* Arm stop detection only after meaningful travel in the requested
+             * direction. Reverse chatter never counts as progress. */
             if(progress>=(int32_t)MCCONF_STEERING_MOTION_PROGRESS_COUNTS){
                 direction_has_moved=true;
-                last=now;
+                best_progress=progress;
                 last_move_age=age;
                 level_age=0u;
             }
-        }else if(d>=1){
-            last=now;
+        }else if(progress>=best_progress+(int32_t)MCCONF_STEERING_SETTLE_COUNTS){
+            /* Refresh the stall timer only when the rack reaches a NEW furthest
+             * point in the commanded direction. Backlash/oscillation at a stop
+             * can no longer keep the timer alive indefinitely. */
+            best_progress=progress;
             last_move_age=age;
         }
 
@@ -445,7 +444,8 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
             if(current<max_current-0.01f){
                 float confirm=current+step;
                 if(confirm>max_current)confirm=max_current;
-                const int32_t confirm_start=m->m_position_counts;
+                const int32_t confirm_start_progress=
+                    (m->m_position_counts-origin)*(int32_t)user_dir;
                 bool resumed=false;
                 uint32_t confirm_ms=0u;
                 while(confirm_ms<MCCONF_STEERING_STOP_CONFIRM_MS){
@@ -454,12 +454,17 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
                     steering_bounded_delay_ms(5u);
                     age+=5u; confirm_ms+=5u;
                     if(m->m_fault!=FAULT_CODE_NONE)goto seek_fail;
-                    int32_t md=m->m_position_counts-confirm_start; if(md<0)md=-md;
-                    if(md>=2){resumed=true;break;}
+                    const int32_t confirm_progress=
+                        (m->m_position_counts-origin)*(int32_t)user_dir;
+                    if(confirm_progress>=confirm_start_progress+
+                       (int32_t)MCCONF_STEERING_SETTLE_COUNTS){
+                        resumed=true;
+                        best_progress=confirm_progress;
+                        break;
+                    }
                 }
                 if(resumed){
                     current=confirm;
-                    last=m->m_position_counts;
                     last_move_age=age;
                     level_age=0u;
                     continue;
@@ -666,10 +671,23 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     if(!encoder_selected || !m->m_encoder_configured){steering_stage_set(0xE1u);return false;}
 
     /* SPAN-ONLY calibration: preserve the existing electrical encoder offset,
-     * ratio and FOC inversion. Only synchronize phase, rebase the current
-     * position, find both mechanical stops and persist the signed stop span. */
-    if(!mcpwm_foc_encoder_startup_align(false)){steering_stage_set(0xE2u);return false;}
-    mcpwm_foc_steering_clear_calibration();
+     * ratio and FOC inversion. If boot/home already synchronized ABI to phase,
+     * do NOT repeat the open-loop +/- electrical probe here: on a geared,
+     * mechanically constrained steering axis that redundant probe is perceived
+     * as a large oscillation. Align only when synchronization is actually absent. */
+    if(!mcpwm_foc_encoder_is_synced(false) &&
+       !mcpwm_foc_encoder_startup_align(false)){steering_stage_set(0xE2u);return false;}
+
+    /* Preserve a previously valid measured span until the replacement sweep has
+     * passed. The detect operation changes physical position, so mark it unhomed
+     * immediately; this keeps runtime steering fail-closed if commissioning fails. */
+    const int32_t previous_span=mcpwm_foc_steering_span_counts();
+    const bool previous_cal=mcpwm_foc_steering_is_calibrated() && previous_span!=0;
+    if(previous_cal){
+        if(!mcpwm_foc_steering_set_span(previous_span,false)){steering_stage_set(0xE6u);return false;}
+    }else{
+        mcpwm_foc_steering_clear_calibration();
+    }
     mcpwm_foc_reset_position(false);
     steering_stage_set(3u);
 
@@ -701,7 +719,7 @@ bool mc_interface_steering_detect_calibrate(float current, float *offset, float 
     s_steer_span1=span1; s_steer_span2=span2;
     const int32_t abs1=span1<0?-span1:span1;
     const int32_t abs2=span2<0?-span2:span2;
-    if(abs1<MCCONF_STEERING_MIN_SPAN_COUNTS || abs2<MCCONF_STEERING_MIN_SPAN_COUNTS){steering_stage_set(0xE5u);return false;}
+    if(abs1<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS || abs2<MCCONF_STEERING_CAL_MIN_SPAN_COUNTS){steering_stage_set(0xE5u);return false;}
     const int32_t reference_span=(abs1+abs2)/2;
     int32_t repeat_tol=reference_span/50; /* 2% of span */
     if(repeat_tol<32)repeat_tol=32;
