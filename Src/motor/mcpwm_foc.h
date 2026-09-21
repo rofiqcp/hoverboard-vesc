@@ -286,6 +286,19 @@ typedef struct {
     uint16_t m_hall_rate_min_step;   /* VESC 1.5x minimum rate-limit step */
     uint16_t m_hall_period_hist[4];
     uint8_t m_hall_hist_pos;
+
+    /* Hall speed telemetry estimator compatible with hoverboard-firmware-hack-FOC
+     * Raw_Motor_Speed_Estimation. It is deliberately separate from the VESC
+     * phase/speed-control estimator above, so matching legacy n_mot telemetry
+     * cannot disturb FOC angle correction or the tuned speed PID. */
+    uint16_t m_hall_ref_period_hist[4];
+    uint16_t m_hall_ref_last_period;
+    int16_t m_hall_ref_rpm;
+    uint16_t m_hall_ref_prev_abs_rpm;
+    int8_t m_hall_ref_prev_direction;
+    uint8_t m_hall_ref_period_change;
+    uint8_t m_hall_ref_prev_direction_change;
+
     uint8_t m_hall_initialized;
     uint8_t m_hall_interp_active;
     /* Raw Hall state whose current rejection has already been counted.

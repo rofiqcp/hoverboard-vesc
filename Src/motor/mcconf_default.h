@@ -201,6 +201,15 @@
  * At 50 ERPM: 60/(50*6)=0.2 s/edge => 3200 ISR ticks @16 kHz.
  * 8000 ticks (0.5 s) keeps valid low-speed Hall feedback down to ~20 ERPM. */
 #define MCCONF_HALL_TIMEOUT_TICKS            8000u
+
+/* Legacy hoverboard-firmware-hack-FOC Hall speed estimator constants.
+ * z_maxCntRst=2000, dz_cntTrnsDetHi=40, dz_cntTrnsDetLo=20. At 16 kHz and
+ * 15 pole-pairs the derived speed coefficient is 10667, exactly matching
+ * cf_speedCoef in BLDC_controller_data.c. These affect telemetry only. */
+#define MCCONF_HALL_REF_MAX_COUNT             2000u
+#define MCCONF_HALL_REF_DELTA_HI                40u
+#define MCCONF_HALL_REF_DELTA_LO                20u
+
 /* Reject an impossible Hall edge that is >4x faster than the previous valid
  * sector period. This suppresses contact/boundary chatter near zero speed. */
 #define MCCONF_HALL_PERIOD_OUTLIER_RATIO            4u
