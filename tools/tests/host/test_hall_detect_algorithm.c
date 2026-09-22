@@ -206,12 +206,14 @@ int main(void){
             return fail("closed-loop Hall phase after reconnect");
 
         /* A stable non-adjacent code is electrically impossible at this
-         * sampled speed envelope. It must be rejected, must not leak into the
-         * Hall phase, and must release closed-loop drive. */
+         * sampled speed envelope. Match upstream foc_correct_hall semantics:
+         * reject that angle and keep the last accepted electrical phase without
+         * collapsing a live current command because of one transient. */
         const uint8_t skipped=left_raw_for_sector[3];
         const uint16_t phase_before_reject=m_motor_1.m_phase_hall;
         const int32_t pos_before_reject=m_motor_1.m_position_counts;
         const int32_t tach_before_reject=m_motor_1.m_tachometer;
+        const int16_t iq_before_reject=m_motor_1.m_iq_target_q4;
         const uint32_t rejects_before=m_motor_1.m_hall_sequence_reject_count;
         set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,skipped);
         for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
@@ -221,17 +223,19 @@ int main(void){
             return fail("rejected Hall state must not leak into FOC phase");
         if(m_motor_1.m_position_counts!=pos_before_reject || m_motor_1.m_tachometer!=tach_before_reject)
             return fail("rejected Hall state must not create position/tachometer edge");
-        if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_state!=MC_STATE_OFF)
-            return fail("stable skipped Hall state must release closed-loop motor");
+        if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT ||
+           m_motor_1.m_iq_target_q4!=iq_before_reject)
+            return fail("single skipped Hall state must preserve the live current command");
 
         /* Returning to the last accepted Hall state clears the feedback mismatch
-         * but does not synthesize motion. A fresh command is required to drive. */
+         * without synthesizing motion or requiring command re-arming. */
         set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,reconnect);
         for(uint16_t n=0u;n<(uint16_t)m_motor_1.m_hall_filter_window+MCCONF_HALL_DEBOUNCE_SAMPLES+2u;++n)mcpwm_foc_adc_int_handler();
         if(m_motor_1.m_position_counts!=pos_before_reject || m_motor_1.m_tachometer!=tach_before_reject)
             return fail("Hall sequence recovery must not synthesize motion");
-        if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)
-            return fail("Hall sequence recovery must remain released until fresh command");
+        if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT ||
+           m_motor_1.m_iq_target_q4!=iq_before_reject)
+            return fail("Hall sequence recovery must preserve the live command");
         mcpwm_foc_release_motor(false); mcpwm_foc_vesc_override_clear(false);
     }
 

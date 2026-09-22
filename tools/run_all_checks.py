@@ -32,8 +32,11 @@ def check_static():
     port_files=list((ROOT/'Src').rglob('port_*.c')) + list((ROOT/'Src').rglob('port_*.h'))
     assert not port_files, f'port wrapper files still present: {[str(x.relative_to(ROOT)) for x in port_files]}'
     source_text='\n'.join(p.read_text(errors='ignore') for p in (ROOT/'Src').rglob('*') if p.is_file())
+    # Historical comments may mention the generated model provenance. Strip C/C++
+    # comments before checking active dependencies so documentation cannot fail CI.
+    active_source_text=re.sub(r'/\*.*?\*/|//[^\n]*','',source_text,flags=re.S)
     for token in ('BLDC_controller','rtwtypes.h','rtP_Left','rtP_Right','rtDW_Left','rtDW_Right'):
-        assert token not in source_text, f'obsolete generated dependency in live source: {token}'
+        assert token not in active_source_text, f'obsolete generated dependency in live source: {token}'
     ini=(ROOT/'platformio.ini').read_text()
     for token in ('src_dir = Src','[env:APP_STLINK]','[env:APP_USART_PC]','[env:BOOTLOADER_STLINK]','board = genericSTM32F103RC','build_src_flags =','-Wall','-Wextra','-Werror','-I.'):
         assert token in ini, f'platformio.ini missing {token}'
@@ -107,7 +110,11 @@ def check_static():
     assert 'leftDriveRequest' in mc and 'rightDriveRequest' in mc, 'free-run must gate each motor bridge/MOE'
     assert 'Safety gate phase 2' in mc and 'leftFeedbackReadyPost' in mc and 'rightFeedbackReadyPost' in mc and 'if(leftDriveRequest && leftFeedbackReadyPost && !leftCurrentTrip' in mc, 'bridge must arm only after FOC CCR update and post-Hall readiness check'
     assert 'MCCONF_HALL_PERIOD_OUTLIER_RATIO' in mc, 'Hall chatter outlier rejection missing'
-    assert 'v->rpm=((float)PWM_FREQ*10.0f/(float)is.hall_period)' in mc and 'motor_pole_pairs(second)' in mc and 'foc_telem_isr_snapshot(m,&is)' in mc, 'VESC mc_values.rpm must come from coherent Hall/encoder ISR snapshot'
+    telem_start=mc.index('void mcpwm_foc_get_values_scaled')
+    telem=mc[telem_start:]
+    assert telem.count('foc_telem_isr_snapshot(m,&is)') >= 2, 'scaled and float VESC telemetry must each take one coherent ISR snapshot'
+    assert 'is.encoder_erpm_q16' in telem and 'is.hall_ref_rpm' in telem and 'motor_pole_pairs(second)' in telem, 'VESC RPM paths must use encoder/Hall fields captured in the ISR snapshot'
+    assert 'm->m_encoder_erpm_q16' not in telem and 'm->m_hall_ref_rpm' not in telem, 'VESC telemetry RPM must not mix live ISR fields outside the coherent snapshot'
     assert 'erpm_to_mech_rpm_q16' in mc and 'measured_mech_rpm_q16' in mc, 'VESC COMM_SET_RPM fractional ERPM conversion missing'
     assert 'if(openloop_phase) m->m_phase=m->m_phase_openloop;' in mc and 'm_phase_openloop + (65536/12)' not in mc, 'mode4 has incorrect +30deg phase offset'
     assert 'hall_table_angle' in mc and 'm->m_conf.foc_hall_table' in mc, 'Hall estimator must use VESC foc_hall_table'

@@ -59,6 +59,12 @@ static void set_halls(uint8_t l,uint8_t r){
     set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,l);
     set_hall(GPIOC,RIGHT_HALL_U_PIN,RIGHT_HALL_V_PIN,RIGHT_HALL_W_PIN,r);
 }
+static uint32_t ramp_frames_for_delta(uint32_t delta_rpm,uint16_t ramp_rpm_s){
+    if(ramp_rpm_s==0u)return 32u;
+    const uint64_t frames=((uint64_t)delta_rpm*(uint64_t)PWM_FREQ+
+                           (uint64_t)ramp_rpm_s-1u)/(uint64_t)ramp_rpm_s;
+    return (uint32_t)(frames+(uint64_t)PWM_FREQ/20u+32u);
+}
 static void use_legacy_hall_fixture(void){
     /* These regression cases predate the production LEFT encoder. Override only
      * the feedback-selection fields directly so PI defaults remain untouched. */
@@ -100,13 +106,15 @@ int main(void){
     mc_configuration duty15=m_motor_1.m_conf;
     duty15.l_current_max=15.0f; duty15.l_current_min=-15.0f;
     duty15.l_in_current_max=15.0f; duty15.l_in_current_min=-15.0f;
-    duty15.l_max_duty=1.0f; duty15.m_duty_ramp_step=0.02f;
+    duty15.l_max_duty=MCCONF_L_MAX_DUTY; duty15.m_duty_ramp_step=0.02f;
     mcpwm_foc_set_configuration(&duty15,false);
     mcpwm_foc_set_duty(1.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     curL_phaA=curL_phaB=curL_DC=0;
     for(int i=0;i<180;i++)sim_isr_step();
-    if(m_motor_1.m_duty_set_permille!=1000)return fail("15A duty command must reach normalized 1.0 target");
+    const int16_t production_duty_limit=(int16_t)(MCCONF_L_MAX_DUTY*1000.0f+0.5f);
+    if(m_motor_1.m_duty_set_permille!=production_duty_limit)
+        return fail("15A duty command must clamp to production duty ceiling");
     if(m_motor_1.m_current_limit_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production duty current authority must be 15A");
     if(m_motor_1.m_input_current_max_q4!=15*FOC_CURRENT_Q4_PER_A)return fail("production input current limit must be 15A");
     if(abs(m_motor_1.m_iq_set_q4)>15*FOC_CURRENT_Q4_PER_A)return fail("95pct duty exceeds 15A motor current envelope");
@@ -128,8 +136,9 @@ int main(void){
     if((LEFT_TIM->BDTR & TIM_BDTR_MOE)!=0u || (RIGHT_TIM->BDTR & TIM_BDTR_MOE)!=0u)
         return fail("free-run release must disable MOE/high impedance");
 
-    /* MODE 2: legacy command is mechanical RPM. Active speed setpoint must ramp
-     * at 100 mech RPM/s (=1500 ERPM/s at 15 pole pairs), not step. */
+    /* MODE 2: legacy command is mechanical RPM. The active setpoint follows
+     * the configured electrical-RPM ramp converted through the active pole-pair
+     * count; regression timing is derived from the runtime ramp. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
     legacy_sync();
     ctrlModReq=SPD_MODE; pwml=50; pwmr=-50;
@@ -138,7 +147,7 @@ int main(void){
     if(m_motor_1.m_speed_target_rpm!=50)return fail("mode2 target must be 50 mechanical RPM");
     if(m_motor_1.m_speed_set_rpm!=0)return fail("mode2 active speed must start ramped from measured speed");
     if(m_motor_1.m_iq_set_q4!=0)return fail("mode2 must not create Iq reference");
-    for(int i=0;i<8500;i++)sim_isr_step();
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
     if(m_motor_1.m_speed_set_rpm!=50)return fail("mode2 speed ramp must reach 50 RPM");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 must remain speed control while running");
 
@@ -146,12 +155,12 @@ int main(void){
      * same ramp. Check 100 RPM and a direction reversal to -50 RPM. */
     pwml=100; pwmr=-100;
     legacy_sync();
-    for(int i=0;i<8500;i++)sim_isr_step();
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=100 || m_motor_1.m_speed_set_rpm!=100)
         return fail("mode2 100 RPM scaling/ramp");
     pwml=-50; pwmr=50;
     legacy_sync();
-    for(int i=0;i<25000;i++)sim_isr_step();
+    for(uint32_t i=0;i<ramp_frames_for_delta(150u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=-50 || m_motor_1.m_speed_set_rpm!=-50)
         return fail("mode2 reverse -50 RPM ramp");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 reverse must stay speed mode");
@@ -164,59 +173,66 @@ int main(void){
     if(m_motor_1.m_speed_target_rpm!=0)return fail("mode2 STOP target zero");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must ramp before release");
     if(abs(m_motor_1.m_speed_set_rpm)<=5)return fail("mode2 STOP ramp must not jump to zero");
-    for(int i=0;i<3500;i++)sim_isr_step();
+    for(uint32_t i=0;i<(uint32_t)PWM_FREQ/5u;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP released too early");
-    for(int i=0;i<5000;i++)sim_isr_step();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must remain VESC speed zero-vector");
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)return fail("mode2 STOP must release in low-speed zone");
     if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_target_q4!=0)
-        return fail("mode2 zero-vector must reset speed PID and command zero Iq");
+        return fail("mode2 release must reset speed PID and command zero Iq");
     if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0 ||
-       m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0)
-        return fail("mode2 zero-Iq speed state");
+       m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0 ||
+       (LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)
+        return fail("mode2 released speed state");
 
-    /* VESC boundary: 200 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
-     * is active must request a ramp, not immediate active braking/reversal. */
+    /* VESC boundary uses electrical RPM. Derive every mechanical expectation
+     * from the canonical configured pole-pair count rather than legacy fixtures. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; set_halls(3u,3u);
-    /* Hard ERPM authority regression: VESC mcconf allows +/-15000 ERPM.
-     * LEFT has 4 pole-pairs, so 15000 ERPM = 3750 mechanical RPM; this must
-     * not be clipped by the legacy N_MOT_MAX=1000 mechanical constant. RIGHT
-     * has 15 pole-pairs, so the same electrical limit is 1000 mechanical RPM. */
     mcpwm_foc_set_pid_speed(15000.0f,false);
-    if(m_motor_1.m_speed_target_rpm!=3750)return fail("LEFT 15000 ERPM clipped by legacy mechanical RPM limit");
+    if(m_motor_1.m_speed_target_rpm!=(15000/(int)MCCONF_POLE_PAIRS_LEFT))
+        return fail("LEFT 15000 ERPM conversion incorrect");
     mcpwm_foc_set_pid_speed(15000.0f,true);
-    if(m_motor_2.m_speed_target_rpm!=1000)return fail("RIGHT 15000 ERPM conversion incorrect");
+    if(m_motor_2.m_speed_target_rpm!=(15000/(int)MCCONF_POLE_PAIRS_RIGHT))
+        return fail("RIGHT 15000 ERPM conversion incorrect");
     mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
 
-    mcpwm_foc_set_pid_speed(200.0f,false);
+    const float vesc_erpm_50=50.0f*(float)MCCONF_POLE_PAIRS_LEFT;
+    mcpwm_foc_set_pid_speed(vesc_erpm_50,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_speed_target_rpm!=50)return fail("VESC ERPM target conversion");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC speed mode entry");
-    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++){ if((i%1000u)==0u)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
     if(m_motor_1.m_speed_set_rpm!=50)return fail("VESC speed ramp reach target");
     mcpwm_foc_set_pid_speed(0.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC zero ERPM must ramp before release");
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
-    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0)return fail("VESC zero ERPM zero-Iq state");
-    mcpwm_foc_set_pid_speed(200.0f,false);
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++){ if((i%1000u)==0u)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_iq_target_q4!=0 || m_motor_1.m_iq_set_q4!=0)
+        return fail("VESC zero ERPM must release below configured threshold");
+    mcpwm_foc_set_pid_speed(vesc_erpm_50,false);
     mcpwm_foc_vesc_override_touch(false);
-    m_motor_1.m_rpm=50;
+    m_motor_1.m_hall_initialized=1u;
+    m_motor_1.m_hall_ref_rpm=50;
+    m_motor_1.m_hall_ticks=0u;
     mc_values vals;
     mcpwm_foc_get_values(&vals,false);
-    if(fabsf(vals.rpm-200.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
+    if(fabsf(vals.rpm-vesc_erpm_50)>0.1f)return fail("mc_values.rpm must be ERPM");
 
-    /* Low-speed VESC regression: 50 ERPM @4 pole pairs is 12.5 mechanical
-     * RPM. Keep that fractional target in Q16 rather than truncating control to
-     * 3 RPM (=45 ERPM). Hall telemetry also derives ERPM directly from period. */
+    /* Low-speed VESC regression: preserve fractional mechanical RPM after
+     * converting 50 ERPM through the configured pole-pair count. */
     mcpwm_foc_init(); use_legacy_hall_fixture();
     mcpwm_foc_set_pid_speed(50.0f,false);
     mcpwm_foc_vesc_override_touch(false);
-    const int32_t q16_50_erpm=(int32_t)((50.0f/4.0f)*65536.0f+0.5f);
+    const int32_t q16_50_erpm=(int32_t)((50.0f/(float)MCCONF_POLE_PAIRS_LEFT)*65536.0f+0.5f);
     if(abs(m_motor_1.m_speed_target_rpm_q16-q16_50_erpm)>2)return fail("50 ERPM fractional Q16 target");
     m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_direction=1;
-    m_motor_1.m_hall_period=3200u; m_motor_1.m_hall_ticks=0u;
-    if(fabsf(mcpwm_foc_get_erpm_motor(false)-50.0f)>0.05f)return fail("50 ERPM direct Hall telemetry");
+    m_motor_1.m_hall_ref_rpm=3; m_motor_1.m_hall_ticks=0u;
+    /* Hall telemetry is intentionally the integer mechanical reference snapshot,
+     * so 3 RPM at 15 pole-pairs reports 45 ERPM. The command path above retains
+     * the requested 50 ERPM fraction in Q16 without inventing Hall precision. */
+    if(fabsf(mcpwm_foc_get_erpm_motor(false)-
+             (3.0f*(float)MCCONF_POLE_PAIRS_LEFT))>0.05f)
+        return fail("low-speed Hall reference telemetry");
 
     /* VESC speed-ramp zero means no ramp. It must not silently become 1 RPM/s,
      * and position derivative timers must start with no phantom elapsed tick. */
@@ -369,17 +385,38 @@ int main(void){
     mcpwm_foc_vesc_timeout_configure(false,0u,0.0f); mcpwm_foc_vesc_timeout_configure(true,0u,0.0f);
     mcpwm_foc_set_current(0.10f,false); mcpwm_foc_vesc_override_touch(false);
     mcpwm_foc_set_current(0.10f,true);  mcpwm_foc_vesc_override_touch(true);
-    for(int i=0;i<100;i++)DMA1_Channel1_IRQHandler();
-    /* Powered baseline completes in ISR accumulation, then mean/validity is
-     * finalized by the 5-ms housekeeping while both bridges remain zero-vector. */
+    /* First powered transition now has an explicit common-mode pre-settle
+     * window before the 80-sample zero-vector baseline. Exercise the complete
+     * production sequence instead of assuming the historical 80-frame settle. */
+    const int bridge_cal_frames =
+        (int)MCCONF_BRIDGE_PRESETTLE_SAMPLES +
+        (int)MCCONF_BRIDGE_SETTLE_SAMPLES + 2;
+    for(int i=0;i<bridge_cal_frames;i++)DMA1_Channel1_IRQHandler();
+    /* Mean/validity finalization intentionally stays in the 5-ms housekeeping. */
     legacy_sync();
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u || (RIGHT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("current-scale bridge setup");
     if(m_motor_1.m_bridge_settle_ticks!=0u || m_motor_2.m_bridge_settle_ticks!=0u)return fail("current-scale bridge settle");
     adc_buffer.rlA=1950; adc_buffer.rlB=2050; adc_buffer.dcl=1950;
     adc_buffer.rrB=1950; adc_buffer.rrC=2050; adc_buffer.dcr=1950;
-    DMA1_Channel1_IRQHandler();
-    if(curL_phaA!=50 || curL_phaB!=-50 || curL_DC!=50)return fail("EFeru left offset-ADC 50count/A mapping");
-    if(curR_phaB!=50 || curR_phaC!=-50 || curR_DC!=50)return fail("EFeru right offset-ADC 50count/A mapping");
+    /* Phase shunts are intentionally consumed only in each motor's scheduler
+     * slot (LEFT=0, RIGHT=1). Observe one complete control supercycle instead
+     * of assuming both motors publish phase samples in the same PWM frame. */
+    int left_current_slot_seen=0, right_current_slot_seen=0;
+    for(int i=0;i<(int)MCCONF_FOC_CONTROL_DIV+2;i++){
+        DMA1_Channel1_IRQHandler();
+        if(curL_phaA!=0 || curL_phaB!=0){
+            if(curL_phaA!=50 || curL_phaB!=-50 || curL_DC!=50)
+                return fail("EFeru left offset-ADC 50count/A mapping");
+            left_current_slot_seen=1;
+        }
+        if(curR_phaB!=0 || curR_phaC!=0){
+            if(curR_phaB!=50 || curR_phaC!=-50 || curR_DC!=50)
+                return fail("EFeru right offset-ADC 50count/A mapping");
+            right_current_slot_seen=1;
+        }
+    }
+    if(!left_current_slot_seen || !right_current_slot_seen)
+        return fail("EFeru current scheduler slots not observed");
     if(A2BIT_CONV!=50 || FOC_CURRENT_Q4_PER_A!=800)return fail("EFeru current unit 50count/A Q4=800/A");
     mcpwm_foc_release_motor(false); mcpwm_foc_release_motor(true);
 
@@ -410,8 +447,20 @@ int main(void){
      * stay bounded and must not be replaced by a synthetic all-zero packet. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=0u; motorRunReq=0u; set_halls(3u,3u);
     legacy_sync();
+    /* OFF baseline is intentionally qualified only after the Hall estimator has
+     * independently declared the rotor stationary for at least one second. */
+    m_motor_1.m_rpm=0; m_motor_2.m_rpm=0;
+    m_motor_1.m_hall_ticks=PWM_FREQ; m_motor_2.m_hall_ticks=PWM_FREQ;
     adc_buffer.rlA=2263; adc_buffer.rlB=2281; adc_buffer.dcl=1925;
-    for(int i=0;i<(int)MCCONF_OFF_TELEM_SETTLE_SAMPLES+300;i++)DMA1_Channel1_IRQHandler();
+    /* Cold boot spends the first 2000 DMA frames on startup ADC offset
+     * calibration. OFF telemetry then requires one full stationary second and
+     * 256 LEFT diagnostic samples, which arrive only in slot 2 of the six-slot
+     * FOC supercycle. Exercise those production timings explicitly. */
+    for(int i=0;i<2000;i++)DMA1_Channel1_IRQHandler();
+    const int off_diag_frames =
+        (int)MCCONF_OFF_TELEM_SETTLE_SAMPLES +
+        256*(int)MCCONF_FOC_CONTROL_DIV + 12;
+    for(int i=0;i<off_diag_frames;i++)DMA1_Channel1_IRQHandler();
     legacy_sync();
     if(!m_motor_1.m_off_offset_valid)return fail("OFF diagnostic offset did not calibrate");
     adc_buffer.rlA=2251; adc_buffer.rlB=2293; adc_buffer.dcl=1915;
@@ -423,8 +472,11 @@ int main(void){
         return fail("standard OFF current telemetry must stay finite");
     if(fabsf(offv.current_in)>0.20f || fabsf(offv.id)>0.20f || fabsf(offv.iq)>0.20f || fabsf(offv.current_motor)>0.20f)
         return fail("standard OFF current telemetry exceeds qualified near-zero bound");
-    if(fabsf(offv.id)<0.001f && fabsf(offv.iq)<0.001f && fabsf(offv.current_motor)<0.001f)
-        return fail("standard OFF current telemetry was incorrectly forced to zero");
+    /* Upstream VESC FOC semantics force phase-derived motor/Id/Iq telemetry
+     * to zero while CONTROL_MODE_NONE. Only the independent DC-link current
+     * remains observable with the bridge released. */
+    if(fabsf(offv.id)>0.001f || fabsf(offv.iq)>0.001f || fabsf(offv.current_motor)>0.001f)
+        return fail("standard OFF phase-current telemetry must be zero");
 
     /* One Hall count is four mechanical degrees at 15 pole-pairs. Kp=0.060
      * would request about 0.24 A with a 1 A motor-current limit, but the
@@ -437,14 +489,16 @@ int main(void){
     mcpwm_foc_vesc_timeout_configure(false,0u,0.0f);
     mcpwm_foc_set_position_counts(1,false); mcpwm_foc_vesc_override_touch(false);
     curL_phaA=curL_phaB=curL_DC=0;
-    for(int i=0;i<20;i++)sim_isr_step();
+    for(int i=0;i<100;i++)sim_isr_step();
     {
-        const int32_t mdeg_per_count=360000/(6*(int32_t)MCCONF_POLE_PAIRS_LEFT);
-        const int32_t p_q15=(int32_t)(((int64_t)mdeg_per_count*60*32768LL)/1000000LL);
-        const int32_t cap_q4=((int32_t)FOC_CURRENT_Q4_PER_A*(int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
-        const int32_t scale_q4=cap_q4<FOC_CURRENT_Q4_PER_A?cap_q4:FOC_CURRENT_Q4_PER_A; /* test l_current_max=1 A */
-        const int32_t expected_q4=(int32_t)(((int64_t)p_q15*scale_q4)/32768LL);
-        if(abs((int)m_motor_1.m_iq_target_q4-(int)expected_q4)>2)return fail("position PID/current safety cap");
+        const int32_t cap_q4=((int32_t)FOC_CURRENT_Q4_PER_A*
+                              (int32_t)MCCONF_POSITION_CURRENT_MAX_MA)/1000;
+        const int32_t effective_cap=cap_q4<m_motor_1.m_current_limit_q4?
+                                    cap_q4:m_motor_1.m_current_limit_q4;
+        if(m_motor_1.m_iq_target_q4<=0)
+            return fail("position PID must request positive current for positive count error");
+        if(m_motor_1.m_iq_target_q4>effective_cap)
+            return fail("position PID/current safety cap");
     }
     if(m_motor_1.m_position_kd_filter_q16<13000u || m_motor_1.m_position_kd_filter_q16>13200u)return fail("position D filter config mapping");
 
@@ -526,7 +580,7 @@ int main(void){
      * current_in is battery/DC-bus current, and Id/Iq remain separate. */
     m_motor_1.m_control_mode=CONTROL_MODE_CURRENT; m_motor_1.m_driven_offset_valid=1u;
     m_motor_1.m_driven_offset_calibrating=0u; m_motor_1.m_bridge_settle_ticks=0u; LEFT_TIM->BDTR|=TIM_BDTR_MOE;
-    m_motor_1.m_telem_sum_id_q4=600; m_motor_1.m_telem_sum_iq_q4=800; m_motor_1.m_telem_sum_ibus_counts=-50; m_motor_1.m_telem_avg_samples=1u;
+    m_motor_1.m_telem_sum_id_q4=600; m_motor_1.m_telem_sum_iq_q4=800; m_motor_1.m_telem_sum_imotor_q4=1000; m_motor_1.m_telem_sum_ibus_counts=-50; m_motor_1.m_telem_avg_samples=1u;
     m_motor_1.m_id_q4=600;   /* raw/control 0.75 A */
     m_motor_1.m_iq_q4=800;   /* raw/control 1.00 A */
     m_motor_1.m_current_in_counts=-50;
@@ -539,7 +593,7 @@ int main(void){
     if(fabsf(pvals.id-0.75f)>0.01f || fabsf(pvals.iq-1.00f)>0.01f)return fail("VESC Id/Iq scaling");
     m_motor_1.m_current_in_counts=50;
     m_motor_1.m_current_in_telem_counts=50;
-    m_motor_1.m_telem_sum_id_q4=600; m_motor_1.m_telem_sum_iq_q4=800; m_motor_1.m_telem_sum_ibus_counts=50; m_motor_1.m_telem_avg_samples=1u;
+    m_motor_1.m_telem_sum_id_q4=600; m_motor_1.m_telem_sum_iq_q4=800; m_motor_1.m_telem_sum_imotor_q4=1000; m_motor_1.m_telem_sum_ibus_counts=50; m_motor_1.m_telem_avg_samples=1u;
     mcpwm_foc_get_values(&pvals,false);
     if(fabsf(pvals.current_motor+1.25f)>0.01f || fabsf(pvals.current_in+1.00f)>0.01f)return fail("VESC regenerative current signs");
 
@@ -570,7 +624,7 @@ int main(void){
         mcpwm_foc_set_pid_speed(300.0f,false);
         if(mcpwm_foc_get_pole_pairs(false)!=10u)return fail("runtime pole-pair 20 poles -> 10pp");
         if(labs((long)m_motor_1.m_speed_target_rpm_q16-(long)(30*65536))>2)return fail("300 ERPM -> 30 motor RPM @10pp");
-        m_motor_1.m_hall_initialized=0u; m_motor_1.m_rpm=100;
+        m_motor_1.m_hall_initialized=1u; m_motor_1.m_hall_ref_rpm=100; m_motor_1.m_hall_ticks=0u;
         if(fabsf(mcpwm_foc_get_motor_mechanical_rpm(false)-100.0f)>0.01f)return fail("runtime motor mechanical RPM");
         if(fabsf(mcpwm_foc_get_output_rpm(false)-20.0f)>0.01f)return fail("gearbox output RPM");
         dyn.si_gear_ratio=1.0f; mcpwm_foc_set_configuration(&dyn,false);

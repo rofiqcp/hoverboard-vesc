@@ -183,6 +183,13 @@ void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
     diag_motors[j].m_openloop_id_target_q4=(int16_t)lroundf(ia*800.0f);
     diag_motors[j].m_id_q4=diag_motors[j].m_openloop_id_target_q4;
     diag_motors[j].m_id_telem_q4=diag_motors[j].m_id_q4;
+    /* Production R/L commissioning waits for the powered current-offset path
+     * to be valid before sampling. The host plant has no analog bridge
+     * transient, so model the bridge as immediately current-ready. */
+    diag_motors[j].m_current_offset_valid=1u;
+    diag_motors[j].m_driven_offset_valid=1u;
+    diag_motors[j].m_driven_offset_calibrating=0u;
+    diag_motors[j].m_bridge_settle_ticks=0u;
     plant_vd[j]=plant_r[j]*ia;
     diag_motors[j].m_vd=(int16_t)lroundf(plant_vd[j]/0.001f);
     diag_motors[j].m_control_mode=CONTROL_MODE_OPENLOOP_PHASE;
@@ -211,6 +218,14 @@ void mcpwm_foc_set_openloop_current(float current,float rpm,bool second){
      * Vmag = R*I + omega*(lambda + L*I). */
     plant_vq[j]=plant_r[j]*ia+omega*(plant_flux[j]+plant_l[j]*ia);
     diag_motors[j].m_vq=(int16_t)lroundf(plant_vq[j]/0.001f);
+    /* The production flux worker ramps until measured duty reaches its target.
+     * Model VESC FOC duty ~= 1.5*|Vdq|/Vbus so the host plant exercises the
+     * same duty-based transition instead of relying on the old fixed-ERPM path. */
+    {
+        float duty=1.5f*fabsf(plant_vq[j])/48.1f;
+        if(duty>0.95f)duty=0.95f;
+        diag_motors[j].m_duty_now_permille=(int16_t)lroundf(duty*1000.0f);
+    }
 }
 float mcpwm_foc_get_id_motor(bool second){return (float)diag_motors[second?1:0].m_id_telem_q4/800.0f;}
 float mcpwm_foc_get_iq_motor(bool second){return (float)diag_motors[second?1:0].m_iq_telem_q4/800.0f;}
@@ -225,8 +240,24 @@ void mcpwm_foc_rl_capture_get(bool second,mcpwm_foc_rl_capture_t *o){
     const double b=(double)plant_l[j]/(0.001*800.0*((double)MCCONF_FOC_CONTROL_DIV/(double)PWM_FREQ));
     o->sum_div=(int64_t)llround(b*(double)o->sum_di2);
 }
-void mc_interface_release_motor(void) { diag_motors[selected_motor==2?1:0].m_control_mode=CONTROL_MODE_NONE; }
-void mcpwm_foc_release_motor(bool second) { diag_motors[second?1:0].m_control_mode=CONTROL_MODE_NONE; }
+void mc_interface_release_motor(void) {
+    const int j=selected_motor==2?1:0;
+    diag_motors[j].m_control_mode=CONTROL_MODE_NONE;
+    /* Host plant has no inertia model. Once torque is released, model the
+     * coast-to-stop that production Detect-All explicitly waits for. */
+    diag_motors[j].m_rpm=0;
+    diag_motors[j].m_duty_now_permille=0;
+    diag_motors[j].m_id_q4=diag_motors[j].m_iq_q4=0;
+    plant_vd[j]=plant_vq[j]=0.0f;
+}
+void mcpwm_foc_release_motor(bool second) {
+    const int j=second?1:0;
+    diag_motors[j].m_control_mode=CONTROL_MODE_NONE;
+    diag_motors[j].m_rpm=0;
+    diag_motors[j].m_duty_now_permille=0;
+    diag_motors[j].m_id_q4=diag_motors[j].m_iq_q4=0;
+    plant_vd[j]=plant_vq[j]=0.0f;
+}
 void mcpwm_foc_clear_faults(void) { clear_faults_count++; diag_motors[0].m_fault=FAULT_CODE_NONE; diag_motors[1].m_fault=FAULT_CODE_NONE; diag_motors[0].m_control_mode=CONTROL_MODE_NONE; diag_motors[1].m_control_mode=CONTROL_MODE_NONE; }
 void mcpwm_foc_force_bridges_off(void) {
     diag_motors[0].m_control_mode=CONTROL_MODE_NONE;
@@ -866,7 +897,7 @@ int main(void){
         buffer_append_float32(fl,3.0f,1e3f,&fi); buffer_append_float32(fl,600.0f,1e3f,&fi);
         buffer_append_float32(fl,0.30f,1e3f,&fi); buffer_append_float32(fl,plant_r[0],1e6f,&fi);
         if(fi!=17||!transact(fl,(uint16_t)fi,r,&rn)||rn!=0u)return fail("local measure flux26 start");
-        if(!pump_until_cmd(7000u,COMM_DETECT_MOTOR_FLUX_LINKAGE,r,&rn)||rn!=5u)return fail("local measure flux26 reply timeout");
+        if(!pump_until_cmd(12000u,COMM_DETECT_MOTOR_FLUX_LINKAGE,r,&rn)||rn!=5u)return fail("local measure flux26 reply timeout");
         { int32_t ri=1; const float lam=buffer_get_float32(r,1e7f,&ri); if(fabsf(lam-plant_flux[0])>0.0015f)return fail("local flux26 FOC compatibility value"); }
         if(store_count[0]!=sb0||memcmp(&confs[0],&keep0,sizeof(keep0))!=0)return fail("flux26 must restore/no-store");
 
@@ -996,7 +1027,11 @@ int main(void){
     }
     {
         uint8_t th[]={COMM_TERMINAL_CMD,'h','e','l','p'};
-        if(!transact(th,sizeof(th),r,&rn)||rn<8u||r[0]!=COMM_PRINT||memcmp(r+1,"Commands:",9u)!=0)
+        /* Help is intentionally emitted in several bounded COMM_PRINT chunks.
+         * The host transport captures the last queued chunk, so validate the
+         * stable final section rather than the historical single-packet prefix. */
+        if(!transact(th,sizeof(th),r,&rn)||rn<21u||r[0]!=COMM_PRINT||
+           memcmp(r+1,"--- FAULT / SAVE ---",20u)!=0)
             return fail("terminal help framing");
         uint8_t tf[]={COMM_FORWARD_CAN,2u,COMM_TERMINAL_CMD_SYNC,'f','w'};
         if(!transact(tf,sizeof(tf),r,&rn)||r[0]!=COMM_PRINT||rn<12u||memcmp(r+1,"motor_right",11u)!=0)

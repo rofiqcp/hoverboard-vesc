@@ -197,11 +197,11 @@ int main(void){
        abs((int)m_motor_2.m_position_kd_filter_q16-(int)(0.63f*65535.0f+0.5f))>2) return fail("position D filter runtime restore");
     if(m_motor_1.m_duty_kp_q12_per_permille==0u || m_motor_1.m_duty_ki_q12_per_permille==0u ||
        m_motor_2.m_duty_kp_q12_per_permille==0u || m_motor_2.m_duty_ki_q12_per_permille==0u) return fail("duty PI runtime restore");
-    /* Motor poles are hardware identity, not EEPROM identity: stale/cross-motor
-     * slots must canonicalize to LEFT 4 pole-pairs and RIGHT 15 pole-pairs.
-     * Gear ratio remains a legitimate persisted user configuration. */
-    if(m_motor_1.m_conf.si_motor_poles!=8u || fabsf(m_motor_1.m_conf.si_gear_ratio-5.25f)>0.02f) return fail("left fixed poles/gear persistence");
-    if(m_motor_2.m_conf.si_motor_poles!=30u || fabsf(m_motor_2.m_conf.si_gear_ratio-1.0f)>0.02f) return fail("right fixed poles/gear persistence");
+    /* Motor poles are physical endpoint identity and are persisted per board.
+     * The same firmware image can serve steering and drive boards, so loading
+     * EEPROM must preserve the values that were explicitly stored above. */
+    if(m_motor_1.m_conf.si_motor_poles!=20u || fabsf(m_motor_1.m_conf.si_gear_ratio-5.25f)>0.02f) return fail("left persisted poles/gear");
+    if(m_motor_2.m_conf.si_motor_poles!=14u || fabsf(m_motor_2.m_conf.si_gear_ratio-1.0f)>0.02f) return fail("right persisted poles/gear");
     if(fabsf(m_motor_1.m_conf.foc_current_filter_const-0.0731f)>0.00011f) return fail("left telemetry filter persistence");
     if(fabsf(m_motor_2.m_conf.foc_current_filter_const-0.2197f)>0.00011f) return fail("right telemetry filter persistence");
     if(fabsf(m_motor_1.m_conf.foc_hall_interp_erpm-620.0f)>0.5f || fabsf(m_motor_2.m_conf.foc_hall_interp_erpm-900.0f)>0.5f)

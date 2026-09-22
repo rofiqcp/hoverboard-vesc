@@ -30,18 +30,22 @@ assert speed.index('if(m->m_encoder_speed_ticks<MCCONF_ENCODER_SPEED_WINDOW_TICK
 tacho=mc[mc.index('static void encoder_tachometer_update_non_isr'):mc.index('static int16_t duty_permille_from_vdq',mc.index('static void encoder_tachometer_update_non_isr'))]
 assert '__disable_irq()' not in tacho and 'mcpwm_foc_get_irq_epoch' in tacho
 
-# UART IRQ only acknowledges IDLE; DMA parsing stays in main context.
-uart_irq=it[it.index('void f103_USART3_IRQHandler_impl'):it.index('/******************************************************************************/',it.index('void f103_USART3_IRQHandler_impl'))]
+# Control-UART IRQ only acknowledges IDLE; DMA parsing stays in main context.
+# The hardware-specific USART3 name was intentionally replaced by the role-based
+# handler name, so bind this gate to the canonical handler rather than a stale symbol.
+uart_start=it.index('void f103_ControlUart_IRQHandler_impl')
+uart_end=it.index('/******************************************************************************/',uart_start)
+uart_irq=it[uart_start:uart_end]
 assert 'usart3_rx_check()' not in re.sub(r'/\*.*?\*/','',uart_irq,flags=re.S)
-assert '__HAL_UART_CLEAR_IDLEFLAG' in uart_irq
+assert '__HAL_UART_CLEAR_IDLEFLAG' in uart_irq and 'HAL_UART_IRQHandler(&huart3)' in uart_irq
 assert 'usart3_rx_check();\n    vesc_protocol_process_pending();' in main
 assert main.index('mcpwm_foc_outer_control_non_isr') < main.index('usart3_rx_check();')
 
 # Priority hierarchy keeps ADC/FOC above UART RX and TX completion.
 assert 'HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);' in setup
-assert 'HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 1, 0);' in setup
-assert 'HAL_NVIC_SetPriority(USART3_IRQn, 1, 0);' in setup
-assert 'HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 2, 0);' in setup
+assert 'HAL_NVIC_SetPriority(CONTROL_UART_RX_DMA_IRQn, 1, 0);' in setup
+assert 'HAL_NVIC_SetPriority(CONTROL_UART_IRQn, 1, 0);' in setup
+assert 'HAL_NVIC_SetPriority(CONTROL_UART_TX_DMA_IRQn, 2, 0);' in setup
 # Health ABI exposes queue pressure, UART recovery and main-loop timing.
 assert '#define HB_CUSTOM_GET_COMMS_HEALTH                 24u' in vp
 for token in ('s_rx_queue_drop','s_rx_queue_highwater','s_rt_cmd_coalesced','s_tx_queue_drop',

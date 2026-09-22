@@ -54,4 +54,4 @@ print('BOOTLOADER_LAYOUT_STATIC_PASS app=240K host_external_stage=1 boot=10K met
 assert 'uart_recv_byte' in boot and 'uart_send_bytes' in boot and 'USART_SR_ORE' in boot
 assert 'HAL_UART_Receive(&huart3' not in boot and 'HAL_UART_Transmit(&huart3' not in boot
 
-assert 'default_envs = APP_STLINK' in ini  # production default: direct ST-Link; USART remains explicit fallback
+assert 'default_envs = APP_USART_PC' in ini  # canonical production default: 921600-baud VESC serial updater; ST-Link remains explicit recovery

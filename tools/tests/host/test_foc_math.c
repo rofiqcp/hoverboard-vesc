@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include "config.h"
 #include "motor/foc_math.h"
 static int fail(const char *m){fprintf(stderr,"FAIL %s\n",m);return 1;}
 

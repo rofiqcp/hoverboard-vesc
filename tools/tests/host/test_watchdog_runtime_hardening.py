@@ -23,9 +23,15 @@ assert 'platform_watchdog_maintenance_kick();' in main
 for token in ('w.init_failed','w.init_fail_stage','w.iwdg_sr','w.iwdg_pr','w.iwdg_rlr'):
     assert token in vp, token
 
-# Python direct-UART enumeration must not shadow the module-level `serial` name.
-assert 'from serial.tools import list_ports' in dual
-assert 'import serial.tools.list_ports' not in dual
-assert 'for q in list_ports.comports()' in dual
+# Direct-UART candidate enumeration must not shadow the module-level `serial`
+# guard. PL2303 identification may import serial.tools.list_ports separately.
+candidate_fn=dual.split('def _direct_serial_candidates()',1)[1].split('def _is_pl2303',1)[0]
+assert 'from serial.tools import list_ports' in candidate_fn
+assert 'import serial.tools.list_ports' not in candidate_fn
+assert 'for q in list_ports.comports()' in candidate_fn
+pl2303_fn=dual.split('def _is_pl2303',1)[1].split('def open_serial_compat',1)[0]
+assert 'from serial.tools import list_ports' in pl2303_fn
+assert 'for port in list_ports.comports()' in pl2303_fn
+assert 'import serial.tools.list_ports' not in pl2303_fn
 
 print('WATCHDOG_RUNTIME_HARDENING_PASS hal_sequence=1 feed_gate=1 hw_diag=1 uart_autodiscovery=1')

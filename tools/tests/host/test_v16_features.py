@@ -36,8 +36,8 @@ assert 'speed_pid_iq_target_step' not in motor_step and 'position_pid_iq_target_
 assert 'm->m_iq_set_q4=m->m_iq_target_q4;' in motor_step
 assert 'motor_outer_loop_virtual_steps' not in mc
 assert 'm->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;' in mc, 'speed STOP must force VESC zero-vector reference'
-assert 'VESC speed PID -> Iq' in mc
-assert 'min_erpm_q16' in mc and 'target_abs_q16 < min_erpm_q16' in mc
+assert 'speed_pid_iq_target_step' in outer and 'm->m_iq_target_q4=speed_pid_iq_target_step' in outer, 'speed PID must feed the cached Iq target through executable code, not a comment contract'
+assert 'min_erpm_q16' in mc and re.search(r'if\s*\(\s*target_abs_q16\s*<\s*min_erpm_q16\s*\)',mc), 'speed release threshold must be enforced independent of source formatting'
 assert 'speed PI drives Vq directly' not in mc
 assert 'MCCONF_POSITION_PHASE_DEADBAND_MDEG' not in mcc and 'MCCONF_POSITION_RUN_CURRENT_MAX_MA' not in mcc and 'MCCONF_POSITION_BREAKAWAY_CURRENT_MA' not in mcc
 assert 'm_position_prev_proc_phase' in mch and 'm_position_kd_proc_phase_coeff_q4' in mch
@@ -65,18 +65,20 @@ assert (R/'tools/tests/hardware/test_hall_detect_repeat.py').exists()
 assert 'mcpwm_foc_vesc_override_clear(second)' in mc
 assert 'COMM_DETECT_HALL_FOC, 90.0)' in dual
 
-# Released bridge remains torque-free, but the separately calibrated high-Z
-# ADC path is intentionally published as measurement-only current telemetry.
-assert 'leftOffTelemValid' in mc and 'rightOffTelemValid' in mc and 'off_telem_deadband_counts' in mc
+# Released bridge remains torque-free while passive DC-link telemetry may
+# continue from the calibrated high-Z path. Check behavior, not old helper names.
 assert 'm_id_telem_q4' in mc and 'm_current_in_telem_counts' in mc
 assert 'const bool inactive = !source_enabled || !feedback_ready ||' in mc
 assert 'if (inactive && !control_update)' in mc
 assert 'Released motors still need one Clarke/Park measurement' in mc
-assert 'if(!m->m_off_offset_valid || bridge_on){td=0; tq=0; ti=0;}' in mc
+assert 'm->m_control_mode==CONTROL_MODE_NONE && m->m_off_dc_valid' in mc
+assert 'telemetry_avg_push(m,0,0,passive_dc)' in mc
 idx=mc.index('if (inactive) {')
 off=mc[idx:mc.index('return;',idx)]
-for token in ('m->m_vd=0','m->m_vq=0','m->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=0',
-              'm->m_iq_set_q4=0','m->m_iq_target_q4=0','m->m_id_set_q4=0'):
+for token in ('m->m_state=MC_STATE_OFF','m->m_vd=0','m->m_vq=0',
+              'm->m_pwm_a=0','m->m_pwm_b=0','m->m_pwm_c=0',
+              'm->m_iq_set_q4=0','m->m_iq_target_q4=0','m->m_id_set_q4=0',
+              'm->m_dq_sample_fresh=0u'):
     assert token in off, token
 for forbidden in ('m->m_id_q4=0','m->m_iq_q4=0','m->m_current_in_counts=0'):
     assert forbidden not in off, forbidden
@@ -96,9 +98,9 @@ assert 'vesc_now_ms = HAL_GetTick();' in main and 'vesc_protocol_periodic(vesc_n
 assert main.index('mcpwm_foc_outer_control_non_isr(vesc_now_ms)') < main.index('vesc_protocol_process_pending()'), 'outer PID must have priority over VESC parser'
 # Timing/control regressions found against VESC + EFeru references.
 assert 'm->m_position_dt_ticks=0u' in mc and 'm->m_position_proc_dt_ticks=0u' in mc, 'position derivative dt must start at zero'
-assert 'const uint32_t den=(uint32_t)m->m_hall_period*(pp?pp:1u);' in mc and '10667' not in mc, 'Hall mechanical RPM must use runtime pole pairs'
+assert re.search(r'const\s+uint32_t\s+den\s*=\s*\(uint32_t\)m->m_hall_period\s*\*\s*pp\s*;',mc), 'Hall mechanical RPM must use runtime pole pairs rather than a hard-coded pole count'
 assert 'if (m->m_speed_ramp_rpm_s == 0u)' in mc and 'm->m_speed_set_ramp_q16 = target_q16;' in mc, 'zero VESC speed ramp must mean direct setpoint'
-assert 'm_speed_release_erpm_q16' in mch and 'min_erpm_q16 = (int64_t)m->m_speed_release_erpm_q16' in mc, 's_pid_min_erpm must stay in electrical ERPM domain'
+assert 'm_speed_release_erpm_q16' in mch and re.search(r'min_erpm_q16\s*=\s*\(int64_t\)m->m_speed_release_erpm_q16',mc), 's_pid_min_erpm must stay in electrical ERPM domain'
 assert outer.index('driven_offset_finalize_non_isr();') < outer.index('if(s_outer_pid_last_ms==0u)'), 'powered offset finalization must not wait for 200-Hz housekeeping'
 assert 'outer_max_cycles, outer_miss_count, outer_jitter_max_cycles' in mch and 'APPP(p.outer_max_cycles)' in vp and '"outer_jitter"' in dual, 'outer timing profiler must be readable through existing diagnostic packet'
 assert 'send_values_packet' in vp and 'send_values_setup_packet' in vp
@@ -122,7 +124,7 @@ assert 'm->m_hall_direction == dir' in mc, 'Hall period-outlier filter must not 
 assert 'hall_table_runtime_sane' in mc and 'Preserve the last known-good table' in mc, 'runtime Hall-table validation missing'
 assert 'hall_feedback_valid' in mc and 'angle==m->m_hall_pos_prev' in mc, 'rejected Hall state must be excluded from feedback-ready gate'
 assert 'leftFeedbackReadyPost' in mc and 'rightFeedbackReadyPost' in mc, 'post-control Hall readiness/MOE race guard missing'
-assert 'stable non-adjacent Hall transition' in mc and 'mcpwm_foc_release_motor(second)' in mc, 'Hall sequence reject must release closed-loop drive'
+assert 'm->m_hall_sequence_reject_count++' in mc and 'static bool hall_drive_ready' in mc and 'm->m_hall_reject_counted_state = h;' in mc, 'Hall sequence reject must keep diagnostic state while bridge readiness remains separately gated'
 assert vp.count('const float sl_erpm=buffer_get_float32(data,1e3f,&k);') == 1, 'Detect-All must consume exactly one sl_erpm field from VESC Tool packet'
 assert 'measure_r_l_imax_f103_finish' in vp and 'conf_general_calc_apply_foc_cc_kp_ki_gain' in vp and 'mcconf->foc_current_kp=mcconf->foc_motor_l*bw' in vp and 'mcconf->foc_current_ki=mcconf->foc_motor_r*bw' in vp, 'Detect-All must identify R/L and use upstream VESC gain equations'
 assert 'left_sensor_encoder' in vp and 'if(s_detect_all.left_sensor_encoder)' in vp and 'detect_all_prepare_hall(mi)' in vp, 'Detect-All must honor LEFT Encoder/Hall selection while RIGHT remains Hall'
@@ -162,7 +164,7 @@ assert 'case COMM_SET_HANDBRAKE:' in vp and 'mc_interface_set_handbrake(current)
 dual=(R/'tools/vesc_dual.py').read_text()
 assert 'COMM_SET_HANDBRAKE = 10' in dual and 'def handbrake(' in dual
 
-assert 'Bridge-OFF current is a real ADC measurement' in mc, 'OFF current telemetry contract missing'
+assert 'leftOffDcValid' in mc and 'rightOffDcValid' in mc and 'only DC-link current is authoritative' in mc, 'OFF telemetry must remain a real calibrated DC-link measurement with phase shunts excluded in high-Z'
 assert 'steering_center_after_span_calibration' in mci, 'steering detect must have bounded midpoint finalizer'
 assert 'ok=mc_interface_store_configuration_motor(false);' in vp, 'Detect Encoder must persist detected ABI electrical config before success'
 assert 'MCCONF_STEERING_CENTER_TOL_COUNTS' in mci and 'steering_stage_set(0xE8u)' in mci, 'detect must fail closed when midpoint centering fails'

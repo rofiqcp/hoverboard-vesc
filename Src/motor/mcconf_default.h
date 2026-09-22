@@ -209,7 +209,7 @@
 /* Legacy hoverboard-firmware-hack-FOC Hall speed estimator constants.
  * z_maxCntRst=2000, dz_cntTrnsDetHi=40, dz_cntTrnsDetLo=20. At 16 kHz and
  * 15 pole-pairs the derived speed coefficient is 10667, exactly matching
- * cf_speedCoef in BLDC_controller_data.c. These affect telemetry only. */
+ * the original generated Hall-speed coefficient. These affect telemetry only. */
 #define MCCONF_HALL_REF_MAX_COUNT             2000u
 #define MCCONF_HALL_REF_DELTA_HI                40u
 #define MCCONF_HALL_REF_DELTA_LO                20u

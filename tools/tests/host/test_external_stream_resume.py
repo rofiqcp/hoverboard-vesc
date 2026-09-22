@@ -5,7 +5,8 @@ R=Path(__file__).resolve().parents[3]
 spec=importlib.util.spec_from_file_location('upl',R/'tools/pio_vesc_upload.py'); upl=importlib.util.module_from_spec(spec); spec.loader.exec_module(upl)
 class Fake:
     def __init__(self,fw):
-        self.args=types.SimpleNamespace(transport='serial',serial_port='/dev/mock',baud=115200,fault_stop_after=8193)
+        self.args=types.SimpleNamespace(transport='serial',serial_port='/dev/mock',baud=115200,boot_baud=921600,fault_stop_after=8193)
+        self.current_baud=int(self.args.baud)
         self.buf=bytearray(); self.mode='boot'; self.fw=fw; self.state=0; self.size=0; self.crc=0; self.stage=bytearray(); self.written=0; self.connections=1; self.resume_seen=0
     def reconnect_transport(self): self.connections+=1
     def transact(self,p,expected,timeout=3):

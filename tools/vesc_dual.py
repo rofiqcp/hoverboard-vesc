@@ -136,8 +136,8 @@ def _is_pl2303(path: str) -> bool:
     """Identify the Prolific 067b:2303 adapter used by the steering USART2 link."""
     target=os.path.realpath(path)
     try:
-        import serial.tools.list_ports
-        for port in serial.tools.list_ports.comports():
+        from serial.tools import list_ports
+        for port in list_ports.comports():
             if os.path.realpath(port.device) == target:
                 return port.vid == 0x067B and port.pid == 0x2303
     except Exception:

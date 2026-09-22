@@ -54,6 +54,12 @@ static void set_halls(uint8_t l,uint8_t r){
     set_hall(GPIOB,LEFT_HALL_U_PIN,LEFT_HALL_V_PIN,LEFT_HALL_W_PIN,l);
     set_hall(GPIOC,RIGHT_HALL_U_PIN,RIGHT_HALL_V_PIN,RIGHT_HALL_W_PIN,r);
 }
+static uint32_t ramp_frames_for_delta(uint32_t delta_rpm,uint16_t ramp_rpm_s){
+    if(ramp_rpm_s==0u)return 32u;
+    const uint64_t frames=((uint64_t)delta_rpm*(uint64_t)PWM_FREQ+
+                           (uint64_t)ramp_rpm_s-1u)/(uint64_t)ramp_rpm_s;
+    return (uint32_t)(frames+(uint64_t)PWM_FREQ/20u+32u);
+}
 static void use_legacy_hall_fixture(void){
     /* These regression cases predate the production LEFT encoder. Override only
      * the feedback-selection fields directly so PI defaults remain untouched. */
@@ -96,7 +102,7 @@ int main(void){
         return fail("free-run release must disable MOE/high impedance");
 
     /* Startup offset remains a one-time 2000-frame bridge-OFF calibration.
-     * OFF->RUN then learns the powered zero-vector common-mode for 80 frames.
+     * OFF->RUN waits the configured pre-settle window, then learns the powered zero-vector common-mode for 80 frames.
      * The real LEFT bridge can sit near 3.3k ADC counts when MOE is enabled, so
      * validity is rail/pair based rather than incorrectly forcing midscale. */
     mcpwm_foc_init(); LEFT_TIM->BDTR=0u; RIGHT_TIM->BDTR=0u; use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
@@ -114,7 +120,7 @@ int main(void){
         return fail("OFF-to-RUN must enter powered zero-vector calibration");
     adc_buffer.rlA=3304; adc_buffer.rlB=3436; adc_buffer.dcl=1922;
     adc_buffer.rrB=1963; adc_buffer.rrC=1938; adc_buffer.dcr=1861;
-    for(unsigned i=0;i<MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++)
+    for(unsigned i=0;i<MCCONF_BRIDGE_PRESETTLE_SAMPLES+MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++)
         DMA1_Channel1_IRQHandler();
     /* Mean/validity powered baseline sekarang sengaja difinalisasi housekeeping
      * (<=5 ms), sementara bridge tetap ditahan zero-vector. */
@@ -140,14 +146,16 @@ int main(void){
     for(unsigned i=0;i<8u && (LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u;i++)DMA1_Channel1_IRQHandler();
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("rail-test bridge did not arm");
     adc_buffer.rlA=4090; adc_buffer.rlB=4088; adc_buffer.dcl=1922;
-    for(unsigned i=0;i<MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++)
+    for(unsigned i=0;i<MCCONF_BRIDGE_PRESETTLE_SAMPLES+MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++)
         DMA1_Channel1_IRQHandler();
     legacy_sync();
     if(m_motor_1.m_fault!=FAULT_CODE_HIGH_OFFSET_CURRENT_SENSOR_1 || m_motor_1.m_driven_offset_valid)
         return fail("powered offset near ADC rail must fault and stay invalid");
 
-    /* MODE 2: legacy command is mechanical RPM. Active speed setpoint must ramp
-     * at 100 mech RPM/s (=1500 ERPM/s at 15 pole pairs), not step. */
+    /* MODE 2: legacy command is mechanical RPM. Active speed setpoint must
+     * follow the configured ERPM/s ramp converted through the active pole-pair
+     * count; the test duration is derived from that runtime value, not a stale
+     * hard-coded mechanical ramp. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; motorRunReq=1u; set_halls(3u,3u);
     legacy_sync();
     ctrlModReq=SPD_MODE; pwml=50; pwmr=-50;
@@ -156,7 +164,7 @@ int main(void){
     if(m_motor_1.m_speed_target_rpm!=50)return fail("mode2 target must be 50 mechanical RPM");
     if(m_motor_1.m_speed_set_rpm!=0)return fail("mode2 active speed must start ramped from measured speed");
     if(m_motor_1.m_iq_set_q4!=0)return fail("mode2 must not create Iq reference");
-    for(int i=0;i<8500;i++)sim_isr_step();
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
     if(m_motor_1.m_speed_set_rpm!=50)return fail("mode2 speed ramp must reach 50 RPM");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 must remain speed control while running");
 
@@ -164,12 +172,12 @@ int main(void){
      * same ramp. Check 100 RPM and a direction reversal to -50 RPM. */
     pwml=100; pwmr=-100;
     legacy_sync();
-    for(int i=0;i<8500;i++)sim_isr_step();
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=100 || m_motor_1.m_speed_set_rpm!=100)
         return fail("mode2 100 RPM scaling/ramp");
     pwml=-50; pwmr=50;
     legacy_sync();
-    for(int i=0;i<25000;i++)sim_isr_step();
+    for(uint32_t i=0;i<ramp_frames_for_delta(150u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
     if(m_motor_1.m_speed_target_rpm!=-50 || m_motor_1.m_speed_set_rpm!=-50)
         return fail("mode2 reverse -50 RPM ramp");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 reverse must stay speed mode");
@@ -182,39 +190,46 @@ int main(void){
     if(m_motor_1.m_speed_target_rpm!=0)return fail("mode2 STOP target zero");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must ramp toward zero vector");
     if(abs(m_motor_1.m_speed_set_rpm)<=5)return fail("mode2 STOP ramp must not jump to zero");
-    for(int i=0;i<3500;i++)sim_isr_step();
+    for(uint32_t i=0;i<(uint32_t)PWM_FREQ/5u;i++)sim_isr_step();
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP left SPEED mode too early");
-    for(int i=0;i<5000;i++)sim_isr_step();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("mode2 STOP must remain SPEED at zero vector");
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++)sim_isr_step();
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)
+        return fail("mode2 STOP must release after entering low-speed release zone");
     if(m_motor_1.m_speed_integrator!=0 || m_motor_1.m_iq_target_q4!=0)
-        return fail("mode2 zero-vector must reset speed PID and command zero Iq");
+        return fail("mode2 release must reset speed PID and command zero Iq");
     if(m_motor_1.m_speed_set_rpm!=0 || m_motor_1.m_speed_target_rpm!=0)
-        return fail("mode2 zero-vector must zero speed states");
+        return fail("mode2 release must zero speed states");
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)
+        return fail("mode2 release must disable bridge MOE");
 
-    /* VESC boundary: 200 ERPM = 50 mechanical RPM. VESC SET_RPM 0 while speed
-     * is active must request a ramp, not immediate active braking/reversal. */
+    /* VESC boundary: COMM_SET_RPM is electrical RPM. Convert the 50 mechanical
+     * RPM test target through the canonical configured pole-pair count. */
+    const float vesc_erpm_50=50.0f*(float)MCCONF_POLE_PAIRS_LEFT;
     mcpwm_foc_init(); use_legacy_hall_fixture(); enable=1u; set_halls(3u,3u);
-    mcpwm_foc_set_pid_speed(200.0f,false);
+    mcpwm_foc_set_pid_speed(vesc_erpm_50,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_speed_target_rpm!=50)return fail("VESC ERPM target conversion");
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC speed mode entry");
-    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++){ if((i%1000u)==0u)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
     if(m_motor_1.m_speed_set_rpm!=50)return fail("VESC speed ramp reach target");
     mcpwm_foc_set_pid_speed(0.0f,false);
     mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("VESC zero ERPM must ramp before release");
     if(m_motor_1.m_speed_target_rpm!=0)return fail("VESC zero ERPM target");
-    for(int i=0;i<8500;i++){ if((i%1000)==0)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0)return fail("VESC zero ERPM zero-vector hold");
-    mcpwm_foc_set_pid_speed(200.0f,false);
+    for(uint32_t i=0;i<ramp_frames_for_delta(50u,m_motor_1.m_speed_ramp_rpm_s);i++){ if((i%1000u)==0u)mcpwm_foc_vesc_override_touch(false); sim_isr_step(); }
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_iq_set_q4!=0)
+        return fail("VESC zero ERPM must release below configured low-speed threshold");
+    mcpwm_foc_set_pid_speed(vesc_erpm_50,false);
     mcpwm_foc_vesc_override_touch(false);
-    m_motor_1.m_rpm=50;
+    m_motor_1.m_hall_initialized=1u;
+    m_motor_1.m_hall_ref_rpm=50;
+    m_motor_1.m_hall_ticks=0u;
     mc_values vals;
     mcpwm_foc_get_values(&vals,false);
-    if(fabsf(vals.rpm-200.0f)>0.1f)return fail("mc_values.rpm must be ERPM");
+    if(fabsf(vals.rpm-vesc_erpm_50)>0.1f)return fail("mc_values.rpm must be ERPM");
 
-    /* VESC speed STOP: once the ramp enters s_pid_min_erpm, command duty=0 and
-     * zero the Iq reference while retaining SPEED mode. */
+    /* VESC speed STOP: once the ramp enters s_pid_min_erpm, release the bridge
+     * to high impedance after clearing the speed/current state. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u;
     /* Production main initializes housekeeping before a VESC command arrives.
      * Prime the slow clock here so the following 80 PWM frames represent one
@@ -227,10 +242,12 @@ int main(void){
     /* SPEED outer PID/zero-zone berjalan di scheduler 1 kHz. 80 PWM frame
      * mewakili 5 ms sehingga menyediakan beberapa outer tick fresh-feedback. */
     for(unsigned i=0;i<80u;i++)sim_isr_step();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED)return fail("speed STOP must not release with nonzero Iq");
-    if(m_motor_1.m_iq_set_q4!=0)return fail("speed STOP zone must force zero Iq like VESC");
-    for(int i=0;i<4000;i++)sim_isr_step();
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_SPEED || m_motor_1.m_iq_set_q4!=0)return fail("speed STOP must retain zero-vector SPEED mode");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE)
+        return fail("speed STOP low-speed zone must release bridge");
+    if(m_motor_1.m_iq_set_q4!=0 || m_motor_1.m_iq_target_q4!=0)
+        return fail("speed STOP release must clear Iq");
+    if((LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)
+        return fail("speed STOP release must disable bridge MOE");
 
     /* VESC current brake: recompute torque sign from live rotor speed. At zero/stale
      * speed the zero-current zero-vector remains active until another command. */
@@ -304,27 +321,29 @@ int main(void){
     sim_isr_step();
     if(m_motor_1.m_openloop_id_target_q4!=SVPWM_MAX_ID_A*FOC_CURRENT_Q4_PER_A)return fail("mode4 Id safety clamp");
 
-    /* VESC normalized +/-1.0 must reach the exact EFeru FOC hardware ceiling:
-     * ARR=2000 with symmetric 110-count current-sampling margin. */
+    /* VESC normalized +/-1.0 is clamped by the configured l_max_duty safety
+     * ceiling before the EFeru hardware modulation limit is applied. */
     mcpwm_foc_init(); use_legacy_hall_fixture(); set_halls(3u,3u); enable=1u; motorRunReq=1u;
+    const int16_t duty_limit=m_motor_1.m_duty_limit_permille;
     legacy_sync();
     ctrlModReq=VLT_MODE; pwml=1000; pwmr=0;
     legacy_sync();
     for(int i=0;i<32000;i++)sim_isr_step();
-    if(m_motor_1.m_duty_set_permille!=1000)return fail("duty +1.0 command scaling");
-    if(m_motor_1.m_duty_now_permille!=1000)return fail("duty +1.0 telemetry scaling");
+    if(m_motor_1.m_duty_set_permille!=duty_limit)return fail("duty +1.0 command clamp");
+    if(m_motor_1.m_duty_now_permille!=duty_limit)return fail("duty +1.0 telemetry clamp");
     if(m_motor_1.m_iq_target_q4!=m_motor_1.m_current_limit_q4)return fail("duty target must stay current-limited");
     if(m_motor_1.m_ccr_a<110 || m_motor_1.m_ccr_a>1890 ||
        m_motor_1.m_ccr_b<110 || m_motor_1.m_ccr_b>1890 ||
        m_motor_1.m_ccr_c<110 || m_motor_1.m_ccr_c>1890)
         return fail("duty1 CCR violates EFeru 110..1890 margin");
     mcpwm_foc_set_duty(-1.0f,false); mcpwm_foc_vesc_override_touch(false);
-    if(m_motor_1.m_duty_set_permille!=-1000)return fail("duty -1.0 command scaling");
+    if(m_motor_1.m_duty_set_permille!=-duty_limit)return fail("duty -1.0 command clamp");
     for(int i=0;i<32000;i++){if((i%1000)==0)mcpwm_foc_vesc_override_touch(false);sim_isr_step();}
-    if(m_motor_1.m_duty_now_permille!=-1000)return fail("duty -1.0 telemetry scaling");
+    if(m_motor_1.m_duty_now_permille!=-duty_limit)return fail("duty -1.0 telemetry clamp");
     mcpwm_foc_set_duty(0.0f,false);
-    if(m_motor_1.m_control_mode!=CONTROL_MODE_DUTY || m_motor_1.m_duty_set_permille!=0)
-        return fail("VESC SET_DUTY zero must remain duty zero-vector");
+    if(m_motor_1.m_control_mode!=CONTROL_MODE_NONE || m_motor_1.m_duty_set_permille!=0 ||
+       (LEFT_TIM->BDTR&TIM_BDTR_MOE)!=0u)
+        return fail("VESC SET_DUTY zero must release high impedance");
     mcpwm_foc_set_current(1.0f,false); mcpwm_foc_vesc_override_touch(false);
     if(m_motor_1.m_control_mode!=CONTROL_MODE_CURRENT)return fail("VESC SET_CURRENT 1A entry");
     mcpwm_foc_set_current(0.0f,false);
@@ -343,7 +362,7 @@ int main(void){
     for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
     adc_buffer.batt1=(uint16_t)(((uint32_t)m_motor_1.m_vin_min_adc+(uint32_t)m_motor_1.m_vin_max_adc)/2u);
     if((LEFT_TIM->BDTR&TIM_BDTR_MOE)==0u)return fail("duty95 bridge did not arm");
-    for(unsigned i=0u;i<MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++){
+    for(unsigned i=0u;i<MCCONF_BRIDGE_PRESETTLE_SAMPLES+MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++){
         DMA1_Channel1_IRQHandler();
     }
     legacy_sync();
@@ -369,7 +388,7 @@ int main(void){
     adc_buffer.dcl=adc_buffer.dcr=2000; adc_buffer.batt1=2000;
     for(int i=0;i<2005;i++)DMA1_Channel1_IRQHandler();
     adc_buffer.batt1=(uint16_t)(((uint32_t)m_motor_1.m_vin_min_adc+(uint32_t)m_motor_1.m_vin_max_adc)/2u);
-    for(unsigned i=0u;i<MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++){
+    for(unsigned i=0u;i<MCCONF_BRIDGE_PRESETTLE_SAMPLES+MCCONF_BRIDGE_SETTLE_SAMPLES+8u && !m_motor_1.m_driven_offset_finalize_pending;i++){
         DMA1_Channel1_IRQHandler();
     }
     legacy_sync();

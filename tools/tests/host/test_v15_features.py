@@ -27,7 +27,9 @@ assert 'm->m_iq_target_q4=position_pid_iq_target_step' in outer
 assert 'speed_pid_iq_target_step' not in motor_step and 'position_pid_iq_target_step' not in motor_step
 assert 'motor_outer_loop_virtual_steps' not in mc
 assert re.search(r'measured_mech_rpm_q16\(m,\s*second\)\s*\*\s*pp',mc)
-assert '((float)PWM_FREQ*10.0f)/(float)m->m_hall_period' in mc
+assert 'const uint32_t den = (uint32_t)m->m_hall_period * pp;' in mc
+assert '((uint32_t)PWM_FREQ * 10u * 4096u) / den' in mc
+assert 'mag_q12 << 4' in mc
 
 # VESC OPENLOOP_PHASE is fixed phase/direct Id. Hall/encoder detect performs
 # its own explicit current ramp and the rotating openloop updater must not run.
