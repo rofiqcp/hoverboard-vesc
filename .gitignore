@@ -4,6 +4,7 @@
 # Python tool artifacts
 __pycache__/
 *.py[cod]
+*.bak*
 /dist/
 /backups/
 recovery/
