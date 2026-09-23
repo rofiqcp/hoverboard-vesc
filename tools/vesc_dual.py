@@ -247,6 +247,7 @@ HB_GET_COMMS_HEALTH = 24
 HB_GET_PLATFORM_INFO = 25
 HB_GET_PERSISTED_MCCONF = 34
 HB_GET_PERSISTED_APPCONF = 35
+HB_STEERING_SYNC_ONLY = 36
 HB_GET_ADC_VALIDITY = 26
 HB_ARM_CURRENT_STEP = 27
 HB_GET_STEP_STATUS = 28
@@ -1272,6 +1273,22 @@ class VescDual:
         return {"status":status,"calibrated":bool(flags&1),"homed":bool(flags&2),
                 "encoder_synced":bool(flags&4),"span":span}
 
+    def sync_steering(self):
+        """LEFT motor ABI/electrical sync only. Never changes logical center."""
+        cal=self.steering_calibration()
+        if cal.get("encoder_synced"):
+            return {"status":0,"calibrated":bool(cal.get("calibrated")),
+                    "homed":bool(cal.get("homed")),"encoder_synced":True,
+                    "span":int(cal.get("span",0)),"already_synced":True}
+        p=self.custom_transact(HB_STEERING_SYNC_ONLY,right=False,timeout=20.0)
+        status=parse_custom_header(p,HB_STEERING_SYNC_ONLY)
+        if len(p)<11:
+            raise ValueError(f"short steering sync reply: {len(p)}")
+        flags=p[6]
+        span=struct.unpack_from(">i",p,7)[0]
+        return {"status":status,"calibrated":bool(flags&1),"homed":bool(flags&2),
+                "encoder_synced":bool(flags&4),"span":span,"already_synced":False}
+
     def encoder_debug(self):
         """Read-only LEFT ABI alignment/detect black-box diagnostics."""
         p=self.custom_transact(HB_ENCODER_DEBUG,right=False,timeout=2.0)
@@ -1281,20 +1298,34 @@ class VescDual:
         q=6
         align_stage,steer_stage,detect_stage,inverted,configured,synced=p[q:q+6]; q+=6
         offset_mdeg,ratio_milli=struct.unpack_from(">ii",p,q); q+=8
-        raw,before,jog,back=struct.unpack_from(">IIII",p,q); q+=16
-        dj,db,plus_mdeg,minus_mdeg=struct.unpack_from(">iiii",p,q); q+=16
+        raw,power_on,phase0,final=struct.unpack_from(">IIII",p,q); q+=16
+        phase0_delta,total_delta,plus_mdeg,minus_mdeg=struct.unpack_from(">iiii",p,q); q+=16
         edge_a,edge_b,edge_pb5,samples=struct.unpack_from(">IIII",p,q); q+=16
         current_ma=struct.unpack_from(">H",p,q)[0]; q+=2
         span,pos,target=struct.unpack_from(">iii",p,q); q+=12
         pid_target=struct.unpack_from(">i",p,q)[0] if len(p)>=q+4 else target
         if len(p)>=q+4: q+=4
+        expected_sector=0; fail_sector=0; direction=0; sectors=(0,0,0,0,0,0)
+        checkpoints=(0,0,0,0,0,0)
+        if len(p)>=q+16:
+            expected_sector=struct.unpack_from(">H",p,q)[0]; q+=2
+            fail_sector=p[q]; direction=struct.unpack_from(">b",p,q+1)[0]; q+=2
+            sectors=struct.unpack_from(">6h",p,q); q+=12
+        if len(p)>=q+24:
+            checkpoints=struct.unpack_from(">6I",p,q); q+=24
         return {"align_stage":align_stage,"steering_stage":steer_stage,"detect_stage":detect_stage,
                 "inverted":bool(inverted),"configured":bool(configured),"synced":bool(synced),
                 "offset_deg":offset_mdeg/1000.0,"ratio":ratio_milli/1000.0,"raw":raw,
-                "before":before,"jog":jog,"back":back,"dj":dj,"db":db,
+                "power_on":power_on,"phase0":phase0,"final":final,
+                "phase0_delta":phase0_delta,"total_delta":total_delta,
+                "expected_sector":expected_sector,"sector_deltas":sectors,"checkpoint_raw":checkpoints,
+                "fail_sector":fail_sector,"direction":direction,
                 "plus_deg":plus_mdeg/1000.0,"minus_deg":minus_mdeg/1000.0,
-                "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,"current_ma":current_ma,
-                "span":span,"position":pos,"target":target,"pid_target":pid_target}
+                "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,
+                "current_ma":current_ma,"span":span,"position":pos,"target":target,
+                "pid_target":pid_target,
+                "before":power_on,"jog":phase0,"back":final,
+                "dj":phase0_delta,"db":total_delta}
 
     def platform_health(self) -> dict[str, int | bool]:
         p=self.custom_transact(HB_GET_PLATFORM_HEALTH,right=False,timeout=max(self.timeout,1.2))

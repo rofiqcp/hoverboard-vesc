@@ -436,40 +436,44 @@ static bool steering_seek_stop_user(float start_current_a, int8_t user_dir, int3
         }
 
         if(direction_has_moved && (uint32_t)(age-last_move_age)>=MCCONF_STEERING_STALL_MS){
-            /* Candidate hard-stop. Raise current by one step only to distinguish
-             * a true mechanical stop from a local friction peak. If motion
-             * resumes, continue travelling with that higher current. If it does
-             * not, accept this count as the endpoint instead of forcing 15 A
-             * continuously into the stop. */
-            if(current<max_current-0.01f){
-                float confirm=current+step;
-                if(confirm>max_current)confirm=max_current;
-                const int32_t confirm_start_progress=
-                    (m->m_position_counts-origin)*(int32_t)user_dir;
-                bool resumed=false;
-                uint32_t confirm_ms=0u;
-                while(confirm_ms<MCCONF_STEERING_STOP_CONFIRM_MS){
-                    mc_interface_set_current(electrical_dir*confirm);
+            /* Candidate hard-stop. A single +1 A confirmation was not enough
+             * on the real steering rack: a local tyre/linkage friction peak can
+             * survive that short probe and look like a hard stop. Escalate in
+             * bounded 1-A steps up to the commissioning ceiling. Intermediate
+             * levels are brief; only the final safe level gets the full confirm
+             * window. Any +SETTLE_COUNTS progress resumes the sweep immediately. */
+            bool resumed=false;
+            float probe=current;
+            while(probe<max_current-0.01f){
+                probe+=step;
+                if(probe>max_current)probe=max_current;
+                const uint32_t probe_window=(probe>=max_current-0.01f)?
+                    MCCONF_STEERING_STOP_CONFIRM_MS:MCCONF_STEERING_STOP_ESCALATE_MS;
+                uint32_t probe_ms=0u;
+                while(probe_ms<probe_window){
+                    mc_interface_set_current(electrical_dir*probe);
                     mcpwm_foc_vesc_override_touch(false);
                     steering_bounded_delay_ms(5u);
-                    age+=5u; confirm_ms+=5u;
-                    if(m->m_fault!=FAULT_CODE_NONE)goto seek_fail;
-                    const int32_t confirm_progress=
+                    age+=5u;
+                    probe_ms+=5u;
+                    if(age>=MCCONF_STEERING_SEEK_TIMEOUT_MS ||
+                       m->m_fault!=FAULT_CODE_NONE)goto seek_fail;
+                    const int32_t probe_progress=
                         (m->m_position_counts-origin)*(int32_t)user_dir;
-                    if(confirm_progress>=confirm_start_progress+
+                    if(probe_progress>=best_progress+
                        (int32_t)MCCONF_STEERING_SETTLE_COUNTS){
                         resumed=true;
-                        best_progress=confirm_progress;
+                        current=probe;
+                        best_progress=probe_progress;
+                        last_move_age=age;
+                        level_age=0u;
                         break;
                     }
                 }
-                if(resumed){
-                    current=confirm;
-                    last_move_age=age;
-                    level_age=0u;
-                    continue;
-                }
+                if(resumed)break;
             }
+            if(resumed)continue;
+
             if(stop_counts)*stop_counts=m->m_position_counts;
             mc_interface_release_motor();
             mcpwm_foc_vesc_override_clear(false);
@@ -662,12 +666,15 @@ bool mc_interface_steering_boot_home(void){
 
 bool mc_interface_steering_set_current_as_center(void){
     if(!mcpwm_foc_steering_is_calibrated() || !mcpwm_foc_encoder_is_synced(false))return false;
-    /* Runtime straight trim: preserve measured span and electrical FOC config;
-     * only redefine the current accumulated ABI count as logical center/POS180. */
+    /* CENTER is deliberately zero-only. Preserve measured span and electrical
+     * FOC synchronization, redefine the current ABI position as logical 0 deg,
+     * and remain RELEASED. Never run SYNC and never enter position hold here. */
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
     if(!mcpwm_foc_steering_rebase_center())return false;
-    return mcpwm_foc_set_steering_deg(0.0f);
+    mcpwm_foc_release_motor(false);
+    mcpwm_foc_vesc_override_clear(false);
+    return true;
 }
 
 bool mc_interface_steering_detect_calibrate(float current, float *offset, float *ratio, bool *inverted,

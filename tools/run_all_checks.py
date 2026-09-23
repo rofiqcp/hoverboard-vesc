@@ -140,9 +140,11 @@ def check_static():
     assert 'l_abs_current_max' in mc and 'MCCONF_L_ABS_CURRENT_MAX' in mc, 'VESC-style absolute current fault limit missing'
     assert 'trq_ca_to_q4' in mc and 'A2BIT_CONV*16)/100' in mc, 'mode3 centiampere scaling missing'
     assert 'm_openloop_id_ramp_q16' in mc and 'MCCONF_OPENLOOP_ID_SLEW_A_S' in mc, 'mode4 Id slew protection missing'
-    assert re.search(r'#define\s+SVPWM_MAX_ID_A\s+6u',cfg), 'mode4 Id safety ceiling must be 6A'
-    assert re.search(r'#define\s+SVPWM_PHASE_LIMIT_A\s+8u',cfg), 'mode4 phase-current trip must be 8A'
-    assert re.search(r'#define\s+SVPWM_DC_LIMIT_A\s+8u',cfg), 'mode4 DC-link trip must be 8A'
+    assert re.search(r'#define\s+SVPWM_MAX_ID_A\s+6u',cfg), 'generic sensorless/open-loop Id command ceiling must be 6A'
+    assert 'SVPWM_PHASE_LIMIT_A' not in cfg and 'SVPWM_DC_LIMIT_A' not in cfg, 'fixed 8-A runtime current overrides must not exist'
+    assert 'const int32_t leftPhaseLimit=leftSyncCommissioning?' in mc and 'const int32_t rightPhaseLimit=m_motor_2.m_abs_current_limit_counts;' in mc, 'runtime phase ABS protection must follow live VESC l_abs_current_max'
+    assert 'const int32_t leftDcLimit=curDC_max;' in mc and 'const int32_t rightDcLimit=curDC_max;' in mc, 'raw DC trip must remain the board hard ceiling, not a hidden runtime current setting'
+    assert 'sync_measurement' in mc and 'MCCONF_ENCODER_SYNC_PHASE_TRIP_A*A2BIT_CONV' in mc, 'SYNC-only measurement envelope must allow the bounded 5..15-A commissioning sweep'
     assert re.search(r'#define\s+SVPWM_OPENLOOP_RPM_DEFAULT\s+10u',cfg), 'mode4 default open-loop speed must be 10 rpm'
     assert re.search(r'#define\s+SVPWM_ID_SLEW_A_PER_S\s+4u',cfg), 'mode4 Id slew must be 4 A/s'
     assert 'm->m_iq_q4=raw.q; m->m_id_q4=raw.d;' in mc and 'integrator += Ierr * Ki * dt' in mc, 'VESC raw-current PI equation missing'
@@ -153,6 +155,24 @@ def check_static():
     for dead in ('encoder_read_deg_multiturn','encoder_reset_multiturn','encoder_reset_errors','encoder_get_error_rate','encoder_check_faults','encoder_pin_isr','encoder_tim_isr','encoder_get_counts','enc_abi_pin_isr'):
         assert dead not in enc and dead not in ench and dead not in abi, f'dead encoder API remains: {dead}'
     assert 'mcpwm_foc_encoder_startup_align' in mc and 'mcpwm_foc_encoder_detect' in mc, 'ABI lifecycle/detect missing'
+    sync_start=mc.index('bool mcpwm_foc_encoder_startup_align')
+    sync_end=mc.index('bool mcpwm_foc_encoder_is_synced',sync_start)
+    sync=mc[sync_start:sync_end]
+    assert 'phase_deg<=360u' in sync and 'MCCONF_ENCODER_SYNC_SECTOR_DEG' in sync, 'startup ABI sync must sweep one monotonic 0..360 electrical revolution'
+    assert 'encoder_align_sector_delta[sector_idx]' in sync and 'encoder_align_checkpoint_raw[sector_idx]' in sync, 'startup ABI sync must validate and record every 60-degree checkpoint'
+    assert 'expected_checkpoint' in sync and 'signed_progress' in sync and 'checkpoint_tol' in sync, 'startup ABI sync must validate cumulative 60/120/.../360 progress, not six isolated equal segments'
+    assert 'encoder_runtime_set_deg' not in sync, 'startup ABI sync must preserve the hardware encoder count; use software electrical offset instead'
+    assert re.search(r'#define\s+MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A\s+5\.00f',mcc), 'startup ABI sync must start at 5 A'
+    assert re.search(r'#define\s+MCCONF_ENCODER_STARTUP_ALIGN_STEP_A\s+1\.00f',mcc), 'startup ABI sync must raise current in 1-A steps only when lagging'
+    assert re.search(r'#define\s+MCCONF_ENCODER_STARTUP_ALIGN_MAX_A\s+15\.00f',mcc), 'startup ABI sync ceiling must stay 15 A'
+    assert 'while(signed_progress<checkpoint_min && current<ceiling-0.001f)' in sync, 'startup ABI sync must hold the current once cumulative encoder progress is valid'
+    assert 'current+MCCONF_ENCODER_STARTUP_ALIGN_STEP_A' in sync, 'startup ABI sync adaptive-current step is missing'
+    assert 's_encoder_sync_commissioning_active=1u' in sync and 's_encoder_sync_commissioning_active=0u' in sync, '15-A authority must be scoped strictly to startup sync'
+    assert 'return_to_boot=m->m_steering_calibrated!=0u' in sync and 'if(return_to_boot)' in sync, 'first-time SPAN sync must not be forced through the generic 0.6-A position return'
+    assert 'mcpwm_foc_set_position_counts(boot_position,false)' in sync, 'calibrated HOME sync must return to the exact pre-sync mechanical position'
+    assert 'previous_encoder_offset' in sync and 'encoder_config_changed' in sync and 'm->m_conf.foc_encoder_offset=previous_encoder_offset' in sync, 'failed startup sync must restore the previous encoder electrical configuration transactionally'
+    assert re.search(r'#define\s+MCCONF_ENCODER_SYNC_SECTOR_DEG\s+60u',mcc), 'startup ABI sync checkpoint spacing must stay 60 electrical degrees'
+    assert 'MCCONF_ENCODER_SYNC_PHASE_TRIP_A' in mc and 'leftSyncCommissioning' in mc and 'leftDcLimit=curDC_max' in mc, 'SYNC-only 15-A phase authority must keep the independent board DC hard trip'
     assert 'PB6/PB7' in mc or 'PB6/PB7' in abi, 'shared Hall/ABI pin constraint not documented'
     vp=(ROOT/'Src/vesc/vesc_protocol.c').read_text()
     assert re.search(r'#define\s+VESC_MAX_PAYLOAD\s+700u',vp), 'VESC payload buffer is not 700 bytes'
@@ -173,6 +193,8 @@ def check_static():
     assert 'coast_brake_level' not in serc and 'coast_brake_ramp_time' not in serc, 'post-6.00 Chuk fields leaked into VESC 6.00 app wire format'
     assert 'if (c->si_motor_poles < 2u || (c->si_motor_poles & 1u)) c->si_motor_poles = 30u;' in vp and 'c->si_gear_ratio >= 0.01f' in vp, 'SET_MCCONF runtime poles/gear validation missing'
     mci=(ROOT/'Src/motor/mc_interface.c').read_text()
+    assert 'MCCONF_STEERING_STOP_ESCALATE_MS' in mci and 'while(probe<max_current-0.01f)' in mci and 'probe>=max_current-0.01f' in mci, 'steering hard-stop confirmation must progressively test through the safe commissioning-current ceiling'
+    assert 'probe_progress>=best_progress+' in mci and 'if(resumed)continue;' in mci, 'steering hard-stop confirmation must resume travel immediately when a friction peak breaks free'
     assert 'EE_L_MOTOR_POLES' in mci and 'EE_L_GEAR_X64' in mci and 'mcpwm_foc_get_pole_pairs(second)' in mci, 'runtime motor poles/gear persistence missing'
     assert 'EE_L_CFG_SIGNATURE = 43, EE_R_CFG_SIGNATURE = 44' in mci and \
         'EE_CFG_SIGNATURE_VALUE 0x6022u' in mci and 'EE_CFG_SIGNATURE_V35   0x6021u' in mci and 'EE_CFG_SIGNATURE_V34   0x6020u' in mci and 'EE_CFG_SIGNATURE_V33   0x601Fu' in mci and 'EE_CFG_SIGNATURE_V32   0x601Eu' in mci and 'EE_CFG_SIGNATURE_V31   0x601Du' in mci and \

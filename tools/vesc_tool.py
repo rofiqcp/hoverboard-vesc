@@ -584,12 +584,13 @@ class Console:
         elif cmd == "steering":
             op = a[0].lower() if a else "status"
             if op == "status": print(self.link.steering_calibration())
+            elif op == "sync": print(self.link.sync_steering())
             elif op in ("zero","center"): print(self.link.terminal("steering zero", False).rstrip())
             elif op == "home": print(self.link.home_steering())
             elif op == "reset": print(self.link.terminal("steering reset", False).rstrip())
             elif op == "invert" and len(a)==2: print(self.link.terminal(f"steering invert {int(a[1])}", False).rstrip())
             elif op == "set" and len(a)==2: self.link.set_steering_deg(float(a[1])); print("LEFT steer", a[1])
-            else: raise ValueError("steering status|zero|center|home|reset|invert 0|1|set DEG")
+            else: raise ValueError("steering status|sync|zero|center|home|reset|invert 0|1|set DEG")
         elif cmd == "encoder": print(self.link.encoder_debug())
         elif cmd == "posstate":
             a, spec = split_target(a, self.target)

@@ -83,12 +83,20 @@ volatile uint8_t encoder_detect_stage = 0u;
 /* Startup-align black box. Kept separate from full encoder detect so HOME
  * failures after reboot can be diagnosed without repeating hard-stop calibration. */
 volatile uint8_t encoder_align_stage = 0u;
-volatile uint32_t encoder_align_before_count = 0u;
-volatile uint32_t encoder_align_jog_count = 0u;
-volatile uint32_t encoder_align_back_count = 0u;
-volatile int32_t encoder_align_jog_delta = 0;
-volatile int32_t encoder_align_back_delta = 0;
+volatile uint32_t encoder_align_power_on_count = 0u;
+volatile uint32_t encoder_align_phase0_count = 0u;
+volatile uint32_t encoder_align_final_count = 0u;
+volatile int32_t encoder_align_phase0_delta = 0;
+volatile int32_t encoder_align_total_delta = 0;
+volatile int16_t encoder_align_sector_delta[6] = {0,0,0,0,0,0};
+volatile uint32_t encoder_align_checkpoint_raw[6] = {0,0,0,0,0,0};
+volatile uint16_t encoder_align_expected_sector_counts = 0u;
 volatile uint16_t encoder_align_current_ma = 0u;
+volatile uint8_t encoder_align_fail_sector = 0u;
+volatile int8_t encoder_align_direction = 0;
+static uint32_t s_encoder_power_on_raw_count = 0u;
+static uint8_t s_encoder_power_on_raw_valid = 0u;
+static volatile uint8_t s_encoder_sync_commissioning_active = 0u;
 volatile int32_t encoder_detect_plus_mdeg = 0;
 volatile int32_t encoder_detect_minus_mdeg = 0;
 volatile uint32_t encoder_detect_plus_count = 0u;
@@ -1140,6 +1148,10 @@ static void encoder_runtime_configure(mcpwm_foc_motor_t *m, bool second, bool re
     m->m_encoder_offset_phase=(uint16_t)(ofs*(65536.0f/360.0f)+0.5f);
     m->m_encoder_raw_count=encoder_read_raw_count();
     m->m_encoder_prev_count=m->m_encoder_raw_count;
+    if(!second && !s_encoder_power_on_raw_valid){
+        s_encoder_power_on_raw_count=m->m_encoder_raw_count;
+        s_encoder_power_on_raw_valid=1u;
+    }
 #ifdef STM32F103xE
     if(!second && reinitialize){
         const uint32_t idr=GPIOB->IDR;
@@ -1959,6 +1971,20 @@ static int16_t amp_to_q4(const mcpwm_foc_motor_t *m, float current) {
     return (int16_t)q;
 }
 
+static int16_t amp_to_q4_encoder_sync(float current) {
+    /* Commissioning-only conversion for LEFT ABI electrical synchronization.
+     * Runtime steering keeps its configured l_current_max (currently 12 A).
+     * SYNC alone may request 5..15 A, bounded independently by I_MOT_MAX and
+     * MCCONF_ENCODER_STARTUP_ALIGN_MAX_A. */
+    float max_a=MCCONF_ENCODER_STARTUP_ALIGN_MAX_A;
+    if(max_a>(float)I_MOT_MAX)max_a=(float)I_MOT_MAX;
+    if(current>max_a)current=max_a;
+    if(current<0.0f)current=0.0f;
+    float q=current*(float)FOC_CURRENT_Q4_PER_A;
+    if(q>(float)MCCONF_MOTOR_CURRENT_MAX_Q4)q=(float)MCCONF_MOTOR_CURRENT_MAX_Q4;
+    return (int16_t)q;
+}
+
 static void reset_position_pid(mcpwm_foc_motor_t *m){
     m->m_position_integrator=0;m->m_position_prev_error=0;m->m_position_prev_error_mdeg=0;m->m_position_sat_hold=0;
     m->m_position_dt_ticks=0u;m->m_position_d_filter_q15=0;m->m_position_d_proc_filter_q15=0;
@@ -2345,7 +2371,8 @@ void mcpwm_foc_set_openloop_current(float current, float rpm, bool second) {
 }
 void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
     mcpwm_foc_motor_t *m=mcpwm_foc_get_motor(second); set_control_mode(m, CONTROL_MODE_OPENLOOP_PHASE);
-    m->m_openloop_id_target_q4=amp_to_q4(m,current);
+    m->m_openloop_id_target_q4=(!second && s_encoder_sync_commissioning_active)?
+        amp_to_q4_encoder_sync(current):amp_to_q4(m,current);
     m->m_openloop_id_ramp_q16=(int32_t)m->m_openloop_id_target_q4*65536;
     m->m_id_set_q4=m->m_openloop_id_target_q4;
     m->m_iq_target_q4=0; m->m_iq_set_q4=0; m->m_iq_set_ramp_q16=0;
@@ -2353,209 +2380,289 @@ void mcpwm_foc_set_openloop_phase(float current, float phase, bool second) {
     while (phase >= 360.0f) phase -= 360.0f;
     m->m_phase_openloop=(uint16_t)(phase*(65536.0f/360.0f)); m->m_phase_override=1;
 }
+static int32_t encoder_sync_wrapped_delta(uint32_t now, uint32_t prev, uint32_t counts) {
+    int32_t d=(int32_t)now-(int32_t)prev;
+    const int32_t half=(int32_t)(counts/2u);
+    if(d>half)d-=(int32_t)counts;
+    else if(d<-half)d+=(int32_t)counts;
+    return d;
+}
+
+static bool encoder_sync_set_phase_current(mcpwm_foc_motor_t *m, float from_a,
+                                           float to_a, float phase_deg) {
+    if(!m)return false;
+    const uint32_t ramp_ms=MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS?
+                           MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS:1u;
+    for(uint32_t t=1u;t<=ramp_ms;++t){
+        const float f=(float)t/(float)ramp_ms;
+        const float current=from_a+(to_a-from_a)*f;
+        mcpwm_foc_set_openloop_phase(current,phase_deg,false);
+        mcpwm_foc_vesc_override_touch(false);
+        foc_bounded_delay_ms(1u);
+        if(m->m_fault!=FAULT_CODE_NONE)return false;
+    }
+    return true;
+}
+
+static bool encoder_sync_hold_phase(mcpwm_foc_motor_t *m, float current,
+                                    float phase_deg, uint32_t hold_ms) {
+    if(!m)return false;
+    for(uint32_t t=0u;t<hold_ms;++t){
+        mcpwm_foc_set_openloop_phase(current,phase_deg,false);
+        mcpwm_foc_vesc_override_touch(false);
+        foc_bounded_delay_ms(1u);
+        if(m->m_fault!=FAULT_CODE_NONE)return false;
+    }
+    return true;
+}
+
 bool mcpwm_foc_encoder_startup_align(bool second) {
     encoder_align_stage=1u;
-    encoder_align_before_count=encoder_align_jog_count=encoder_align_back_count=0u;
-    encoder_align_jog_delta=encoder_align_back_delta=0; encoder_align_current_ma=0u;
+    encoder_align_power_on_count=encoder_align_phase0_count=encoder_align_final_count=0u;
+    encoder_align_phase0_delta=encoder_align_total_delta=0;
+    for(uint32_t i=0u;i<6u;++i){
+        encoder_align_sector_delta[i]=0;
+        encoder_align_checkpoint_raw[i]=0u;
+    }
+    encoder_align_expected_sector_counts=0u;
+    encoder_align_current_ma=0u;
+    encoder_align_fail_sector=0u;
+    encoder_align_direction=0;
+
     if(second){encoder_align_stage=0xE1u;return false;}
     mcpwm_foc_motor_t *m=&m_motor_1;
     if(!encoder_port_active(m,false)){encoder_align_stage=9u;return true;}
-    if(!m->m_encoder_configured) encoder_runtime_configure(m,false,true);
+    if(!m->m_encoder_configured)encoder_runtime_configure(m,false,true);
     if(!m->m_encoder_configured){encoder_align_stage=0xE2u;return false;}
+    const float previous_encoder_offset=m->m_conf.foc_encoder_offset;
+    const float previous_encoder_ratio=m->m_conf.foc_encoder_ratio;
+    const bool previous_encoder_inverted=m->m_conf.foc_encoder_inverted;
+    bool encoder_config_changed=false;
     encoder_align_stage=2u;
+
 #ifdef STM32F103xE
-    /* Every alignment attempt gets fresh A/B evidence. If one quadrature line
-     * is dead or disconnected, fail fast instead of escalating steering current
-     * for several seconds and starving the USART main-context parser. */
     {
         const uint32_t idr=GPIOB->IDR;
-        encoder_gpio_edge_a=0u; encoder_gpio_edge_b=0u; encoder_gpio_edge_pb5=0u; encoder_gpio_samples=0u;
-        encoder_gpio_last_ab=(uint8_t)(((idr & GPIO_PIN_6)?1u:0u) | ((idr & GPIO_PIN_7)?2u:0u));
+        encoder_gpio_edge_a=0u; encoder_gpio_edge_b=0u;
+        encoder_gpio_edge_pb5=0u; encoder_gpio_samples=0u;
+        encoder_gpio_last_ab=(uint8_t)(((idr & GPIO_PIN_6)?1u:0u) |
+                                       ((idr & GPIO_PIN_7)?2u:0u));
         encoder_gpio_last_pb5=(idr & GPIO_PIN_5)?1u:0u;
     }
 #endif
 
-    /* Incremental ABI has no absolute index. Lock the rotor to a known
-     * electrical phase with D-axis current, but do not assume a fixed current
-     * can overcome steering tyre/linkage stiction. Increase Id gradually and
-     * probe only +/-60 electrical degrees. The first level that produces a
-     * plausible ABI delta becomes the alignment current for this boot. */
-    for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t) foc_bounded_delay_ms(1u);
+    for(uint32_t t=0u;t<1000u && !mcpwm_foc_dc_cal_done();++t)foc_bounded_delay_ms(1u);
     if(!mcpwm_foc_dc_cal_done()){encoder_align_stage=0xE3u;return false;}
-    encoder_align_stage=3u;
 
-    float ceiling=m->m_conf.l_current_max*m->m_conf.l_current_max_scale;
-    if(!(ceiling>0.0f))ceiling=m->m_conf.l_current_max;
-    if(ceiling>MCCONF_ENCODER_STARTUP_ALIGN_MAX_A)ceiling=MCCONF_ENCODER_STARTUP_ALIGN_MAX_A;
-    if(ceiling>MCCONF_STEERING_CAL_CURRENT_MAX_A)ceiling=MCCONF_STEERING_CAL_CURRENT_MAX_A;
-    if(ceiling>(float)I_MOT_MAX)ceiling=(float)I_MOT_MAX;
-    /* Alignment uses the open-loop phase path, whose hard phase-current trip is
-     * SVPWM_PHASE_LIMIT_A. Keep commissioning below that threshold so the
-     * adaptive probe can fail cleanly instead of deliberately touching the
-     * ABS_OVER_CURRENT boundary. */
-    const float openloop_safe_ceiling=(float)SVPWM_PHASE_LIMIT_A-0.50f;
-    if(ceiling>openloop_safe_ceiling)ceiling=openloop_safe_ceiling;
-    if(ceiling<0.10f)ceiling=0.10f;
-    float current=MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A;
-    if(current<0.10f)current=0.10f;
-    float previous=0.0f;
     const float ratio=(float)motor_pole_pairs(false);
     const uint32_t counts=m->m_encoder_counts>=4u?m->m_encoder_counts:MCCONF_ENCODER_COUNTS_DEFAULT;
-    const int32_t half=(int32_t)(counts/2u);
-    const float expected_f=(float)counts*60.0f/(360.0f*ratio);
-    /* A tiny ABI twitch is not enough to establish electrical zero under steering
-     * load. Hardware measurements gave ~18 counts at 1.5 A (borderline/no useful
-     * torque afterwards) and ~38 counts at 2.5 A. Require >=40% of the ideal
-     * +30 electrical-degree excursion before accepting phase lock. */
-    int32_t min_move=(int32_t)(expected_f*0.40f); if(min_move<4)min_move=4;
-    /* Steering gearbox compliance/backlash can amplify the short electrical
-     * probe beyond the ideal motor-only count estimate. Hardware shows a clean
-     * opposite-direction ABI response around 3.3-4.0x ideal before breakaway;
-     * accept up to 4x while retaining the lower motion threshold and A/B checks. */
-    int32_t max_move=(int32_t)(expected_f*4.0f)+4;
-    bool aligned=false;
-    bool detected_inverted=false;
-    /* On power-up the operator places the wheel at mechanical center. TIM4 is
-     * incremental only, so remember how far the rotor moves while Id locks the
-     * first electrical phase. After synchronization we can drive that exact
-     * relative displacement back and call the original boot point 180 degrees. */
-    int32_t boot_center_to_phase0_counts=0;
+    if(!(ratio>=1.0f) || counts<4u){encoder_align_stage=0xE4u;return false;}
 
+    /* SYNC has its own bounded commissioning envelope. Do not inherit the
+     * runtime Motor Current Max setting here; that standard VESC setting becomes
+     * authoritative again immediately after SYNC exits. */
+    float ceiling=MCCONF_ENCODER_STARTUP_ALIGN_MAX_A;
+    if(ceiling>MCCONF_STEERING_CAL_CURRENT_MAX_A)ceiling=MCCONF_STEERING_CAL_CURRENT_MAX_A;
+    if(ceiling>(float)I_MOT_MAX)ceiling=(float)I_MOT_MAX;
+    /* Startup sync is the only OPENLOOP_PHASE path allowed to request the
+     * configured 5..15 A commissioning envelope. ISR protection switches to a
+     * dedicated 16-A phase trip only while this bounded sweep is active; the
+     * independent board DC hard trip remains unchanged. */
+    if(ceiling<0.10f){encoder_align_stage=0xE5u;return false;}
+
+    float current=MCCONF_ENCODER_STARTUP_ALIGN_CURRENT_A;
+    if(current>ceiling)current=ceiling;
+    if(current<0.10f)current=0.10f;
+    encoder_align_current_ma=(uint16_t)(current*1000.0f+0.5f);
+
+    const float expected_sector_f=(float)counts*(float)MCCONF_ENCODER_SYNC_SECTOR_DEG/
+                                  (360.0f*ratio);
+    const int32_t expected_sector=(int32_t)(expected_sector_f+0.5f);
+    int32_t checkpoint_tol=(int32_t)(expected_sector_f*
+        (float)MCCONF_ENCODER_SYNC_CHECKPOINT_TOL_PERCENT/100.0f+0.5f);
+    if(checkpoint_tol<(int32_t)MCCONF_STEERING_SETTLE_COUNTS)
+        checkpoint_tol=(int32_t)MCCONF_STEERING_SETTLE_COUNTS;
+    encoder_align_expected_sector_counts=(uint16_t)(expected_sector>0?expected_sector:1);
+
+    const int32_t boot_position=m->m_position_counts;
+    const bool return_to_boot=m->m_steering_calibrated!=0u;
+    const uint32_t sync_start_raw=encoder_read_raw_count();
+    encoder_align_power_on_count=s_encoder_power_on_raw_valid?
+                                 s_encoder_power_on_raw_count:sync_start_raw;
     m->m_encoder_synced=0u;
     mcpwm_foc_release_motor(false);
-    while(current<=ceiling+0.001f){
-        const uint32_t level_ref_raw=encoder_read_raw_count();
-        encoder_align_current_ma=(uint16_t)(current*1000.0f+0.5f);
-        encoder_align_stage=4u;
-        /* Hold phase zero while ramping Id from the previous level. */
-        for(uint32_t t=1u;t<=MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS;++t){
-            const float f=(float)t/(float)MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS;
-            const float i=previous+(current-previous)*f;
-            mcpwm_foc_set_openloop_phase(i,0.0f,false);
-            mcpwm_foc_vesc_override_touch(false);
-            foc_bounded_delay_ms(1u);
-            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-        }
-        for(uint32_t t=0u;t<MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS;++t){
-            mcpwm_foc_set_openloop_phase(current,0.0f,false);
-            mcpwm_foc_vesc_override_touch(false);
-            foc_bounded_delay_ms(1u);
-            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-        }
-        {
-            const uint32_t held_raw=encoder_read_raw_count();
-            int32_t dd=(int32_t)held_raw-(int32_t)level_ref_raw;
-            if(dd>half)dd-=(int32_t)counts; else if(dd<-half)dd+=(int32_t)counts;
-            boot_center_to_phase0_counts+=dd;
+
+    encoder_align_stage=3u;
+    s_encoder_sync_commissioning_active=1u;
+    if(!encoder_sync_set_phase_current(m,0.0f,current,0.0f))goto align_fail;
+    if(!encoder_sync_hold_phase(m,current,0.0f,MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS))
+        goto align_fail;
+
+    uint32_t raw_prev=encoder_read_raw_count();
+    encoder_align_phase0_count=raw_prev;
+    encoder_align_phase0_delta=encoder_sync_wrapped_delta(raw_prev,sync_start_raw,counts);
+
+    int32_t unwrapped=0;
+    int32_t checkpoint_prev=0;
+    int8_t direction=0;
+    encoder_align_stage=4u;
+
+    /* Monotonic electrical sweep. This is NOT steering SET_POS 0..360.
+     * SVPWM receives phase modulo 360 while phase_deg remains unwrapped so
+     * 360 electrical degrees means one complete electrical revolution. */
+    for(uint32_t phase_deg=MCCONF_ENCODER_SYNC_PHASE_STEP_DEG;
+        phase_deg<=360u;
+        phase_deg+=MCCONF_ENCODER_SYNC_PHASE_STEP_DEG){
+
+        mcpwm_foc_set_openloop_phase(current,(float)phase_deg,false);
+        mcpwm_foc_vesc_override_touch(false);
+        foc_bounded_delay_ms(MCCONF_ENCODER_SYNC_PHASE_STEP_MS);
+        if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+
+        uint32_t raw_now=encoder_read_raw_count();
+        unwrapped+=encoder_sync_wrapped_delta(raw_now,raw_prev,counts);
+        raw_prev=raw_now;
+
+        if((phase_deg%MCCONF_ENCODER_SYNC_SECTOR_DEG)!=0u)continue;
+        const uint32_t sector_idx=phase_deg/MCCONF_ENCODER_SYNC_SECTOR_DEG-1u;
+        if(sector_idx>=6u){encoder_align_stage=0xA6u;goto align_fail;}
+
+        if(!encoder_sync_hold_phase(m,current,(float)phase_deg,
+                                    MCCONF_ENCODER_SYNC_CHECKPOINT_SETTLE_MS))
+            goto align_fail;
+        raw_now=encoder_read_raw_count();
+        unwrapped+=encoder_sync_wrapped_delta(raw_now,raw_prev,counts);
+        raw_prev=raw_now;
+
+        int32_t sector=unwrapped-checkpoint_prev;
+        const int32_t expected_checkpoint=(int32_t)
+            (expected_sector_f*(float)(sector_idx+1u)+0.5f);
+        int32_t checkpoint_min=expected_checkpoint-checkpoint_tol;
+        const int32_t checkpoint_max=expected_checkpoint+checkpoint_tol;
+        if(checkpoint_min<0)checkpoint_min=0;
+        int32_t signed_progress=(direction==0)?
+            (unwrapped<0?-unwrapped:unwrapped):unwrapped*(int32_t)direction;
+
+        /* Validate cumulative progress at 60/120/.../360 electrical degrees.
+         * A sector may lag under tyre/linkage stiction and catch up at the next
+         * checkpoint; cumulative validation preserves that real mechanical
+         * behaviour while still proving the rotor follows the rotating field. */
+        while(signed_progress<checkpoint_min && current<ceiling-0.001f){
+            float next=current+MCCONF_ENCODER_STARTUP_ALIGN_STEP_A;
+            if(next>ceiling)next=ceiling;
+            if(!encoder_sync_set_phase_current(m,current,next,(float)phase_deg))
+                goto align_fail;
+            current=next;
+            encoder_align_current_ma=(uint16_t)(current*1000.0f+0.5f);
+            if(!encoder_sync_hold_phase(m,current,(float)phase_deg,
+                                        MCCONF_ENCODER_SYNC_CURRENT_HOLD_MS))
+                goto align_fail;
+            raw_now=encoder_read_raw_count();
+            unwrapped+=encoder_sync_wrapped_delta(raw_now,raw_prev,counts);
+            raw_prev=raw_now;
+            sector=unwrapped-checkpoint_prev;
+            signed_progress=(direction==0)?
+                (unwrapped<0?-unwrapped:unwrapped):unwrapped*(int32_t)direction;
         }
 
-        /* Phase zero is now the physical electrical reference. Rebase the
-         * incremental counter and test +60 degrees first. */
-        encoder_runtime_set_deg(m,0.0f);
-        const uint32_t before=encoder_read_raw_count();
-        encoder_align_before_count=before;
-        for(uint32_t t=1u;t<=60u;++t){
-            mcpwm_foc_set_openloop_phase(current,60.0f*(float)t/60.0f,false);
-            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
-            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-        }
-        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
-        uint32_t probe=encoder_read_raw_count();
-        encoder_align_jog_count=probe;
-        int32_t dp=(int32_t)probe-(int32_t)before;
-        if(dp>half)dp-=(int32_t)counts; else if(dp<-half)dp+=(int32_t)counts;
-        encoder_align_jog_delta=dp;
-#ifdef STM32F103xE
-        /* A valid quadrature move must exercise both A and B. Seeing repeated
-         * edges on only one input means the position/direction feedback is not
-         * trustworthy; never increase Id in that condition. */
-        if((encoder_gpio_edge_a>=4u && encoder_gpio_edge_b==0u) ||
-           (encoder_gpio_edge_b>=4u && encoder_gpio_edge_a==0u)){
-            encoder_align_stage=0xA2u;
+        if(direction==0 && unwrapped!=0)direction=unwrapped>0?1:-1;
+        const int32_t signed_total=unwrapped*(int32_t)direction;
+        const int32_t signed_sector=sector*(int32_t)direction;
+        encoder_align_current_ma=(uint16_t)(current*1000.0f+0.5f);
+        encoder_align_sector_delta[sector_idx]=(int16_t)CLAMP(sector,-32768,32767);
+        encoder_align_checkpoint_raw[sector_idx]=raw_prev;
+
+        if(direction==0 || signed_total<checkpoint_min || signed_total>checkpoint_max){
+            encoder_align_fail_sector=(uint8_t)(sector_idx+1u);
+            encoder_align_stage=0xA1u;
             goto align_fail;
         }
-#endif
-        for(int32_t t=59;t>=0;--t){
-            mcpwm_foc_set_openloop_phase(current,60.0f*(float)t/60.0f,false);
-            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
-            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-        }
-        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
-        int32_t adp=dp<0?-dp:dp;
-        if(adp>=min_move && adp<=max_move){
-            detected_inverted=dp<0;
-            aligned=true; encoder_align_stage=5u;
-            break;
+        if(sector_idx>0u &&
+           signed_sector<-(int32_t)MCCONF_STEERING_SETTLE_COUNTS){
+            encoder_align_fail_sector=(uint8_t)(sector_idx+1u);
+            encoder_align_stage=0xA3u;
+            goto align_fail;
         }
 
-        /* A mechanical stop can block the + direction. Retry the same bounded
-         * probe in the negative direction before increasing current. */
-        encoder_runtime_set_deg(m,0.0f);
-        const uint32_t before_neg=encoder_read_raw_count();
-        for(uint32_t t=1u;t<=60u;++t){
-            mcpwm_foc_set_openloop_phase(current,-60.0f*(float)t/60.0f,false);
-            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
-            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-        }
-        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
-        probe=encoder_read_raw_count();
-        encoder_align_back_count=probe;
-        int32_t dm=(int32_t)probe-(int32_t)before_neg;
-        if(dm>half)dm-=(int32_t)counts; else if(dm<-half)dm+=(int32_t)counts;
-        encoder_align_back_delta=dm;
-        for(int32_t t=59;t>=0;--t){
-            mcpwm_foc_set_openloop_phase(current,-60.0f*(float)t/60.0f,false);
-            mcpwm_foc_vesc_override_touch(false); foc_bounded_delay_ms(2u);
-            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
-        }
-        for(uint32_t t=0u;t<80u;++t){mcpwm_foc_vesc_override_touch(false);foc_bounded_delay_ms(1u);}
-        const int32_t adm=dm<0?-dm:dm;
-        if(adm>=min_move && adm<=max_move){
-            /* Negative electrical phase producing positive count means the ABI
-             * direction must be inverted for the VESC phase equation. */
-            detected_inverted=dm>0;
-            aligned=true; encoder_align_stage=6u;
-            break;
-        }
-
-        previous=current;
-        current+=MCCONF_ENCODER_STARTUP_ALIGN_STEP_A;
+        encoder_align_direction=direction;
+        checkpoint_prev=unwrapped;
+        encoder_align_stage=(uint8_t)(5u+sector_idx);
     }
-    if(!aligned){encoder_align_stage=0xA1u;goto align_fail;}
 
-    /* The motor pole count is known and ABI offset is meaningless across power
-     * cycles. Learn only direction from the bounded phase probe, then define
-     * electrical phase 0 as ABI software zero for this boot. */
-    m->m_conf.foc_encoder_offset=0.0f;
+    encoder_align_final_count=raw_prev;
+    encoder_align_total_delta=unwrapped;
+    if(direction==0){
+        encoder_align_stage=0xA4u;
+        goto align_fail;
+    }
+#ifdef STM32F103xE
+    if(encoder_gpio_edge_a<4u || encoder_gpio_edge_b<4u){
+        encoder_align_stage=0xA2u;
+        goto align_fail;
+    }
+#endif
+
+    /* The 360-degree endpoint is electrical phase 0 again. Keep the hardware
+     * ABI counter untouched and encode phase-zero as a software electrical
+     * offset. This preserves raw startup history across synchronization. */
+    const bool detected_inverted=direction<0;
+    const float mech_deg=(float)encoder_align_final_count*360.0f/(float)counts;
+    const float corrected_mech_deg=detected_inverted?-mech_deg:mech_deg;
+    const float runtime_offset_deg=encoder_norm_deg(corrected_mech_deg*ratio);
     m->m_conf.foc_encoder_ratio=ratio;
     m->m_conf.foc_encoder_inverted=detected_inverted;
+    m->m_conf.foc_encoder_offset=runtime_offset_deg;
     encoder_runtime_configure(m,false,false);
-    encoder_runtime_set_deg(m,0.0f);
-    /* If a hard-stop span is already calibrated, the boot position is assumed
-     * to be center (180 deg) as requested. We are currently at electrical
-     * phase-zero, displaced by boot_center_to_phase0_counts from that point. */
-    const int32_t boot_center=0;
-    m->m_position_counts=boot_center_to_phase0_counts;
-    m->m_position_target_counts=boot_center;
-    m->m_position_abs_counts=(uint32_t)(boot_center_to_phase0_counts<0?
-                                        -boot_center_to_phase0_counts:boot_center_to_phase0_counts);
-    encoder_feedback_update(m,false,1u);
+    encoder_config_changed=true;
     m->m_encoder_synced=1u;
-    /* A persisted hard-stop span plus the explicit boot-at-center policy gives
-     * us an absolute logical reference for this power cycle. Mark homed only
-     * after phase/ABI synchronization is valid; without this, SET_POS remains
-     * correctly fail-closed forever after every reboot. */
-    if(m->m_steering_calibrated && m->m_steering_span_counts!=0)
-        m->m_steering_homed=1u;
+    s_encoder_sync_commissioning_active=0u;
+
+    /* HOME/startup already has a persisted mechanical span and therefore a
+     * meaningful center coordinate. Return that path to the exact pre-sync
+     * position before the caller rebases center. During first-time SPAN
+     * commissioning there is no calibrated position scale yet; the caller
+     * immediately resets count and starts the hard-stop sweep, so forcing the
+     * generic 0.6-A count-position return here would create a false failure. */
+    if(return_to_boot){
+        encoder_align_stage=0x0Cu;
+        mcpwm_foc_set_position_counts(boot_position,false);
+        uint32_t settled_ms=0u;
+        for(uint32_t t=0u;t<MCCONF_ENCODER_SYNC_RETURN_TIMEOUT_MS;++t){
+            mcpwm_foc_vesc_override_touch(false);
+            foc_bounded_delay_ms(1u);
+            if(m->m_fault!=FAULT_CODE_NONE)goto align_fail;
+            int32_t e=m->m_position_counts-boot_position;
+            if(e<0)e=-e;
+            if(e<=MCCONF_ENCODER_SYNC_RETURN_TOL_COUNTS){
+                if(settled_ms<MCCONF_ENCODER_SYNC_RETURN_SETTLE_MS)settled_ms++;
+                if(settled_ms>=MCCONF_ENCODER_SYNC_RETURN_SETTLE_MS)break;
+            }else{
+                settled_ms=0u;
+            }
+        }
+        if(settled_ms<MCCONF_ENCODER_SYNC_RETURN_SETTLE_MS){
+            encoder_align_stage=0xA5u;
+            goto align_fail;
+        }
+    }
+
     encoder_align_stage=9u;
     mcpwm_foc_release_motor(false);
     mcpwm_foc_vesc_override_clear(false);
     return true;
 
 align_fail:
-    if(encoder_align_stage<0x80u)encoder_align_stage=(uint8_t)(0xB0u | (encoder_align_stage&0x0Fu));
-    m->m_encoder_synced=0u;
+    s_encoder_sync_commissioning_active=0u;
+    if(encoder_align_stage<0x80u)
+        encoder_align_stage=(uint8_t)(0xB0u|(encoder_align_stage&0x0Fu));
     mcpwm_foc_release_motor(false);
+    if(encoder_config_changed){
+        m->m_conf.foc_encoder_offset=previous_encoder_offset;
+        m->m_conf.foc_encoder_ratio=previous_encoder_ratio;
+        m->m_conf.foc_encoder_inverted=previous_encoder_inverted;
+        encoder_runtime_configure(m,false,false);
+    }
+    m->m_encoder_synced=0u;
     mcpwm_foc_vesc_override_clear(false);
     return false;
 }
@@ -4255,11 +4362,18 @@ static int16_t duty_control_iq_target_step(mcpwm_foc_motor_t *m, bool second) {
 
 static int16_t phase_current_counts_to_q4(const mcpwm_foc_motor_t *m, int16_t counts) {
     /* Keep a one/two-sample high-duty shunt glitch from kicking the current PI
-     * far outside the absolute-current envelope while the qualified ABS fault
-     * logic below decides whether it is persistent. */
-    const int32_t max_counts=(m && m->m_abs_current_limit_counts>0)?
-                             m->m_abs_current_limit_counts:
-                             (int32_t)(MCCONF_L_ABS_CURRENT_MAX*(float)A2BIT_CONV);
+     * far outside the active absolute-current envelope while the qualified ABS
+     * fault logic decides whether it is persistent. Runtime uses the standard
+     * VESC l_abs_current_max. Only the bounded LEFT ABI SYNC sweep temporarily
+     * widens this measurement envelope to its dedicated commissioning trip. */
+    const bool sync_measurement=
+        m==&m_motor_1 && s_encoder_sync_commissioning_active &&
+        m->m_control_mode==CONTROL_MODE_OPENLOOP_PHASE;
+    const int32_t max_counts=sync_measurement?
+        ((int32_t)MCCONF_ENCODER_SYNC_PHASE_TRIP_A*A2BIT_CONV):
+        ((m && m->m_abs_current_limit_counts>0)?
+            m->m_abs_current_limit_counts:
+            (int32_t)(MCCONF_L_ABS_CURRENT_MAX*(float)A2BIT_CONV));
     int32_t c=CLAMP((int32_t)counts,-max_counts,max_counts);
     int32_t q4=c*16;
     /* Preserve the generated-controller numeric saturation as a final guard. */
@@ -5831,16 +5945,22 @@ if(!m_motor_2.m_driven_offset_powered_valid){
 
     const int32_t curL_phaC=-(int32_t)curL_phaA-(int32_t)curL_phaB;
     const int32_t curR_phaA=-(int32_t)curR_phaB-(int32_t)curR_phaC;
-    const uint8_t leftOpenloop = (m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||
-                                  m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
-    const uint8_t rightOpenloop = (m_motor_2.m_control_mode==CONTROL_MODE_OPENLOOP ||
-                                   m_motor_2.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE);
-    const int32_t leftPhaseLimit=leftOpenloop?((int32_t)SVPWM_PHASE_LIMIT_A*A2BIT_CONV):m_motor_1.m_abs_current_limit_counts;
-    const int32_t rightPhaseLimit=rightOpenloop?((int32_t)SVPWM_PHASE_LIMIT_A*A2BIT_CONV):m_motor_2.m_abs_current_limit_counts;
-    /* Phase over-current protection must apply to every powered mode. Hall
-     * detection uses the mode-4 current-control power path, so its fixed-phase
-     * submode gets the same stricter phase/DC limits even when the legacy
-     * ctrlModReq is not SVPWM_MODE. */
+    const uint8_t leftSyncCommissioning=
+        s_encoder_sync_commissioning_active &&
+        m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP_PHASE;
+    /* Standard VESC runtime authority:
+     *   - commanded motor current: l_current_{min,max} -> m_current_limit_*_q4
+     *   - ABS motor-current fault: l_abs_current_max -> m_abs_current_limit_counts
+     * Never replace those live MC-config limits with a fixed open-loop value.
+     * The only exception is the bounded LEFT encoder SYNC sweep, whose temporary
+     * 5..15-A D-axis authority has its own 16-A phase trip. */
+    const int32_t leftPhaseLimit=leftSyncCommissioning?
+        ((int32_t)MCCONF_ENCODER_SYNC_PHASE_TRIP_A*A2BIT_CONV):
+        m_motor_1.m_abs_current_limit_counts;
+    const int32_t rightPhaseLimit=m_motor_2.m_abs_current_limit_counts;
+    /* Phase over-current protection applies to every powered mode using the
+     * live VESC l_abs_current_max cache. The bounded LEFT ABI SYNC sweep above
+     * is the sole temporary commissioning exception. */
     /* VESC suppresses current-unbalance diagnostics when phase sampling loses
      * observability at high duty, but ABS over-current protection stays active.
      * On this fixed low-side-shunt board, qualify a >80% phase excursion for a
@@ -5887,8 +6007,11 @@ if(!m_motor_2.m_driven_offset_powered_valid){
      * remains an immediate 16-kHz shutdown path below. */
     const uint8_t leftPhaseTrip=leftDqFresh&&leftPhaseExceeded&&m_motor_1.m_phase_overcurrent_streak>=MCCONF_ABS_CURRENT_QUAL_SAMPLES;
     const uint8_t rightPhaseTrip=rightDqFresh&&rightPhaseExceeded&&m_motor_2.m_phase_overcurrent_streak>=MCCONF_ABS_CURRENT_QUAL_SAMPLES;
-    const int32_t leftDcLimit=leftOpenloop?((int32_t)SVPWM_DC_LIMIT_A*A2BIT_CONV):curDC_max;
-    const int32_t rightDcLimit=rightOpenloop?((int32_t)SVPWM_DC_LIMIT_A*A2BIT_CONV):curDC_max;
+    /* Raw DC-shunt trip is the board hard ceiling. VESC input-current
+     * limits (l_in_current_min/max) already constrain commanded torque in the
+     * control path; do not replace them with a hidden fixed 8-A runtime trip. */
+    const int32_t leftDcLimit=curDC_max;
+    const int32_t rightDcLimit=curDC_max;
     const uint8_t leftDcTrip = leftCurrentSampleValid && (ABS(curL_DC) > leftDcLimit);
     const uint8_t rightDcTrip = rightCurrentSampleValid && (ABS(curR_DC) > rightDcLimit);
     const uint8_t leftCurrentTrip = leftPhaseTrip || leftDcTrip;
