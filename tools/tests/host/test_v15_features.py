@@ -44,10 +44,8 @@ assert 'mcpwm_foc_adc_int_handler();' in halltest and 'for(uint32_t t=0;t<ms;t++
 # endpoint, an expired command must not be bypassed by the legacy enable flag.
 assert 'const uint8_t leftSourceEnable=(!estopActive) &&' in mc and        '(s_vesc_owned[0] ? mcpwm_foc_vesc_command_live(false) : (enable!=0u));' in mc,        'LEFT source gate must enforce exclusive VESC ownership and E-stop'
 assert 'const uint8_t rightSourceEnable=(!estopActive) &&' in mc and        '(s_vesc_owned[1] ? mcpwm_foc_vesc_command_live(true) : (enable!=0u));' in mc,        'RIGHT source gate must enforce exclusive VESC ownership and E-stop'
-assert 'const int32_t leftPhaseLimit=leftSyncCommissioning?' in mc
-assert 'm_motor_1.m_abs_current_limit_counts' in mc and 'm_motor_2.m_abs_current_limit_counts' in mc
-assert 'const int32_t leftDcLimit=curDC_max;' in mc and 'const int32_t rightDcLimit=curDC_max;' in mc
-assert 'SVPWM_PHASE_LIMIT_A' not in mc and 'SVPWM_DC_LIMIT_A' not in mc
+assert 'leftOpenloop = (m_motor_1.m_control_mode==CONTROL_MODE_OPENLOOP ||' in mc
+assert 'CONTROL_MODE_OPENLOOP_PHASE);' in mc and 'leftDcLimit=leftOpenloop' in mc and 'rightDcLimit=rightOpenloop' in mc
 
 # Tidak ada live toggle maupun telemetry legacy. USART3 hanya protokol VESC.
 assert '"LIVE"' not in com

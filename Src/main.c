@@ -166,13 +166,32 @@ int main(void) {
    * after GPIO/TIM/ADC/UART/DMA are configured and their state is valid. */
   __enable_irq();
 
-  /* Steering startup is deliberately passive. Incremental ABI has no absolute
-   * index, therefore a power cycle clears SYNC/HOME state while preserving the
-   * measured mechanical span in EEPROM. Never energize the steering motor or
-   * run electrical synchronization automatically at boot. The operator must
-   * explicitly request SYNC (ROS Web or VESC Tool), then manually straighten
-   * the wheel and request CENTER / SET 0 deg. */
+  /* Incremental ABI has no absolute index. If a steering hard-stop span has
+   * already been calibrated, normal power-up assumes the wheel was placed at
+   * center by the operator. Wait for the ADC zero calibration, perform only the
+   * adaptive Id electrical-phase/ABI synchronization, then return to the exact
+   * boot point and define it as logical VESC position 180 degrees. No hard-stop
+   * sweep is performed on an ordinary power cycle. */
   mcpwm_foc_release_motor(false);
+  if(mc_interface_steering_calibration_valid()){
+    for(uint32_t t=0u;t<2500u && !mcpwm_foc_dc_cal_done();++t)HAL_Delay(1u);
+    if(mcpwm_foc_dc_cal_done()){
+      /* HOME uses only the persisted span plus ABI/electrical synchronization.
+       * The adaptive alignment now starts at 5 A and may rise to 15 A; it never
+       * performs a mechanical hard-stop/span sweep. */
+      (void)mc_interface_steering_boot_home();
+    }
+  }
+
+  /* If ADC/DC zero calibration was not ready inside the early startup window,
+   * finish HOME later from the normal main loop. This is especially important
+   * after a TEST-image boot where actuator probation can delay useful alignment.
+   * A valid persisted span is mandatory; no retry path is allowed to measure or
+   * overwrite span. */
+  bool steering_boot_home_pending = mc_interface_steering_calibration_valid() &&
+      (!mcpwm_foc_steering_is_homed() || !mcpwm_foc_encoder_is_synced(false));
+  uint8_t steering_boot_home_attempts = 0u;
+  uint32_t steering_boot_home_retry_ms = HAL_GetTick();
 
   poweronMelody();
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
@@ -273,6 +292,22 @@ int main(void) {
       }
     }
 
+    /* Deferred power-cycle HOME: wait until firmware probation is over and DC
+     * calibration is actually ready. HOME performs adaptive 5..15 A electrical
+     * sync and rebases the operator-provided physical center; it never calls the
+     * mechanical span detector. Keep retries bounded and fail closed on fault. */
+    if(steering_boot_home_pending && !fw_test_probation && mcpwm_foc_dc_cal_done() &&
+       mc_interface_get_fault_motor(false)==FAULT_CODE_NONE &&
+       (int32_t)(vesc_now_ms-steering_boot_home_retry_ms)>=0){
+      ++steering_boot_home_attempts;
+      if(mc_interface_steering_boot_home()){
+        steering_boot_home_pending=false;
+      }else if(steering_boot_home_attempts>=3u){
+        steering_boot_home_pending=false;
+      }else{
+        steering_boot_home_retry_ms=HAL_GetTick()+1000u;
+      }
+    }
     uint32_t profd=DWT->CYCCNT-prof0;
     // cppcheck-suppress unsignedLessThanZero -- CYCCNT dan maksimum profiler sama-sama uint32_t.
     if(profd>main_prof_vesc_max_cycles)main_prof_vesc_max_cycles=profd;

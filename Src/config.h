@@ -100,7 +100,9 @@
 #define SVPWM_OPENLOOP_RPM_MAX          300u
 #define SVPWM_ACCEL_RPM_PER_S            20u
 #define SVPWM_ID_SLEW_A_PER_S             4u
-#define SVPWM_MAX_ID_A                   6u   /* sensorless detect/open-loop command ceiling */
+#define SVPWM_MAX_ID_A                   6u   /* sensorless detect/open-loop safety ceiling */
+#define SVPWM_PHASE_LIMIT_A               8u   /* fast phase-current chop threshold */
+#define SVPWM_DC_LIMIT_A                  8u   /* DC-link chop threshold during mode 4 */
 
 /* Torque/current mode uses direct centiampere command semantics:
  *   cmd 50 = 0.50 A, cmd 100 = 1.00 A, cmd 3000 = 30.00 A.

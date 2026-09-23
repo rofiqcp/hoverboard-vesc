@@ -1298,34 +1298,23 @@ class VescDual:
         q=6
         align_stage,steer_stage,detect_stage,inverted,configured,synced=p[q:q+6]; q+=6
         offset_mdeg,ratio_milli=struct.unpack_from(">ii",p,q); q+=8
-        raw,power_on,phase0,final=struct.unpack_from(">IIII",p,q); q+=16
-        phase0_delta,total_delta,plus_mdeg,minus_mdeg=struct.unpack_from(">iiii",p,q); q+=16
+        raw,before,jog,back=struct.unpack_from(">IIII",p,q); q+=16
+        dj,db,plus_mdeg,minus_mdeg=struct.unpack_from(">iiii",p,q); q+=16
         edge_a,edge_b,edge_pb5,samples=struct.unpack_from(">IIII",p,q); q+=16
         current_ma=struct.unpack_from(">H",p,q)[0]; q+=2
         span,pos,target=struct.unpack_from(">iii",p,q); q+=12
         pid_target=struct.unpack_from(">i",p,q)[0] if len(p)>=q+4 else target
         if len(p)>=q+4: q+=4
-        expected_sector=0; fail_sector=0; direction=0; sectors=(0,0,0,0,0,0)
-        checkpoints=(0,0,0,0,0,0)
-        if len(p)>=q+16:
-            expected_sector=struct.unpack_from(">H",p,q)[0]; q+=2
-            fail_sector=p[q]; direction=struct.unpack_from(">b",p,q+1)[0]; q+=2
-            sectors=struct.unpack_from(">6h",p,q); q+=12
-        if len(p)>=q+24:
-            checkpoints=struct.unpack_from(">6I",p,q); q+=24
+        sweep360_delta=struct.unpack_from(">i",p,q)[0] if len(p)>=q+4 else 0
+        if len(p)>=q+4: q+=4
         return {"align_stage":align_stage,"steering_stage":steer_stage,"detect_stage":detect_stage,
                 "inverted":bool(inverted),"configured":bool(configured),"synced":bool(synced),
                 "offset_deg":offset_mdeg/1000.0,"ratio":ratio_milli/1000.0,"raw":raw,
-                "power_on":power_on,"phase0":phase0,"final":final,
-                "phase0_delta":phase0_delta,"total_delta":total_delta,
-                "expected_sector":expected_sector,"sector_deltas":sectors,"checkpoint_raw":checkpoints,
-                "fail_sector":fail_sector,"direction":direction,
+                "before":before,"jog":jog,"back":back,"dj":dj,"db":db,
                 "plus_deg":plus_mdeg/1000.0,"minus_deg":minus_mdeg/1000.0,
-                "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,
-                "current_ma":current_ma,"span":span,"position":pos,"target":target,
-                "pid_target":pid_target,
-                "before":power_on,"jog":phase0,"back":final,
-                "dj":phase0_delta,"db":total_delta}
+                "edge_a":edge_a,"edge_b":edge_b,"edge_pb5":edge_pb5,"samples":samples,"current_ma":current_ma,
+                "span":span,"position":pos,"target":target,"pid_target":pid_target,
+                "sweep360_delta":sweep360_delta}
 
     def platform_health(self) -> dict[str, int | bool]:
         p=self.custom_transact(HB_GET_PLATFORM_HEALTH,right=False,timeout=max(self.timeout,1.2))

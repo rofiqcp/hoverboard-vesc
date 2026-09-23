@@ -63,25 +63,6 @@
 #define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A       15.00f /* hard HOME/sync ceiling; never exceeded */
 #define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       120u
 #define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       120u
-/* Startup ABI/FOC synchronization is an electrical commissioning sweep, not
- * steering SET_POS. One monotonically increasing 0..360 electrical revolution
- * is observed against the raw incremental encoder. At 4096 CPR / 15 pole pairs
- * each 60-electrical-degree sector is about 45.5 counts and the full sweep is
- * about 273 counts. Current rises only when a sector cannot keep up. */
-#define MCCONF_ENCODER_SYNC_PHASE_STEP_DEG            1u
-#define MCCONF_ENCODER_SYNC_PHASE_STEP_MS             2u
-#define MCCONF_ENCODER_SYNC_SECTOR_DEG                60u
-#define MCCONF_ENCODER_SYNC_CHECKPOINT_TOL_PERCENT    40u
-#define MCCONF_ENCODER_SYNC_CHECKPOINT_SETTLE_MS      60u
-#define MCCONF_ENCODER_SYNC_CURRENT_HOLD_MS           80u
-/* SYNC-only D-axis commissioning trip. The request is clamped by I_MOT_MAX
- * and the 15-A startup ceiling. Only the bounded LEFT ABI startup sweep may use
- * 5..15 A. Runtime current/ABS protection remains owned by standard VESC MC
- * config; the independent board DC hard trip (I_DC_MAX) stays active. */
-#define MCCONF_ENCODER_SYNC_PHASE_TRIP_A              16u
-#define MCCONF_ENCODER_SYNC_RETURN_TIMEOUT_MS       3000u
-#define MCCONF_ENCODER_SYNC_RETURN_SETTLE_MS          60u
-#define MCCONF_ENCODER_SYNC_RETURN_TOL_COUNTS         12
 /* Internal LEFT steering normalization envelope. External owners always use
  * standard VESC COMM_SET_POS 0..360; this internal -30..+30 coordinate only maps
  * that raw actuator position onto the calibrated encoder-count span. Vehicle
@@ -107,7 +88,6 @@
 #define MCCONF_STEERING_DETECT_CURRENT_START_A      3.00f
 #define MCCONF_STEERING_DETECT_CURRENT_STEP_A       1.00f
 #define MCCONF_STEERING_MOVE_PROBE_MS                450u
-#define MCCONF_STEERING_STOP_ESCALATE_MS              90u
 #define MCCONF_STEERING_STOP_CONFIRM_MS              300u
 #define MCCONF_STEERING_STALL_MS                     350u
 #define MCCONF_STEERING_SEEK_TIMEOUT_MS            20000u
@@ -204,7 +184,7 @@
 #define MCCONF_OFF_TELEM_SETTLE_SAMPLES           16000u /* 1 s @16 kHz: high-Z shunt common-mode benar-benar stabil */
 #define MCCONF_MOTOR_CURRENT_MAX_Q4  (I_MOT_MAX * A2BIT_CONV * 16)
 #define MCCONF_MOTOR_RPM_MAX                 N_MOT_MAX
-#define MCCONF_POLE_PAIRS_LEFT              15u
+#define MCCONF_POLE_PAIRS_LEFT               4u
 #define MCCONF_POLE_PAIRS_RIGHT              15u
 /* VESC mcconf_default.h: foc_hall_interp_erpm default = 500 ERPM.
  * Nilai runtime tetap berasal dari Motor Config dan diprecompute ke integer

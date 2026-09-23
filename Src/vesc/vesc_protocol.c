@@ -74,7 +74,7 @@
 #define HB_CUSTOM_ABORT_RELAY_AUTOTUNE              33u
 #define HB_CUSTOM_GET_PERSISTED_MCCONF              34u /* read EEPROM-backed MC config without storing */
 #define HB_CUSTOM_GET_PERSISTED_APPCONF             35u /* read EEPROM-backed App config without storing */
-#define HB_CUSTOM_STEERING_SYNC_ONLY                 36u /* ABI/electrical sync only; preserve logical center */
+#define HB_CUSTOM_STEERING_SYNC_ONLY                 36u /* LEFT ABI/electrical sync only; center unchanged */
 #define HB_PLATFORM_SCHEMA 2u
 #define HB_DIAG_SCHEMA 4u
 #define HB_ISR_SCHEMA 3u
@@ -98,17 +98,13 @@ extern volatile uint32_t buzzerTimer;
 extern volatile uint8_t steering_detect_stage;
 extern volatile uint8_t encoder_detect_stage;
 extern volatile uint8_t encoder_align_stage;
-extern volatile uint32_t encoder_align_power_on_count;
-extern volatile uint32_t encoder_align_phase0_count;
-extern volatile uint32_t encoder_align_final_count;
-extern volatile int32_t encoder_align_phase0_delta;
-extern volatile int32_t encoder_align_total_delta;
-extern volatile int16_t encoder_align_sector_delta[6];
-extern volatile uint32_t encoder_align_checkpoint_raw[6];
-extern volatile uint16_t encoder_align_expected_sector_counts;
+extern volatile uint32_t encoder_align_before_count;
+extern volatile uint32_t encoder_align_jog_count;
+extern volatile uint32_t encoder_align_back_count;
+extern volatile int32_t encoder_align_jog_delta;
+extern volatile int32_t encoder_align_back_delta;
+extern volatile int32_t encoder_align_sweep360_delta;
 extern volatile uint16_t encoder_align_current_ma;
-extern volatile uint8_t encoder_align_fail_sector;
-extern volatile int8_t encoder_align_direction;
 extern volatile int32_t encoder_detect_plus_mdeg;
 extern volatile int32_t encoder_detect_minus_mdeg;
 extern volatile uint32_t encoder_gpio_edge_a;
@@ -2508,7 +2504,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         return;
     }
     if (op == HB_CUSTOM_GET_STEERING_CAL) {
-        uint8_t b[48]; int32_t j=0; uint8_t flags=0u;
+        uint8_t b[64]; int32_t j=0; uint8_t flags=0u;
         if(mc_interface_steering_calibration_valid())flags|=0x01u;
         if(mcpwm_foc_steering_is_homed())flags|=0x02u;
         if(mcpwm_foc_encoder_is_synced(false))flags|=0x04u;
@@ -2532,6 +2528,19 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         if(pos360<0.0f){pos360=0.0f;}
         if(pos360>360.0f){pos360=360.0f;}
         buffer_append_int32(b,(int32_t)lroundf(pos360*1000.0f),&j);
+        /* Sync-quality evidence for the host safety gate. This is appended after
+         * the stable prefix so older host parsers remain compatible. */
+        {
+            const mcpwm_foc_motor_t *sm=mcpwm_foc_get_motor_const(false);
+            const uint32_t enc_counts=sm->m_encoder_counts>=4u?
+                sm->m_encoder_counts:(uint32_t)sm->m_conf.m_encoder_counts;
+            const uint16_t pp=mcpwm_foc_get_pole_pairs(false);
+            const uint32_t expected=pp>0u?(enc_counts+(uint32_t)pp/2u)/(uint32_t)pp:0u;
+            buffer_append_uint32(b,enc_counts,&j);
+            buffer_append_uint16(b,pp,&j);
+            buffer_append_int32(b,encoder_align_sweep360_delta,&j);
+            buffer_append_uint32(b,expected,&j);
+        }
         uart_send_payload(b,(uint16_t)j); return;
     }
     if (op == HB_CUSTOM_STEERING_HOME) {
@@ -2869,7 +2878,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
     if (op == HB_CUSTOM_ENCODER_DEBUG) {
         if(second)return;
         const mcpwm_foc_motor_t *m=mcpwm_foc_get_motor_const(false);
-        uint8_t b[144]; int32_t j=0;
+        uint8_t b[96]; int32_t j=0;
         b[j++]=COMM_CUSTOM_APP_DATA; b[j++]=HB_CUSTOM_MAGIC0; b[j++]=HB_CUSTOM_MAGIC1;
         b[j++]=HB_CUSTOM_VERSION; b[j++]=op; b[j++]=0u;
         b[j++]=encoder_align_stage; b[j++]=steering_detect_stage; b[j++]=encoder_detect_stage;
@@ -2878,11 +2887,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_int32(b,(int32_t)lroundf(m->m_conf.foc_encoder_offset*1000.0f),&j);
         buffer_append_int32(b,(int32_t)lroundf(m->m_conf.foc_encoder_ratio*1000.0f),&j);
         buffer_append_uint32(b,m->m_encoder_raw_count,&j);
-        buffer_append_uint32(b,encoder_align_power_on_count,&j);
-        buffer_append_uint32(b,encoder_align_phase0_count,&j);
-        buffer_append_uint32(b,encoder_align_final_count,&j);
-        buffer_append_int32(b,encoder_align_phase0_delta,&j);
-        buffer_append_int32(b,encoder_align_total_delta,&j);
+        buffer_append_uint32(b,encoder_align_before_count,&j);
+        buffer_append_uint32(b,encoder_align_jog_count,&j);
+        buffer_append_uint32(b,encoder_align_back_count,&j);
+        buffer_append_int32(b,encoder_align_jog_delta,&j);
+        buffer_append_int32(b,encoder_align_back_delta,&j);
         buffer_append_int32(b,encoder_detect_plus_mdeg,&j);
         buffer_append_int32(b,encoder_detect_minus_mdeg,&j);
         buffer_append_uint32(b,encoder_gpio_edge_a,&j);
@@ -2894,11 +2903,7 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         buffer_append_int32(b,m->m_position_counts,&j);
         buffer_append_int32(b,m->m_position_target_counts,&j);
         buffer_append_int32(b,m->m_position_pid_target_counts,&j);
-        buffer_append_uint16(b,encoder_align_expected_sector_counts,&j);
-        b[j++]=encoder_align_fail_sector;
-        b[j++]=(uint8_t)encoder_align_direction;
-        for(uint32_t si=0u;si<6u;++si)buffer_append_int16(b,encoder_align_sector_delta[si],&j);
-        for(uint32_t si=0u;si<6u;++si)buffer_append_uint32(b,encoder_align_checkpoint_raw[si],&j);
+        buffer_append_int32(b,encoder_align_sweep360_delta,&j);
         uart_send_payload(b,(uint16_t)j);
         return;
     }
@@ -3327,8 +3332,7 @@ static void terminal_help(void){
     terminal_send_text(
         "--- STEERING / DETECT ---\n"
         "steering status                  (span, home, sync, sweep, invert)\n"
-        "steering sync                    (LEFT ABI/electrical sync only; center tetap)\n"
-        "steering center / zero           (posisi sekarang = center / 0 deg; tanpa sync)\n"
+        "steering center / zero           (posisi sekarang = center / 0 deg)\n"
         "steering reset                   (hapus span; config elektrik tetap)\n"
         "steering invert 0/1              (mapping logical normal/invert)\n"
         "home                             (home/startup center LEFT encoder)\n"
@@ -3495,17 +3499,11 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         if(second){terminal_send_text("ERR LEFT steering only\n");return;}
         const char *sub=ac>1?a[1]:"status"; terminal_lower((char *)sub);
         if(!strcmp(sub,"status")){int32_t n1=0,p1=0,n2=0,p2=0,s1=0,s2=0,tol=0;mc_interface_get_steering_span_diag(&n1,&p1,&n2,&p2,&s1,&s2,&tol);float p360=(mc_interface_get_steering_deg()-MCCONF_STEERING_POS_MIN_DEG)*360.0f/(MCCONF_STEERING_POS_MAX_DEG-MCCONF_STEERING_POS_MIN_DEG);if(p360<0.0f){p360=0.0f;}
-        if(p360>360.0f){p360=360.0f;}snprintf(o,sizeof(o),"steering cal=%u home=%u sync=%u logical_inv=%u foc_enc_inv=%u measured_span=%ld safe_span=%ld deg=%.3f pos360=%.1f raw=%lu count=%ld sync_stage=%u sync_current=%.1fA sync_total=%ld fail_sector=%u sweep1=%ld/%ld span1=%ld sweep2=%ld/%ld span2=%ld tol=%ld\n",(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)mc_interface_steering_logical_inverted(),(unsigned)m->m_conf.foc_encoder_inverted,(long)mcpwm_foc_steering_span_counts(),(long)mcpwm_foc_steering_safe_span_counts(),(double)mc_interface_get_steering_deg(),(double)p360,(unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(unsigned)encoder_align_stage,(double)encoder_align_current_ma/1000.0,(long)encoder_align_total_delta,(unsigned)encoder_align_fail_sector,(long)n1,(long)p1,(long)s1,(long)n2,(long)p2,(long)s2,(long)tol);terminal_send_text(o);return;}
-        if(!strcmp(sub,"sync")){
-            if(!mc_interface_steering_calibration_valid()){terminal_send_text("ERR steering sync requires valid measured span\n");return;}
-            if(mcpwm_foc_encoder_is_synced(false)){terminal_send_text("OK steering already synced; no sweep repeated\n");return;}
-            terminal_send_text(mcpwm_foc_encoder_startup_align(false)?"OK steering ABI/electrical sync verified; center unchanged\n":"ERR steering sync failed; motor released\n");
-            return;
-        }
-        if(!strcmp(sub,"center")||!strcmp(sub,"zero")){terminal_send_text(mc_interface_steering_set_current_as_center()?"OK current steering position is now POS180/0deg; sync not rerun\n":"ERR steering center requires valid span + synced encoder\n");return;}
+        if(p360>360.0f){p360=360.0f;}snprintf(o,sizeof(o),"steering cal=%u home=%u sync=%u logical_inv=%u foc_enc_inv=%u measured_span=%ld safe_span=%ld deg=%.3f pos360=%.1f raw=%lu count=%ld sweep1=%ld/%ld span1=%ld sweep2=%ld/%ld span2=%ld tol=%ld\n",(unsigned)mc_interface_steering_calibration_valid(),(unsigned)mcpwm_foc_steering_is_homed(),(unsigned)mcpwm_foc_encoder_is_synced(false),(unsigned)mc_interface_steering_logical_inverted(),(unsigned)m->m_conf.foc_encoder_inverted,(long)mcpwm_foc_steering_span_counts(),(long)mcpwm_foc_steering_safe_span_counts(),(double)mc_interface_get_steering_deg(),(double)p360,(unsigned long)m->m_encoder_raw_count,(long)mcpwm_foc_get_position_user_counts(false),(long)n1,(long)p1,(long)s1,(long)n2,(long)p2,(long)s2,(long)tol);terminal_send_text(o);return;}
+        if(!strcmp(sub,"center")||!strcmp(sub,"zero")){terminal_send_text(mc_interface_steering_set_current_as_center()?"OK current steering position is now POS180/0deg\n":"ERR steering center requires valid span + synced encoder\n");return;}
         if(!strcmp(sub,"reset")){terminal_send_text(mc_interface_reset_steering_calibration()?"OK steering span reset; electrical encoder config preserved\n":"ERR steering reset\n");return;}
         if(!strcmp(sub,"invert")&&ac>2){float x=0.0f;if(!terminal_float(a[2],&x)||(x!=0.0f&&x!=1.0f)){terminal_send_text("ERR steering invert 0|1\n");return;}terminal_send_text(mc_interface_set_steering_logical_inverted(x>0.5f)?"OK steering logical mapping saved\n":"ERR steering invert requires valid span\n");return;}
-        terminal_send_text("ERR steering status|sync|center|zero|reset|invert 0|1\n");return;
+        terminal_send_text("ERR steering status|center|zero|reset|invert 0|1\n");return;
     }
     if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb dec=%u speed_src=%u\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);terminal_send_text(o);return;}
     if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pll %.1f %.1f | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->foc_pll_kp,(double)cc->foc_pll_ki,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
