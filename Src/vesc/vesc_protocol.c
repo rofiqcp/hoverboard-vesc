@@ -104,6 +104,9 @@ extern volatile uint32_t encoder_align_back_count;
 extern volatile int32_t encoder_align_jog_delta;
 extern volatile int32_t encoder_align_back_delta;
 extern volatile int32_t encoder_align_sweep360_delta;
+extern volatile uint8_t encoder_align_consensus_run;
+extern volatile int32_t encoder_align_consensus_delta;
+extern volatile uint8_t encoder_align_consensus_valid;
 extern volatile uint16_t encoder_align_current_ma;
 extern volatile int32_t encoder_detect_plus_mdeg;
 extern volatile int32_t encoder_detect_minus_mdeg;
@@ -2540,6 +2543,11 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
             buffer_append_uint16(b,pp,&j);
             buffer_append_int32(b,encoder_align_sweep360_delta,&j);
             buffer_append_uint32(b,expected,&j);
+            /* Consensus-quality extension: minimum consecutive stable sectors,
+             * representative signed delta/60deg, and authoritative validity. */
+            b[j++]=encoder_align_consensus_run;
+            buffer_append_int32(b,encoder_align_consensus_delta,&j);
+            b[j++]=encoder_align_consensus_valid;
         }
         uart_send_payload(b,(uint16_t)j); return;
     }
@@ -2563,8 +2571,24 @@ static void process_custom_app(bool second, const uint8_t *data, uint16_t len) {
         uint8_t status=0u;
         if(second) status=1u;
         else if(!mc_interface_steering_calibration_valid()) status=2u;
-        else if(mcpwm_foc_encoder_is_synced(false)) status=0u;
-        else if(!mcpwm_foc_encoder_startup_align(false)) status=3u;
+        else {
+            /* Raw m_encoder_synced is not sufficient authority. Older firmware
+             * could leave it true after a partial ~839-count sweep on a 4-PP,
+             * 4096-count encoder. Reuse an existing SYNC only when firmware
+             * has a valid >=3-sector consecutive count consensus. Otherwise
+             * force a fresh startup-align sweep. */
+            const mcpwm_foc_motor_t *sm=mcpwm_foc_get_motor_const(false);
+            const uint32_t enc_counts=sm->m_encoder_counts>=4u?
+                sm->m_encoder_counts:(uint32_t)sm->m_conf.m_encoder_counts;
+            const uint16_t pp=mcpwm_foc_get_pole_pairs(false);
+            const uint32_t expected=pp>0u?
+                (enc_counts+(uint32_t)pp/2u)/(uint32_t)pp:0u;
+            (void)expected;
+            const bool quality_ok=mcpwm_foc_encoder_is_synced(false) &&
+                encoder_align_consensus_valid!=0u &&
+                encoder_align_consensus_run>=3u;
+            if(!quality_ok && !mcpwm_foc_encoder_startup_align(false)) status=3u;
+        }
         uint8_t b[16]; int32_t j=0; uint8_t flags=0u;
         if(mc_interface_steering_calibration_valid())flags|=0x01u;
         if(mcpwm_foc_steering_is_homed())flags|=0x02u;
@@ -3390,6 +3414,7 @@ static void terminal_help(void){
         "set pos_ki V                     (V=0..65.535)\n"
         "set pos_kd V                     (V=0..65.535)\n"
         "set pos_kd_proc V                (V=0..10)\n"
+        "set pos_gain_dec DEG             (V=0..3276.7; 0=disabled)\n"
         "set decoupling 0/1/2/3           (OFF/CROSS/BEMF/BOTH)\n");
 
     terminal_send_text(
@@ -3444,6 +3469,7 @@ static int terminal_cfg_one(mc_configuration *c,bool second,const char *k,const 
     if(!strcmp(k,"gear")){if(v<0.01f||v>1000.0f)return -1;c->si_gear_ratio=v;return 1;}
     if(!strcmp(k,"encoder_ratio")){if(second||v<0.01f||v>MCCONF_ENCODER_RATIO_MAX)return -1;c->foc_encoder_ratio=v;return 1;}
     if(!strcmp(k,"encoder_offset")){if(second||fabsf(v)>100000.0f)return -1;c->foc_encoder_offset=v;return 1;}
+    if(!strcmp(k,"pos_gain_dec")){if(v<0.0f||v>3276.7f)return -1;c->p_pid_gain_dec_angle=v;return 1;}
     if(!strncmp(k,"pos_k",5)){
         if(!strcmp(k+5,"d_proc")){if(v<0||v>10.0f)return -1;c->p_pid_kd_proc=v;return 1;}
         if(v<0||v>65.535f||k[6])return -1;
@@ -3506,7 +3532,7 @@ static void process_terminal_command(bool second,const uint8_t *data,uint16_t le
         terminal_send_text("ERR steering status|center|zero|reset|invert 0|1\n");return;
     }
     if(!strcmp(a[0],"config")||!strcmp(a[0],"mcconf")){snprintf(o,sizeof(o),"sensor=%u/%u inv=%u poles=%u gear=%.2f I=%.1f/%.1f Iin=%.1f/%.1f erpm=%.0f/%.0f R=%.4f L=%.0fuH flux=%.2fmWb dec=%u speed_src=%u\n",(unsigned)cc->m_sensor_port_mode,(unsigned)cc->foc_sensor_mode,(unsigned)cc->m_invert_direction,(unsigned)cc->si_motor_poles,(double)cc->si_gear_ratio,(double)cc->l_current_min,(double)cc->l_current_max,(double)cc->l_in_current_min,(double)cc->l_in_current_max,(double)cc->l_min_erpm,(double)cc->l_max_erpm,(double)cc->foc_motor_r,(double)(cc->foc_motor_l*1e6f),(double)(cc->foc_motor_flux_linkage*1e3f),(unsigned)cc->foc_cc_decoupling,(unsigned)cc->s_pid_speed_source);terminal_send_text(o);return;}
-    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pll %.1f %.1f | pos %.4f %.4f %.4f kdproc %.6f\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->foc_pll_kp,(double)cc->foc_pll_ki,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc);terminal_send_text(o);return;}
+    if(!strcmp(a[0],"tuning")){snprintf(o,sizeof(o),"current %.6f %.3f | speed %.6f %.6f %.6f ramp=%.0fERPM/s | pll %.1f %.1f | pos %.4f %.4f %.4f kdproc %.6f gaindec %.2fdeg\n",(double)cc->foc_current_kp,(double)cc->foc_current_ki,(double)cc->s_pid_kp,(double)cc->s_pid_ki,(double)cc->s_pid_kd,(double)cc->s_pid_ramp_erpms_s,(double)cc->foc_pll_kp,(double)cc->foc_pll_ki,(double)cc->p_pid_kp,(double)cc->p_pid_ki,(double)cc->p_pid_kd,(double)cc->p_pid_kd_proc,(double)cc->p_pid_gain_dec_angle);terminal_send_text(o);return;}
     if(!strcmp(a[0],"perf")){
         if(ac>1&&!strcmp(a[1],"reset")){
             foc_isr_cycles_max=0u; foc_isr_deadline_miss_count=0u;

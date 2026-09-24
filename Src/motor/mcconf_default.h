@@ -63,6 +63,7 @@
 #define MCCONF_ENCODER_STARTUP_ALIGN_MAX_A       15.00f /* hard HOME/sync ceiling; never exceeded */
 #define MCCONF_ENCODER_STARTUP_ALIGN_RAMP_MS       120u
 #define MCCONF_ENCODER_STARTUP_ALIGN_HOLD_MS       120u
+#define MCCONF_ENCODER_STARTUP_SWEEP_SETTLE_MS     200u /* commissioning only: let rotor settle at each 60 electrical-deg checkpoint */
 /* Internal LEFT steering normalization envelope. External owners always use
  * standard VESC COMM_SET_POS 0..360; this internal -30..+30 coordinate only maps
  * that raw actuator position onto the calibrated encoder-count span. Vehicle

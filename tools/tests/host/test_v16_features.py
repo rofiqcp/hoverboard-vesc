@@ -132,6 +132,9 @@ assert 'DETECT_ALL_ENCODER_FIXED_SPAN_COUNTS' not in vp and 'mcpwm_foc_encoder_d
 assert 'mc_interface_steering_detect_calibrate(' in vp and 'case COMM_DETECT_ENCODER:' in vp and 'mcpwm_foc_encoder_detect(current,false,&eoff,&eratio,&einv)' in vp, 'Standalone Detect Encoder must run electrical ABI detect then physical span calibration'
 enc_case=vp[vp.index('case COMM_DETECT_ENCODER:'):vp.index('case COMM_DETECT_HALL_FOC:')]
 assert enc_case.index('mcpwm_foc_encoder_detect') < enc_case.index('mc_interface_steering_detect_calibrate'), 'Manual encoder order must be electrical detect before hard-stop span'
+sync_case=vp[vp.index('if (op == HB_CUSTOM_STEERING_SYNC_ONLY)'):vp.index('if (op == HB_CUSTOM_STEERING_SET_CENTER)')]
+assert 'quality_ok=mcpwm_foc_encoder_is_synced(false)' in sync_case and 'mcpwm_foc_encoder_startup_align(false)' in sync_case and 'encoder_align_consensus_valid' in sync_case and 'encoder_align_consensus_run>=3u' in sync_case, 'SYNC-only must reject raw synced without >=3-sector consensus quality evidence'
+assert 'best_run>=3u' in mc and '(int64_t)diff*100 <= (int64_t)mean*10' in mc and 'encoder_align_consensus_valid=consensus_ok?1u:0u' in mc, 'startup SYNC must require three consecutive similar encoder sectors'
 assert 'measure_r_l_imax_f103_start(0u,detect_time_now())' in vp and 'conf_general_autodetect_apply_sensors_foc_start(now_time)' in vp, 'Detect-All must identify R/L/flux before sensor commissioning'
 assert 's_detect_all.result[mi].sensor_mode=SENSOR_MODE_SENSORLESS' not in vp and 's_detect_all.result[mi].foc_sensor_mode=FOC_SENSOR_MODE_SENSORLESS' not in vp, 'Detect-All must not expose temporary LEFT sensorless selection; OPENLOOP itself is sensor-independent'
 assert 'next.foc_sensor_mode!=FOC_SENSOR_MODE_SENSORLESS' not in mc and 'next.sensor_mode=SENSOR_MODE_SENSORED' in mc, 'LEFT ABI/Hall runtime contract must not allow persistent sensorless feedback mode'

@@ -89,6 +89,9 @@ volatile uint32_t encoder_align_back_count = 0u;
 volatile int32_t encoder_align_jog_delta = 0;
 volatile int32_t encoder_align_back_delta = 0;
 volatile int32_t encoder_align_sweep360_delta = 0;
+volatile uint8_t encoder_align_consensus_run = 0u;
+volatile int32_t encoder_align_consensus_delta = 0;
+volatile uint8_t encoder_align_consensus_valid = 0u;
 volatile uint16_t encoder_align_current_ma = 0u;
 volatile int32_t encoder_detect_plus_mdeg = 0;
 volatile int32_t encoder_detect_minus_mdeg = 0;
@@ -2369,6 +2372,11 @@ static bool encoder_startup_sweep_360(mcpwm_foc_motor_t *m, float current,
     int32_t phase_cont=0;
     int32_t total_delta=0;
     bool ok=true;
+    uint8_t run=0u, best_run=0u;
+    int32_t run_sum=0, best_mean=0;
+    encoder_align_consensus_run=0u;
+    encoder_align_consensus_delta=0;
+    encoder_align_consensus_valid=0u;
 
     for(uint32_t sector=1u;sector<=6u && ok;++sector){
         const int32_t target=(int32_t)sector*60*(int32_t)electrical_dir;
@@ -2380,7 +2388,7 @@ static bool encoder_startup_sweep_360(mcpwm_foc_motor_t *m, float current,
             if(m->m_fault!=FAULT_CODE_NONE){ok=false;break;}
         }
         if(!ok)break;
-        for(uint32_t t=0u;t<80u;++t){
+        for(uint32_t t=0u;t<MCCONF_ENCODER_STARTUP_SWEEP_SETTLE_MS;++t){
             mcpwm_foc_vesc_override_touch(false);
             foc_bounded_delay_ms(1u);
             if(m->m_fault!=FAULT_CODE_NONE){ok=false;break;}
@@ -2394,32 +2402,52 @@ static bool encoder_startup_sweep_360(mcpwm_foc_motor_t *m, float current,
         const int32_t ad=d<0?-d:d;
         total_delta+=d;
         encoder_align_sweep360_delta=total_delta;
-        if(ad<min_move || ad>max_move || d*(int32_t)count_dir<=0){
-            ok=false;
-            break;
+
+        /* Consensus gate: steering load/backlash can distort the first or last
+         * 60-degree sector even when the rotor is electrically locked. Do not
+         * reject the complete sweep because of one edge sector. Instead require
+         * at least 3 consecutive sectors with the expected count direction and
+         * mutually similar magnitude (within 10% of the running mean). */
+        const bool plausible=(ad>=min_move && ad<=max_move &&
+                              d*(int32_t)count_dir>0);
+        if(plausible){
+            if(run==0u){
+                run=1u; run_sum=ad;
+            }else{
+                const int32_t mean=run_sum/(int32_t)run;
+                const int32_t diff=ad>mean?ad-mean:mean-ad;
+                if(mean>0 && (int64_t)diff*100 <= (int64_t)mean*10){
+                    ++run; run_sum+=ad;
+                }else{
+                    run=1u; run_sum=ad;
+                }
+            }
+            if(run>best_run){
+                best_run=run;
+                best_mean=run_sum/(int32_t)run;
+            }
+        }else{
+            run=0u; run_sum=0;
         }
         prev=now;
         encoder_align_stage=(uint8_t)(5u+sector);
     }
 
-    /* Full-sweep quality gate. For an incremental encoder mounted on the motor,
-     * one 360 electrical-degree revolution must move approximately
-     * encoder_counts / pole_pairs. Per-sector direction checks above catch
-     * wiring/order faults; this total check rejects partial motion/backlash that
-     * previously allowed ~839 counts to be reported SYNCED for a 4-pole-pair,
-     * 4096-count encoder whose ideal total is 1024 counts. Keep the window
-     * deliberately tight enough to fail closed without changing any motor,
-     * current, span, or control calibration. */
+    /* Minimum 3-sector consensus is authoritative. Keep a broad physical sanity
+     * check against encoder_counts/pole_pairs so three mutually-similar but
+     * clearly impossible tiny/huge sectors still cannot authorize SYNC. */
     if(ok){
         const uint32_t pp=(uint32_t)mcpwm_foc_get_pole_pairs(false);
         const uint32_t expected_total=pp>0u?(counts+pp/2u)/pp:0u;
-        const int32_t abs_total=total_delta<0?-total_delta:total_delta;
-        const int32_t min_total=(int32_t)((expected_total*90u)/100u);
-        const int32_t max_total=(int32_t)((expected_total*110u+99u)/100u);
-        if(expected_total==0u || abs_total<min_total || abs_total>max_total ||
-           total_delta*(int32_t)count_dir<=0){
-            ok=false;
-        }
+        const int32_t inferred_total=best_mean*6;
+        const int32_t min_inferred=(int32_t)((expected_total*75u)/100u);
+        const int32_t max_inferred=(int32_t)((expected_total*125u+99u)/100u);
+        const bool consensus_ok=best_run>=3u && best_mean>0 && expected_total>0u &&
+            inferred_total>=min_inferred && inferred_total<=max_inferred;
+        encoder_align_consensus_run=best_run;
+        encoder_align_consensus_delta=(int32_t)count_dir*best_mean;
+        encoder_align_consensus_valid=consensus_ok?1u:0u;
+        if(!consensus_ok)ok=false;
     }
 
     /* Always unwind the electrical command back to phase 0 before either
@@ -2431,7 +2459,7 @@ static bool encoder_startup_sweep_360(mcpwm_foc_motor_t *m, float current,
         foc_bounded_delay_ms(2u);
         if(m->m_fault!=FAULT_CODE_NONE)ok=false;
     }
-    for(uint32_t t=0u;t<80u;++t){
+    for(uint32_t t=0u;t<MCCONF_ENCODER_STARTUP_SWEEP_SETTLE_MS;++t){
         mcpwm_foc_vesc_override_touch(false);
         foc_bounded_delay_ms(1u);
         if(m->m_fault!=FAULT_CODE_NONE)ok=false;
@@ -2443,6 +2471,9 @@ bool mcpwm_foc_encoder_startup_align(bool second) {
     encoder_align_stage=1u;
     encoder_align_before_count=encoder_align_jog_count=encoder_align_back_count=0u;
     encoder_align_jog_delta=encoder_align_back_delta=encoder_align_sweep360_delta=0;
+    encoder_align_consensus_run=0u;
+    encoder_align_consensus_delta=0;
+    encoder_align_consensus_valid=0u;
     encoder_align_current_ma=0u;
     if(second){encoder_align_stage=0xE1u;return false;}
     mcpwm_foc_motor_t *m=&m_motor_1;
