@@ -8,3 +8,31 @@ __pycache__/
 /dist/
 /backups/
 recovery/
+
+
+# Experimental output: keep raw measurements and screenshots locally, not in Git
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.zip
+*.log
+*.b64
+
+# Generated output and temporary backups
+/backups/
+/backup/
+/config/backups_*/
+**/*.bak
+**/*.bak.*
+**/*.bak_*
+*.backup
+*.backup_*
+*.pre_*
+/.pio/
+/.pytest_cache/
+/.venv*/
+/.env
+/.env.*
